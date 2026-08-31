@@ -16,6 +16,7 @@ import {
   KanbanIcon,
   KeyboardIcon,
   BellIcon,
+  BotIcon,
   type LucideIcon,
   NewThreadIcon,
   PencilIcon,
@@ -207,6 +208,7 @@ import { ThreadArchiveActionButton } from "./ThreadArchiveActionButton";
 import { ThreadPinToggleButton } from "./ThreadPinToggleButton";
 import {
   SidebarThreadRowContent,
+  resolveSubagentRowDescription,
   type SidebarThreadTerminalStatus,
 } from "./SidebarThreadRowContent";
 import { RenameDialog } from "./RenameDialog";
@@ -334,6 +336,11 @@ import {
   sortProjectsForSidebar,
   sortThreadsForSidebar,
 } from "./Sidebar.logic";
+import {
+  applySidebarSplitGroups,
+  buildSidebarSplitGroupIndex,
+  type SidebarSplitGroupInfo,
+} from "./sidebarSplitGroups";
 import type { LastThreadRoute } from "../chatRouteRestore";
 import { useCopyPathToClipboard, useCopyThreadIdToClipboard } from "~/hooks/useCopyToClipboard";
 import { DESKTOP_TOP_BAR_TRAFFIC_LIGHT_GUTTER_CLASS } from "~/hooks/useDesktopTopBarGutter";
@@ -352,6 +359,7 @@ import {
 } from "../lib/threadHandoff";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { useDiffRouteSearch } from "../hooks/useDiffRouteSearch";
+import { stripDiffSearchParams } from "../diffRouteSearch";
 import { normalizeSettingsSection } from "../settingsNavigation";
 import {
   sidebarHoverRevealHideClassName,
@@ -370,7 +378,11 @@ import {
   ComposerPickerMenuPopup,
   ComposerPickerMenuSubPopup,
 } from "./chat/ComposerPickerMenuPopup";
-import { selectSplitView, useSplitViewStore } from "../splitViewStore";
+import {
+  resolveSplitViewFocusedThreadId,
+  selectSplitView,
+  useSplitViewStore,
+} from "../splitViewStore";
 import { useRightDockStore } from "../rightDockStore";
 import { THREAD_DRAG_MIME } from "./chat-drop-overlay/ChatPaneDropOverlay";
 import { useTemporaryThreadStore } from "../temporaryThreadStore";
@@ -620,7 +632,7 @@ function resolveWorktreeBadgeLabel(
 }
 
 type ThreadMetaChip = {
-  id: "automation" | "handoff" | "fork" | "worktree";
+  id: "automation" | "handoff" | "fork" | "worktree" | "synara-source";
   tooltip: string;
   icon: ReactNode;
 };
@@ -630,10 +642,16 @@ type ThreadMetaChip = {
  * Priority lowest -> highest: handoff -> fork -> worktree. Sidechats skip fork/temporary
  * badges because the "Sidechat:" title already identifies them.
  */
-function resolveThreadRowMetaChips(input: {
+export function resolveThreadRowMetaChips(input: {
   thread: Pick<
     Thread,
-    "forkSourceThreadId" | "sidechatSourceThreadId" | "envMode" | "worktreePath" | "handoff"
+    | "forkSourceThreadId"
+    | "sidechatSourceThreadId"
+    | "envMode"
+    | "worktreePath"
+    | "handoff"
+    | "creationSource"
+    | "sourceThreadId"
   >;
   includeHandoffBadge: boolean;
   /**
@@ -646,6 +664,14 @@ function resolveThreadRowMetaChips(input: {
 }): ThreadMetaChip[] {
   const chips: ThreadMetaChip[] = [];
   const isSidechatThread = Boolean(input.thread.sidechatSourceThreadId);
+
+  if (input.thread.creationSource === "synara_mcp" && input.thread.sourceThreadId) {
+    chips.push({
+      id: "synara-source",
+      tooltip: "Sent by Synara from another thread",
+      icon: <SidebarGlyph icon={BotIcon} variant="meta" className="text-muted-foreground/55" />,
+    });
+  }
 
   const threadAutomations = input.threadAutomations;
   if (threadAutomations && threadAutomations.length > 0) {
@@ -703,6 +729,13 @@ function resolveThreadRowMetaChips(input: {
   }
 
   return chips;
+}
+
+export function shouldShowTemporaryThreadIcon(input: {
+  isTemporaryThread: boolean;
+  sidechatSourceThreadId: Thread["sidechatSourceThreadId"];
+}): boolean {
+  return input.isTemporaryThread && !input.sidechatSourceThreadId;
 }
 
 interface PrStatusIndicator {
@@ -1437,6 +1470,66 @@ export default function Sidebar() {
     useMemo(() => selectSplitView(routeSearch.splitViewId ?? null), [routeSearch.splitViewId]),
   );
   const splitViewsById = useSplitViewStore((store) => store.splitViewsById);
+  const splitViewIdBySourceThreadId = useSplitViewStore(
+    (store) => store.splitViewIdBySourceThreadId,
+  );
+  const splitGroupMembershipByThreadId = useMemo(
+    () => buildSidebarSplitGroupIndex({ splitViewsById, splitViewIdBySourceThreadId }),
+    [splitViewIdBySourceThreadId, splitViewsById],
+  );
+  const detachThreadFromSplit = useCallback(
+    async (splitGroup: SidebarSplitGroupInfo, threadId: ThreadId) => {
+      const result = useSplitViewStore.getState().detachThreadFromSplitView({
+        splitViewId: splitGroup.splitViewId,
+        threadId,
+      });
+      if (!result || routeSearch.splitViewId !== splitGroup.splitViewId) return;
+
+      if (result.kind === "split") {
+        await navigate({
+          to: "/$threadId",
+          params: { threadId: result.focusedThreadId },
+          replace: true,
+          search: (previous) => ({
+            ...stripDiffSearchParams(previous),
+            splitViewId: result.splitViewId,
+          }),
+        });
+        return;
+      }
+
+      await navigate({
+        to: "/$threadId",
+        params: { threadId: result.threadId },
+        replace: true,
+        search: (previous) => ({
+          ...stripDiffSearchParams(previous),
+          splitViewId: undefined,
+        }),
+      });
+    },
+    [navigate, routeSearch.splitViewId],
+  );
+  const dissolveSplitView = useCallback(
+    async (splitGroup: SidebarSplitGroupInfo) => {
+      const splitView = useSplitViewStore.getState().splitViewsById[splitGroup.splitViewId];
+      if (!splitView) return;
+      const focusedThreadId = resolveSplitViewFocusedThreadId(splitView);
+      useSplitViewStore.getState().removeSplitView(splitGroup.splitViewId);
+      if (!focusedThreadId || routeSearch.splitViewId !== splitGroup.splitViewId) return;
+
+      await navigate({
+        to: "/$threadId",
+        params: { threadId: focusedThreadId },
+        replace: true,
+        search: (previous) => ({
+          ...stripDiffSearchParams(previous),
+          splitViewId: undefined,
+        }),
+      });
+    },
+    [navigate, routeSearch.splitViewId],
+  );
 
   useEffect(() => {
     const api = readNativeApi();
@@ -2914,10 +3007,13 @@ export default function Sidebar() {
       position: { x: number; y: number },
       options?: {
         extraItems?: Array<{
-          id: "return-to-single-chat";
+          id: "return-to-single-chat" | "remove-from-split" | "dissolve-split";
           label: string;
+          separatorBefore?: boolean;
         }>;
-        onExtraAction?: (itemId: "return-to-single-chat") => Promise<void> | void;
+        onExtraAction?: (
+          itemId: "return-to-single-chat" | "remove-from-split" | "dissolve-split",
+        ) => Promise<void> | void;
       },
     ) => {
       const api = readNativeApi();
@@ -3118,8 +3214,12 @@ export default function Sidebar() {
         copyThreadIdToClipboard(threadId);
         return;
       }
-      if (clicked === "return-to-single-chat") {
-        await options?.onExtraAction?.("return-to-single-chat");
+      if (
+        clicked === "return-to-single-chat" ||
+        clicked === "remove-from-split" ||
+        clicked === "dissolve-split"
+      ) {
+        await options?.onExtraAction?.(clicked);
         return;
       }
       if (clicked === "archive") {
@@ -3709,12 +3809,15 @@ export default function Sidebar() {
     if (!chatSectionExpanded) {
       return [];
     }
-    return buildProjectThreadTree({
-      threads: sortThreadsForSidebar(
-        chatProjects.flatMap((project) => sortedSidebarThreadsByProjectId.get(project.id) ?? []),
-        appSettings.sidebarThreadSortOrder,
-      ),
-      forceVisibleThreadId: activeSidebarThreadId ?? undefined,
+    return applySidebarSplitGroups({
+      rows: buildProjectThreadTree({
+        threads: sortThreadsForSidebar(
+          chatProjects.flatMap((project) => sortedSidebarThreadsByProjectId.get(project.id) ?? []),
+          appSettings.sidebarThreadSortOrder,
+        ),
+        forceVisibleThreadId: activeSidebarThreadId ?? undefined,
+      }),
+      membershipByThreadId: splitGroupMembershipByThreadId,
     });
   }, [
     activeSidebarThreadId,
@@ -3722,6 +3825,7 @@ export default function Sidebar() {
     chatSectionExpanded,
     chatProjects,
     sortedSidebarThreadsByProjectId,
+    splitGroupMembershipByThreadId,
   ]);
   const visibleChatThreadIds = useMemo(
     () => visibleChatThreadRows.map((row) => row.thread.id),
@@ -3735,17 +3839,20 @@ export default function Sidebar() {
     if (!isOnStudio) {
       return [];
     }
-    return buildProjectThreadTree({
-      threads: sortThreadsForSidebar(
-        getUnpinnedThreadsForSidebar(
-          studioProjects.flatMap(
-            (project) => sortedSidebarThreadsByProjectId.get(project.id) ?? [],
+    return applySidebarSplitGroups({
+      rows: buildProjectThreadTree({
+        threads: sortThreadsForSidebar(
+          getUnpinnedThreadsForSidebar(
+            studioProjects.flatMap(
+              (project) => sortedSidebarThreadsByProjectId.get(project.id) ?? [],
+            ),
+            pinnedThreadIds,
           ),
-          pinnedThreadIds,
+          appSettings.sidebarThreadSortOrder,
         ),
-        appSettings.sidebarThreadSortOrder,
-      ),
-      forceVisibleThreadId: activeSidebarThreadId ?? undefined,
+        forceVisibleThreadId: activeSidebarThreadId ?? undefined,
+      }),
+      membershipByThreadId: splitGroupMembershipByThreadId,
     });
   }, [
     activeSidebarThreadId,
@@ -3753,6 +3860,7 @@ export default function Sidebar() {
     isOnStudio,
     pinnedThreadIds,
     sortedSidebarThreadsByProjectId,
+    splitGroupMembershipByThreadId,
     studioProjects,
   ]);
   const studioChatThreadIds = useMemo(
@@ -3764,6 +3872,7 @@ export default function Sidebar() {
       visibleChatThreadRows.map((row) => ({
         rowId: row.thread.id,
         rootRowId: row.rootThreadId,
+        splitGroup: row.splitGroup,
         row,
       })),
     [visibleChatThreadRows],
@@ -3861,6 +3970,7 @@ export default function Sidebar() {
         projects: standardProjects,
         sortedSidebarThreadsByProjectId,
         pinnedThreadIds,
+        splitGroupMembershipByThreadId,
         threadListExtraPagesByProjectCwd,
         normalizeProjectCwd: normalizeSidebarProjectThreadListCwd,
         activeSidebarThreadId: activeSidebarThreadId ?? undefined,
@@ -3870,6 +3980,7 @@ export default function Sidebar() {
       }),
     [
       activeSidebarThreadId,
+      splitGroupMembershipByThreadId,
       threadListExtraPagesByProjectCwd,
       pinnedThreadIds,
       sortedSidebarThreadsByProjectId,
@@ -3891,6 +4002,7 @@ export default function Sidebar() {
       projects: studioProjects,
       sortedSidebarThreadsByProjectId,
       pinnedThreadIds,
+      splitGroupMembershipByThreadId,
       threadListExtraPagesByProjectCwd,
       normalizeProjectCwd: normalizeSidebarProjectThreadListCwd,
       activeSidebarThreadId: activeSidebarThreadId ?? undefined,
@@ -3901,6 +4013,7 @@ export default function Sidebar() {
   }, [
     activeSidebarThreadId,
     isOnStudio,
+    splitGroupMembershipByThreadId,
     threadListExtraPagesByProjectCwd,
     pinnedThreadIds,
     sortedSidebarThreadsByProjectId,
@@ -4176,15 +4289,31 @@ export default function Sidebar() {
     threadId: ThreadId;
     toneClassName: string;
     isPinned: boolean;
+    splitGroup?: SidebarSplitGroupInfo | null;
     includePinToggle?: boolean;
     compact?: boolean;
   }) {
     const compact = input.compact === true;
     const includePinToggle = input.includePinToggle !== false;
+    const splitGroup = input.splitGroup ?? null;
 
     return (
       <SidebarRowHoverActions threadId={input.threadId}>
         <div className="pointer-events-auto inline-flex items-center gap-2">
+          {splitGroup ? (
+            <SidebarIconButton
+              icon={XIcon}
+              label="Remove from split view"
+              size="sm"
+              title="Remove from split view"
+              className={input.toneClassName}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                void detachThreadFromSplit(splitGroup, input.threadId);
+              }}
+            />
+          ) : null}
           {includePinToggle ? (
             <ThreadPinToggleButton
               pinned={input.isPinned}
@@ -4377,6 +4506,12 @@ export default function Sidebar() {
     });
     const threadStatus = resolveThreadStatusForSidebar(thread);
     const isSubagentThread = Boolean(thread.parentThreadId);
+    const subagentDescription = isSubagentThread
+      ? resolveSubagentRowDescription({
+          thread,
+          parentTitle: sidebarThreadSummaryById[thread.parentThreadId!]?.title,
+        })
+      : undefined;
     const prStatus = prStatusIndicator(prByThreadId.get(thread.id) ?? null);
     const leadingPrStatus =
       isSubagentThread || thread.forkSourceThreadId || thread.sidechatSourceThreadId
@@ -4415,6 +4550,7 @@ export default function Sidebar() {
           <div
             role="button"
             tabIndex={0}
+            aria-description={subagentDescription}
             data-thread-item
             className={cn(
               SIDEBAR_HEADER_ROW_CLASS_NAME,
@@ -4515,6 +4651,7 @@ export default function Sidebar() {
     // their top-level rows align flush like pinned rows instead of the indented
     // column used for project-nested threads.
     topLevel = false,
+    splitGroup: SidebarSplitGroupInfo | null = null,
   ) {
     const threadTerminalState = selectThreadTerminalState(terminalStateByThreadId, thread.id);
     const threadEntryPoint = threadTerminalState.entryPoint;
@@ -4545,14 +4682,25 @@ export default function Sidebar() {
       threadAutomations: automationsByThreadId.get(thread.id),
     });
     const isSubagentThread = Boolean(thread.parentThreadId);
+    const subagentDescription = isSubagentThread
+      ? resolveSubagentRowDescription({
+          thread,
+          parentTitle: sidebarThreadSummaryById[thread.parentThreadId!]?.title,
+        })
+      : undefined;
+    const visibleMetaChips = isSubagentThread
+      ? rightMetaChips.filter((chip) => chip.id === "synara-source")
+      : rightMetaChips;
     const leadingPrStatus =
       isSubagentThread || thread.forkSourceThreadId || thread.sidechatSourceThreadId
         ? null
         : prStatus;
     const subagentIndentPx = Math.max(0, Math.min(depth - 1, 3) * 10);
-    const showCompactMeta = !isSubagentThread;
-    const showTemporaryThreadIcon =
-      showCompactMeta && isTemporaryThread && !thread.sidechatSourceThreadId;
+    const showCompactMeta = visibleMetaChips.length > 0;
+    const showTemporaryThreadIcon = shouldShowTemporaryThreadIcon({
+      isTemporaryThread,
+      sidechatSourceThreadId: thread.sidechatSourceThreadId,
+    });
     const threadJumpLabel = visibleThreadJumpLabelByThreadId.get(thread.id) ?? null;
     const threadJumpLabelParts =
       visibleThreadJumpLabelPartsByThreadId.get(thread.id) ?? EMPTY_SHORTCUT_PARTS;
@@ -4582,6 +4730,7 @@ export default function Sidebar() {
               <SidebarMenuSubButton
                 render={<div role="button" tabIndex={0} />}
                 data-thread-entry-point={threadEntryPoint}
+                aria-description={subagentDescription}
                 size="sm"
                 isActive={isActive}
                 className={cn(
@@ -4590,10 +4739,11 @@ export default function Sidebar() {
                     isSelected,
                   }),
                   leadingPrStatus ? "pl-8" : topLevel && !isSubagentThread ? "pl-2" : null,
+                  splitGroup ? "overflow-visible" : null,
                   isSubagentThread
                     ? "pr-7.5"
                     : resolveThreadRowTrailingReserveClass({
-                        metaChipCount: showCompactMeta ? rightMetaChips.length : 0,
+                        metaChipCount: showCompactMeta ? visibleMetaChips.length : 0,
                         hasTrailingGlyph: Boolean(threadStatus) || Boolean(threadJumpLabel),
                       }),
                 )}
@@ -4643,10 +4793,32 @@ export default function Sidebar() {
                   if (selectedThreadIds.size > 0) {
                     clearSelection();
                   }
-                  void handleThreadContextMenu(thread.id, {
-                    x: event.clientX,
-                    y: event.clientY,
-                  });
+                  void handleThreadContextMenu(
+                    thread.id,
+                    {
+                      x: event.clientX,
+                      y: event.clientY,
+                    },
+                    splitGroup && !isSubagentThread
+                      ? {
+                          extraItems: [
+                            {
+                              id: "remove-from-split",
+                              label: "Remove from split view",
+                              separatorBefore: true,
+                            },
+                            { id: "dissolve-split", label: "End split view" },
+                          ],
+                          onExtraAction: async (itemId) => {
+                            if (itemId === "remove-from-split") {
+                              await detachThreadFromSplit(splitGroup, thread.id);
+                            } else if (itemId === "dissolve-split") {
+                              await dissolveSplitView(splitGroup);
+                            }
+                          },
+                        }
+                      : undefined,
+                  );
                 }}
               />
             }
@@ -4659,6 +4831,10 @@ export default function Sidebar() {
               isActive={isActive}
               variant="standard"
               subagentIndentPx={subagentIndentPx}
+              splitGroup={splitGroup}
+              splitGroupActive={
+                splitGroup !== null && splitGroup.splitViewId === routeSearch.splitViewId
+              }
               pendingStatusColorClass={
                 threadStatus?.label === "Pending Approval" ? threadStatus.colorClass : null
               }
@@ -4684,7 +4860,7 @@ export default function Sidebar() {
                 isSubagentThread,
                 threadJumpLabel,
                 threadJumpLabelParts,
-                rightMetaChips: showCompactMeta ? rightMetaChips : [],
+                rightMetaChips: visibleMetaChips,
                 threadStatus,
                 timestampToneClassName: isSubagentThread
                   ? isHighlighted
@@ -4696,6 +4872,7 @@ export default function Sidebar() {
                   toneClassName: secondaryMetaClass,
                   isPinned,
                   compact: isSubagentThread,
+                  splitGroup: isSubagentThread ? null : splitGroup,
                 }),
               })}
             </div>
@@ -5938,7 +6115,13 @@ export default function Sidebar() {
                   <SidebarMenu ref={attachProjectListAutoAnimateRef} className="gap-1">
                     {studioChatThreadRows.length > 0 ? (
                       studioChatThreadRows.map((row) =>
-                        renderThreadRow(row.thread, studioChatThreadIds, row.depth, true),
+                        renderThreadRow(
+                          row.thread,
+                          studioChatThreadIds,
+                          row.depth,
+                          true,
+                          row.splitGroup,
+                        ),
                       )
                     ) : (
                       <div className="px-2 pt-4 text-center text-[length:var(--app-font-size-ui,12px)] text-muted-foreground/58">
@@ -6178,6 +6361,7 @@ export default function Sidebar() {
                           visibleChatThreadIds,
                           entry.row.depth,
                           true,
+                          entry.row.splitGroup,
                         ),
                       )
                     ) : (

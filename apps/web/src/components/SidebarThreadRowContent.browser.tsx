@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { render } from "vitest-browser-react";
 
 import { DEFAULT_INTERACTION_MODE, type SidebarThreadSummary } from "../types";
-import { SidebarThreadRowContent } from "./SidebarThreadRowContent";
+import { resolveSubagentRowDescription, SidebarThreadRowContent } from "./SidebarThreadRowContent";
 
 function makeThread(overrides: Partial<SidebarThreadSummary> = {}): SidebarThreadSummary {
   return {
@@ -80,5 +80,115 @@ describe("SidebarThreadRowContent", () => {
 
     await expect.element(screen.getByText("Scout")).toBeVisible();
     await expect.element(screen.getByText("(reviewer)")).toBeVisible();
+    const connector = screen.getByTestId("sidebar-subagent-connector");
+    await expect.element(connector).toBeVisible();
+    await expect.element(connector).toHaveAttribute("data-indent", "10");
+  });
+
+  it("uses a simple shared card surface without a per-row split rail", async () => {
+    const screen = await render(
+      <SidebarThreadRowContent
+        thread={makeThread({ id: ThreadId.makeUnsafe("thread-split-member") })}
+        terminalEntryPoint={false}
+        terminalStatus={null}
+        terminalCount={0}
+        isActive={false}
+        variant="standard"
+        splitGroup={{
+          splitViewId: "split-rail",
+          memberIndex: 2,
+          memberCount: 3,
+          isLeader: false,
+          position: "middle",
+        }}
+        splitGroupActive
+      />,
+    );
+
+    const surface = screen.getByTestId("sidebar-split-group-surface");
+    await expect.element(surface).toBeVisible();
+    await expect.element(surface).toHaveAttribute("data-split-position", "middle");
+    expect(document.querySelectorAll("[data-testid=sidebar-split-group-rail]")).toHaveLength(0);
+  });
+
+  it("draws the shared split-group surface capped to the row position", async () => {
+    const screen = await render(
+      <SidebarThreadRowContent
+        thread={makeThread({ id: ThreadId.makeUnsafe("thread-split-surface") })}
+        terminalEntryPoint={false}
+        terminalStatus={null}
+        terminalCount={0}
+        isActive={false}
+        variant="standard"
+        splitGroup={{
+          splitViewId: "split-surface",
+          memberIndex: 1,
+          memberCount: 2,
+          isLeader: true,
+          position: "first",
+        }}
+      />,
+    );
+
+    const surface = screen.getByTestId("sidebar-split-group-surface");
+    await expect.element(surface).toHaveAttribute("data-split-position", "first");
+    await expect.element(surface).toHaveClass("rounded-t-lg");
+  });
+
+  it("moves the subagent context onto its focusable row description", () => {
+    expect(
+      resolveSubagentRowDescription({
+        thread: makeThread({
+          parentThreadId: ThreadId.makeUnsafe("thread-parent-row"),
+          modelSelection: {
+            provider: "codex",
+            model: "gpt-5.6",
+            options: { reasoningEffort: "medium" },
+          },
+          session: {
+            provider: "codex",
+            status: "closed",
+            orchestrationStatus: "stopped",
+            createdAt: "2026-07-19T12:00:00.000Z",
+            updatedAt: "2026-07-19T12:01:00.000Z",
+          },
+        }),
+        parentTitle: "Implement webhook spec",
+      }),
+    ).toBe("Subagent of Implement webhook spec · gpt-5.6 · medium · closed");
+  });
+
+  it("omits the split-group surface when the row is not part of a split", async () => {
+    const screen = await render(
+      <SidebarThreadRowContent
+        thread={makeThread({ id: ThreadId.makeUnsafe("thread-no-split") })}
+        terminalEntryPoint={false}
+        terminalStatus={null}
+        terminalCount={0}
+        isActive={false}
+        variant="standard"
+        splitGroup={null}
+      />,
+    );
+
+    await expect.element(screen.getByText("Shared thread row")).toBeVisible();
+    expect(document.querySelectorAll("[data-testid=sidebar-split-group-rail]")).toHaveLength(0);
+    expect(document.querySelectorAll("[data-testid=sidebar-split-group-surface]")).toHaveLength(0);
+  });
+
+  it("keeps the temporary icon when an ordinary thread has no metadata chips", async () => {
+    const screen = await render(
+      <SidebarThreadRowContent
+        thread={makeThread()}
+        terminalEntryPoint={false}
+        terminalStatus={null}
+        terminalCount={0}
+        isActive={false}
+        variant="standard"
+        suffix={<span aria-label="Temporary chat">Temporary</span>}
+      />,
+    );
+
+    await expect.element(screen.getByLabelText("Temporary chat")).toBeVisible();
   });
 });

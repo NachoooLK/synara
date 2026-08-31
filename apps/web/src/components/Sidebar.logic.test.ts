@@ -1458,7 +1458,7 @@ describe("getRenderedThreadsForSidebarProject", () => {
 });
 
 describe("buildProjectThreadTree", () => {
-  it("keeps inactive child threads out of the sidebar", () => {
+  it("keeps child threads visible directly below their parent", () => {
     const rows = buildProjectThreadTree({
       threads: [
         makeThread({
@@ -1473,11 +1473,9 @@ describe("buildProjectThreadTree", () => {
       ],
     });
 
-    expect(rows).toEqual([
-      expect.objectContaining({
-        thread: expect.objectContaining({ id: ThreadId.makeUnsafe("thread-parent") }),
-        depth: 0,
-      }),
+    expect(rows.map((row) => [row.thread.id, row.depth])).toEqual([
+      [ThreadId.makeUnsafe("thread-parent"), 0],
+      [ThreadId.makeUnsafe("thread-child"), 1],
     ]);
   });
 
@@ -1512,7 +1510,7 @@ describe("buildProjectThreadTree", () => {
     ]);
   });
 
-  it("reveals the active child thread and its ancestors", () => {
+  it("keeps nested descendants visible without requiring an active child", () => {
     const rows = buildProjectThreadTree({
       threads: [
         makeThread({
@@ -1530,7 +1528,6 @@ describe("buildProjectThreadTree", () => {
           createdAt: "2026-03-09T10:01:00.000Z",
         }),
       ],
-      forceVisibleThreadId: ThreadId.makeUnsafe("thread-grandchild"),
     });
 
     expect(rows.map((row) => [row.thread.id, row.depth])).toEqual([
