@@ -17,15 +17,21 @@ import {
   WS_PROTOCOL_EPOCH,
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
+  WS_PROJECT_FILE_WATCH_CAPABILITY,
   DEVICE_WS_CHANNELS,
   DEVICE_WS_METHODS,
+  COMPUTER_WS_CHANNELS,
+  COMPUTER_WS_METHODS,
   WsBootstrapNegotiateResult,
   WsBootstrapRpcGroup,
   WsDeviceRpcGroup,
+  WsComputerRpcGroup,
   WS_METHODS,
   WsCompatibilityError,
   WsFeatureRpcGroup,
+  WsProjectAgentRpcGroup,
   type AutomationStreamEvent,
+  type TodoStreamEvent,
   type GitActionProgressEvent,
   type GitCreateDetachedWorktreeResult,
   type GitRunStackedActionResult,
@@ -35,16 +41,21 @@ import {
   type OrchestrationEvent,
   type OrchestrationShellStreamItem,
   type OrchestrationThreadStreamItem,
+  type ProjectAgentStreamEvent,
   type ProjectDevServerEvent,
+  type ProjectFileChangeEvent,
+  type ProjectWatchFileInput,
   type ServerConfigStreamEvent,
   type ServerLifecycleStreamEvent,
   type ServerProviderStatusesUpdatedPayload,
   type ServerSettingsUpdatedPayload,
   type DeviceEvent,
+  type ComputerEvent,
   type TerminalEvent,
   type WsPush,
   type WsPushChannel,
   type WsPushMessage,
+  TASKS_UNAVAILABLE_ERROR_CODE,
   ThreadId,
 } from "@synara/contracts";
 import {
@@ -64,6 +75,7 @@ import * as Socket from "effect/unstable/socket/Socket";
 
 import { APP_VERSION } from "./branding";
 import { useDeviceStateStore } from "./deviceStateStore";
+import { useComputerStateStore } from "./computerStateStore";
 import {
   getUnaryRpcCapacityRetryDelayMs,
   MAX_UNARY_RPC_CAPACITY_RETRY_ATTEMPTS,
@@ -80,6 +92,15 @@ type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void
 type RpcClientEffect = typeof makeRpcClient;
 type RpcClientInstance =
   RpcClientEffect extends Effect.Effect<infer Client, any, any> ? Client : never;
+
+type ProjectFileChangeSubscription = {
+  readonly input: ProjectWatchFileInput;
+  readonly listeners: Set<(event: ProjectFileChangeEvent) => void>;
+};
+
+export function projectFileChangeStreamKey(input: ProjectWatchFileInput): string {
+  return `projects.file-change:${input.cwd.length}:${input.cwd}${input.relativePath}`;
+}
 
 class WsTransportRpcError extends Data.TaggedError("WsTransportRpcError")<{
   readonly message: string;
@@ -199,7 +220,9 @@ function awaitWithAbort<A>(promise: Promise<A>, signal: AbortSignal | undefined)
 // server is the authority that refuses them off darwin, and the pane needs a
 // real RPC error (or an `unsupported-platform` availability) to render its
 // blocked state. Merging here keeps one socket and one client.
-const makeRpcClient = RpcClient.make(WsFeatureRpcGroup.merge(WsDeviceRpcGroup));
+const makeRpcClient = RpcClient.make(
+  WsFeatureRpcGroup.merge(WsDeviceRpcGroup).merge(WsComputerRpcGroup).merge(WsProjectAgentRpcGroup),
+);
 const makeBootstrapRpcClient = RpcClient.make(WsBootstrapRpcGroup);
 const REQUEST_TIMEOUT_MS = 60_000;
 const FEATURE_CONNECTION_PROBE_TIMEOUT_MS = 10_000;
@@ -351,6 +374,9 @@ const STREAM_ADMISSION_ERROR_CODES = new Set([
   "WS_NEGOTIATION_REQUIRED",
   "WS_PROTOCOL_INCOMPATIBLE",
   "WS_CAPABILITIES_INCOMPATIBLE",
+  // A local filesystem watcher failure is scoped to its optional panel
+  // subscription. Reconnecting every RPC stream cannot repair that path.
+  "PROJECT_FILE_WATCH_FAILED",
   // Snapshot-fence failures are a property of one stream's read model, not of
   // the socket. Tearing the whole transport down for them interrupts every
   // unrelated in-flight request while fixing nothing — the same fence is
@@ -360,6 +386,9 @@ const STREAM_ADMISSION_ERROR_CODES = new Set([
   "ORCHESTRATION_RESNAPSHOT_REQUIRED",
   "ORCHESTRATION_SNAPSHOT_STALLED",
   "ORCHESTRATION_PROJECTION_STATE_INCOMPLETE",
+  // A server that does not offer Tasks (Stable) refuses its stream for good;
+  // reconnecting the socket would only be refused again.
+  TASKS_UNAVAILABLE_ERROR_CODE,
 ]);
 
 const RESNAPSHOT_REQUIRED_ERROR_CODE = "ORCHESTRATION_RESNAPSHOT_REQUIRED";
@@ -454,6 +483,34 @@ const MAX_STREAM_CAPACITY_RETRY_MS = 10_000;
 const INITIAL_UNEXPECTED_STREAM_COMPLETION_RETRY_MS = 100;
 const MAX_UNEXPECTED_STREAM_COMPLETION_RETRY_MS = 5_000;
 const STABLE_STREAM_LIFETIME_MS = 10_000;
+const PROJECT_FILE_WATCH_FAILED_ERROR_CODE = "PROJECT_FILE_WATCH_FAILED";
+const INITIAL_PROJECT_FILE_WATCH_RETRY_MS = 500;
+const MAX_PROJECT_FILE_WATCH_RETRY_MS = 8_000;
+export const MAX_PROJECT_FILE_WATCH_RETRY_ATTEMPTS = 5;
+
+/**
+ * A file watcher failure belongs to one optional visible panel, not the whole
+ * socket. Retry that subscription with bounded exponential backoff so a
+ * transient filesystem failure heals without reconnecting unrelated streams.
+ */
+export function getProjectFileWatchRetryDelayMs(
+  cause: Cause.Cause<unknown>,
+  previousAttempts: number,
+): number | null {
+  if (previousAttempts >= MAX_PROJECT_FILE_WATCH_RETRY_ATTEMPTS) return null;
+  for (const reason of cause.reasons) {
+    if (!Cause.isFailReason(reason)) continue;
+    const error = reason.error;
+    if (!error || typeof error !== "object") continue;
+    const code = "code" in error ? error.code : undefined;
+    if (code !== PROJECT_FILE_WATCH_FAILED_ERROR_CODE) continue;
+    return Math.min(
+      INITIAL_PROJECT_FILE_WATCH_RETRY_MS * 2 ** previousAttempts,
+      MAX_PROJECT_FILE_WATCH_RETRY_MS,
+    );
+  }
+  return null;
+}
 
 /**
  * Infinite subscription streams should not complete successfully. A short,
@@ -630,7 +687,7 @@ export function resolveStreamAdmissionRetry(
   };
 }
 
-export function getStreamFailureCode(cause: Cause.Cause<unknown>): string | null {
+function getStreamFailureCode(cause: Cause.Cause<unknown>): string | null {
   for (const reason of cause.reasons) {
     if (!Cause.isFailReason(reason)) continue;
     const error = reason.error;
@@ -729,6 +786,7 @@ export class WsTransport {
   private readonly streamDuplicateRetries = new Map<string, number>();
   private readonly streamThreadBootstrapRetries = new Map<string, number>();
   private readonly streamResnapshotRetries = new Map<string, number>();
+  private readonly projectFileWatchRetries = new Map<string, number>();
   private readonly streamCapacityRetryTimers = new Map<string, number>();
   private readonly streamCompletionRetries = new Map<string, number>();
   private readonly streamCompletionRetryTimers = new Map<string, number>();
@@ -741,6 +799,8 @@ export class WsTransport {
   // is absorbed (bootstrap coalescing).
   private shellSnapshotDelivered = false;
   private readonly threadSubscriptions = new Map<string, unknown>();
+  private readonly projectFileSubscriptions = new Map<string, ProjectFileChangeSubscription>();
+  private readonly projectAgentSubscriptions = new Map<string, unknown>();
   private compatibility: WsBootstrapNegotiateResult | null = null;
   private compatibilityIssue: WsCompatibilityError | null = null;
   // Tracks the last server generation this transport observed so cross-restart
@@ -807,6 +867,22 @@ export class WsTransport {
         this.threadSubscriptions.set(threadId, input);
         const client = await awaitWithAbort(this.getClient(), abortScope.signal);
         await this.startThreadStream(client, threadId, input as never, wasSubscribed);
+        return undefined as T;
+      }
+      if (method === WS_METHODS.subscribeProjectAgentEvents) {
+        const projectId = (params as { projectId: string }).projectId;
+        const streamKey = `projectAgent.events:${projectId}`;
+        this.resetStreamCapacityRetry(streamKey);
+        this.resetStreamCompletionRetry(streamKey);
+        this.projectAgentSubscriptions.set(projectId, params);
+        const client = await awaitWithAbort(this.getClient(), abortScope.signal);
+        // An unsubscribe that landed during the connect wait already dropped the
+        // registration (and a resubscribe replaced it) — only stream when this
+        // request is still the registered one.
+        if (this.projectAgentSubscriptions.get(projectId) !== params) {
+          return undefined as T;
+        }
+        this.startProjectAgentEventStream(client, projectId, params);
         return undefined as T;
       }
 
@@ -911,6 +987,38 @@ export class WsTransport {
     };
   }
 
+  subscribeProjectFileChange(
+    input: ProjectWatchFileInput,
+    listener: (event: ProjectFileChangeEvent) => void,
+  ): () => void {
+    const key = projectFileChangeStreamKey(input);
+    let subscription = this.projectFileSubscriptions.get(key);
+    const isNewSubscription = subscription === undefined;
+    if (!subscription) {
+      subscription = { input, listeners: new Set() };
+      this.projectFileSubscriptions.set(key, subscription);
+    }
+    subscription.listeners.add(listener);
+    const desiredSubscription = subscription;
+    if (isNewSubscription) {
+      void this.getClient()
+        .then((client) => this.startProjectFileChangeStream(client, key, desiredSubscription))
+        .catch(() => undefined);
+    }
+
+    return () => {
+      desiredSubscription.listeners.delete(listener);
+      if (
+        desiredSubscription.listeners.size > 0 ||
+        this.projectFileSubscriptions.get(key) !== desiredSubscription
+      ) {
+        return;
+      }
+      this.projectFileSubscriptions.delete(key);
+      void this.stopStream(key);
+    };
+  }
+
   getLatestPush<C extends WsPushChannel>(channel: C): WsPushMessage<C> | null {
     const latest = this.latestPushByChannel.get(channel);
     return latest ? (latest as WsPushMessage<C>) : null;
@@ -990,6 +1098,8 @@ export class WsTransport {
     for (const cleanup of this.streamCleanups.values()) cleanup();
     this.streamCleanups.clear();
     this.activeThreadStreamInputs.clear();
+    this.projectFileSubscriptions.clear();
+    this.projectAgentSubscriptions.clear();
     this.threadStreamFailureListeners.clear();
     // Dispose can race with initial connection or reconnect promises. Mark them
     // handled before closing the runtime so test/browser teardown stays quiet.
@@ -1060,6 +1170,7 @@ export class WsTransport {
       // snapshots as stragglers and leave the pane showing pre-restart devices
       // and attachments forever, so the cache is dropped with the cursors.
       useDeviceStateStore.getState().clear();
+      useComputerStateStore.getState().clear();
     }
     this.lastServerInstanceId = compatibility.serverInstanceId;
     this.setCompatibility(compatibility);
@@ -1227,6 +1338,7 @@ export class WsTransport {
     this.streamDuplicateRetries.delete(key);
     this.streamThreadBootstrapRetries.delete(key);
     this.streamResnapshotRetries.delete(key);
+    this.projectFileWatchRetries.delete(key);
   }
 
   private resetAllStreamCapacityRetries(): void {
@@ -1238,6 +1350,7 @@ export class WsTransport {
     this.streamDuplicateRetries.clear();
     this.streamThreadBootstrapRetries.clear();
     this.streamResnapshotRetries.clear();
+    this.projectFileWatchRetries.clear();
   }
 
   private clearStreamCompletionRetryTimer(key: string): void {
@@ -1356,6 +1469,12 @@ export class WsTransport {
           if (input === undefined) continue;
           await this.startThreadStream(client, threadId, input);
         }
+        for (const [key, subscription] of this.projectFileSubscriptions) {
+          this.startProjectFileChangeStream(client, key, subscription);
+        }
+        for (const [projectId, params] of this.projectAgentSubscriptions) {
+          this.startProjectAgentEventStream(client, projectId, params);
+        }
         this.reconnectFailures = 0;
         return client;
       } catch (error) {
@@ -1466,12 +1585,28 @@ export class WsTransport {
             (event: AutomationStreamEvent) => this.emit(WS_CHANNELS.automationEvent, event),
             restartChannel,
           );
+        } else if (channel === WS_CHANNELS.todoEvent) {
+          this.startStream(
+            client,
+            "todo.events",
+            client[WS_METHODS.subscribeTodoEvents]({}),
+            (event: TodoStreamEvent) => this.emit(WS_CHANNELS.todoEvent, event),
+            restartChannel,
+          );
         } else if (channel === DEVICE_WS_CHANNELS.event) {
           this.startStream(
             client,
             "device.events",
             client[DEVICE_WS_METHODS.subscribeEvents]({}),
             (event: DeviceEvent) => this.emit(DEVICE_WS_CHANNELS.event, event),
+            restartChannel,
+          );
+        } else if (channel === COMPUTER_WS_CHANNELS.event) {
+          this.startStream(
+            client,
+            "computer.events",
+            client[COMPUTER_WS_METHODS.subscribeEvents]({}),
+            (event: ComputerEvent) => this.emit(COMPUTER_WS_CHANNELS.event, event),
             restartChannel,
           );
         } else if (channel === ORCHESTRATION_WS_CHANNELS.domainEvent) {
@@ -1507,7 +1642,9 @@ export class WsTransport {
     else if (channel === WS_CHANNELS.terminalEvent) this.stopStream("terminal.events");
     else if (channel === WS_CHANNELS.projectDevServerEvent) this.stopStream("project.devServers");
     else if (channel === WS_CHANNELS.automationEvent) this.stopStream("automation.events");
+    else if (channel === WS_CHANNELS.todoEvent) this.stopStream("todo.events");
     else if (channel === DEVICE_WS_CHANNELS.event) this.stopStream("device.events");
+    else if (channel === COMPUTER_WS_CHANNELS.event) this.stopStream("computer.events");
     else if (channel === ORCHESTRATION_WS_CHANNELS.domainEvent)
       this.stopStream("orchestration.domain");
   }
@@ -1638,6 +1775,41 @@ export class WsTransport {
     );
   }
 
+  private startProjectFileChangeStream(
+    client: RpcClientInstance,
+    key: string,
+    subscription: ProjectFileChangeSubscription,
+  ): void {
+    if (
+      this.disposed ||
+      this.projectFileSubscriptions.get(key) !== subscription ||
+      !this.compatibility?.capabilities.includes(WS_PROJECT_FILE_WATCH_CAPABILITY)
+    ) {
+      return;
+    }
+    const restart = () => {
+      if (this.projectFileSubscriptions.get(key) !== subscription) return;
+      void this.getClient()
+        .then((nextClient) => this.startProjectFileChangeStream(nextClient, key, subscription))
+        .catch(() => undefined);
+    };
+    this.startStream<ProjectFileChangeEvent>(
+      client,
+      key,
+      client[WS_METHODS.projectsSubscribeFileChange](subscription.input),
+      (event) => {
+        for (const subscribedListener of subscription.listeners) {
+          try {
+            subscribedListener(event);
+          } catch {
+            // One panel listener must not prevent another from revalidating.
+          }
+        }
+      },
+      restart,
+    );
+  }
+
   private startStream<T>(
     client: RpcClientInstance,
     key: string,
@@ -1746,6 +1918,28 @@ export class WsTransport {
               this.streamCapacityRetryTimers.set(key, timeoutId);
               return;
             }
+
+            const previousFileWatchAttempts =
+              performance.now() - streamStartedAt >= STABLE_STREAM_LIFETIME_MS
+                ? 0
+                : (this.projectFileWatchRetries.get(key) ?? 0);
+            const fileWatchRetryDelayMs = getProjectFileWatchRetryDelayMs(
+              exit.cause,
+              previousFileWatchAttempts,
+            );
+            if (fileWatchRetryDelayMs !== null) {
+              this.projectFileWatchRetries.set(key, previousFileWatchAttempts + 1);
+              this.clearStreamCapacityRetryTimer(key);
+              const timeoutId = window.setTimeout(() => {
+                if (this.streamCapacityRetryTimers.get(key) !== timeoutId) return;
+                this.streamCapacityRetryTimers.delete(key);
+                if (!this.disposed && !this.streamCleanups.has(key)) {
+                  restart();
+                }
+              }, fileWatchRetryDelayMs);
+              this.streamCapacityRetryTimers.set(key, timeoutId);
+              return;
+            }
           }
           if (restart && Exit.isFailure(exit) && shouldReconnectAfterStreamFailure(exit.cause)) {
             window.setTimeout(
@@ -1800,6 +1994,43 @@ export class WsTransport {
     this.streamSettled.set(key, settled);
   }
 
+  /**
+   * Detach a project-agent event stream entirely: drop the resubscribe-on-reconnect
+   * registration and cancel the live stream scope. `subscribeProjectAgentEvents`
+   * re-registers from scratch when needed.
+   */
+  async unsubscribeProjectAgentEvents(projectId: string): Promise<void> {
+    this.projectAgentSubscriptions.delete(projectId);
+    await this.stopStream(`projectAgent.events:${projectId}`);
+  }
+
+  /**
+   * Start (or restart) a project-agent event stream. The restart closure keeps the
+   * standard stream recovery paths alive — unexpected-completion reconnects and
+   * admission retries run through startStream, and the recursion means a restarted
+   * stream can itself restart instead of dying after one completion.
+   */
+  private startProjectAgentEventStream(
+    client: RpcClientInstance,
+    projectId: string,
+    params: unknown,
+  ): void {
+    const streamKey = `projectAgent.events:${projectId}`;
+    this.startStream<ProjectAgentStreamEvent>(
+      client,
+      streamKey,
+      client[WS_METHODS.subscribeProjectAgentEvents](params as never),
+      (event) => this.emit(WS_CHANNELS.projectAgentEvent, event),
+      () => {
+        if (!this.projectAgentSubscriptions.has(projectId)) return;
+        void this.getClient().then((nextClient) => {
+          if (!this.projectAgentSubscriptions.has(projectId)) return;
+          this.startProjectAgentEventStream(nextClient, projectId, params);
+        });
+      },
+    );
+  }
+
   private stopStream(
     key: string,
     options?: { readonly resetCapacityRetry?: boolean },
@@ -1811,6 +2042,7 @@ export class WsTransport {
       this.streamDuplicateRetries.delete(key);
       this.streamThreadBootstrapRetries.delete(key);
       this.streamResnapshotRetries.delete(key);
+      this.projectFileWatchRetries.delete(key);
     }
     this.streamCompletionRetries.delete(key);
     this.activeThreadStreamInputs.delete(key);

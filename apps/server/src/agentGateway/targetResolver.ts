@@ -4,6 +4,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   DROID_REASONING_EFFORT_OPTIONS,
   GROK_REASONING_EFFORT_OPTIONS,
+  OMP_THINKING_LEVEL_OPTIONS,
   PI_THINKING_LEVEL_OPTIONS,
   type ModelSelection,
   type ProviderKind,
@@ -11,6 +12,8 @@ import {
   type ProviderModelDescriptor,
   type ServerProviderAuthStatus,
 } from "@synara/contracts";
+import { getClaudeContextWindowSuffix, stripClaudeContextWindowSuffix } from "@synara/shared/model";
+import { defaultInstanceIdForProvider } from "@synara/shared/providerInstances";
 import { Effect } from "effect";
 
 import type { ProviderDiscoveryServiceShape } from "../provider/Services/ProviderDiscoveryService.ts";
@@ -72,6 +75,7 @@ export interface AgentGatewayTargetOptionGuidance {
   readonly optionsByModel: Readonly<Record<string, ReadonlyArray<AgentGatewayTargetOptionRule>>>;
   readonly exampleTarget: {
     readonly provider: ProviderKind;
+    readonly instanceId: string;
     readonly model: string;
     readonly options: Readonly<Record<string, AgentGatewayTargetOptionValue>>;
   } | null;
@@ -97,7 +101,7 @@ type ProviderOptionValidation =
   | { readonly kind: "non-empty-string" };
 
 interface ProviderTargetOptionRuleSpec extends Omit<AgentGatewayTargetOptionRule, "key"> {
-  readonly advertised: boolean;
+  readonly advertised: boolean | "when-discovered";
   readonly validation: ProviderOptionValidation;
 }
 
@@ -130,7 +134,7 @@ function providerOptionRule(
   allowedValues: ReadonlyArray<AgentGatewayTargetOptionValue>,
   allowedValuesSource: AgentGatewayTargetOptionRule["allowedValuesSource"] = "provider-contract",
   options?: {
-    readonly advertised?: boolean;
+    readonly advertised?: boolean | "when-discovered";
     readonly validation?: ProviderOptionValidation;
     readonly allowsCustomValue?: boolean;
   },
@@ -199,7 +203,7 @@ const PROVIDER_TARGET_OPTION_RULES = {
         validation: { kind: "boolean-capability", capability: "supportsThinkingToggle" },
       }),
       autoCompactWindow: providerOptionRule("string", [], "model-discovery", {
-        advertised: false,
+        advertised: "when-discovered",
         validation: { kind: "context-window" },
       }),
       contextWindow: providerOptionRule("string", [], "model-discovery", {
@@ -212,19 +216,13 @@ const PROVIDER_TARGET_OPTION_RULES = {
     primaryOptionKey: "thinkingLevel",
     options: { thinkingLevel: providerOptionRule("string", PI_THINKING_LEVEL_OPTIONS) },
   }),
+  omp: defineProviderOptionConfig<"omp">({
+    primaryOptionKey: "thinkingLevel",
+    options: { thinkingLevel: providerOptionRule("string", OMP_THINKING_LEVEL_OPTIONS) },
+  }),
   antigravity: defineProviderOptionConfig<"antigravity">({
     primaryOptionKey: "reasoningEffort",
     options: { reasoningEffort: providerOptionRule("string", [], "model-discovery") },
-  }),
-  kilo: defineProviderOptionConfig<"kilo">({
-    primaryOptionKey: "variant",
-    options: {
-      variant: providerOptionRule("string", [], "model-discovery"),
-      agent: providerOptionRule("string", [], "model-discovery", {
-        validation: { kind: "non-empty-string" },
-        allowsCustomValue: true,
-      }),
-    },
   }),
   opencode: defineProviderOptionConfig<"opencode">({
     primaryOptionKey: "variant",
@@ -236,10 +234,38 @@ const PROVIDER_TARGET_OPTION_RULES = {
       }),
     },
   }),
+  devin: defineProviderOptionConfig<"devin">({
+    primaryOptionKey: "modelVariant",
+    options: {
+      fastMode: providerOptionRule("boolean", [], "model-discovery", {
+        advertised: false,
+        validation: { kind: "boolean-capability", capability: "supportsFastMode" },
+      }),
+      thinking: providerOptionRule("boolean", [], "model-discovery", {
+        advertised: false,
+        validation: { kind: "boolean-capability", capability: "supportsThinkingToggle" },
+      }),
+      contextWindow: providerOptionRule("string", [], "model-discovery", {
+        advertised: false,
+        validation: { kind: "context-window" },
+      }),
+      reasoningEffort: providerOptionRule("string", [], "model-discovery"),
+      modelVariant: providerOptionRule("string", [], "model-discovery", {
+        validation: { kind: "non-empty-string" },
+        allowsCustomValue: true,
+      }),
+    },
+  }),
 } as const satisfies Record<ProviderKind, ProviderTargetOptionConfig>;
 
+function providerTargetOptionConfig(provider: ProviderKind): ProviderTargetOptionConfig {
+  const registry: Readonly<Record<ProviderKind, ProviderTargetOptionConfig>> =
+    PROVIDER_TARGET_OPTION_RULES;
+  return registry[provider];
+}
+
 function providerDefaultModel(provider: ProviderKind): string | null {
-  return provider === "pi" ? null : DEFAULT_MODEL_BY_PROVIDER[provider];
+  return provider === "pi" || provider === "omp" ? null : DEFAULT_MODEL_BY_PROVIDER[provider];
 }
 
 export function loadAgentGatewayProviderCatalog(input: {
@@ -298,8 +324,8 @@ export function loadAgentGatewayProviderCatalog(input: {
 function providerTargetOptionRules(
   provider: ProviderKind,
 ): ReadonlyArray<AgentGatewayTargetOptionRule> {
-  return Object.entries(PROVIDER_TARGET_OPTION_RULES[provider].options)
-    .filter(([, option]) => option.advertised)
+  return Object.entries(providerTargetOptionConfig(provider).options)
+    .filter(([, option]) => option.advertised === true)
     .map(([key, { valueType, allowedValues, allowedValuesSource, allowsCustomValue }]) => ({
       key,
       valueType,
@@ -310,7 +336,7 @@ function providerTargetOptionRules(
 }
 
 function providerPrimaryOptionKey(provider: ProviderKind): string {
-  return PROVIDER_TARGET_OPTION_RULES[provider].primaryOptionKey;
+  return providerTargetOptionConfig(provider).primaryOptionKey;
 }
 
 function convertDiscoveredOptionValue(
@@ -357,9 +383,23 @@ function modelTargetOptionRules(
   };
 
   const discoveredEfforts = model.supportedReasoningEfforts?.map((entry) => entry.value) ?? [];
-  replaceAllowedValues(providerPrimaryOptionKey(provider), discoveredEfforts);
+  const primaryOptionKey = providerPrimaryOptionKey(provider);
+  // A custom-value primary option (e.g. Devin modelVariant) accepts arbitrary
+  // values, so the discovered reasoning-effort list must not constrain it.
+  if (rules.find((rule) => rule.key === primaryOptionKey)?.allowsCustomValue !== true) {
+    replaceAllowedValues(primaryOptionKey, discoveredEfforts);
+  }
 
   for (const descriptor of model.optionDescriptors ?? []) {
+    const spec = providerOptionRuleSpec(provider, descriptor.id);
+    if (spec?.advertised === "when-discovered") {
+      rules.push({
+        key: spec.key,
+        valueType: spec.valueType,
+        allowedValues: [],
+        allowedValuesSource: "model-discovery",
+      });
+    }
     const rule = rules.find((candidate) => candidate.key === descriptor.id);
     if (!rule) continue;
     if (descriptor.type === "select") {
@@ -431,6 +471,7 @@ export function agentGatewayTargetOptionGuidance(
       catalog.available && exampleModel
         ? {
             provider: catalog.provider,
+            instanceId: defaultInstanceIdForProvider(catalog.provider),
             model: exampleModel,
             options: exampleOptionsForRules(primaryOptionKey, exampleRules),
           }
@@ -464,7 +505,7 @@ function providerOptionRuleSpec(
   provider: ProviderKind,
   optionId: string,
 ): ResolvedProviderTargetOptionRuleSpec | undefined {
-  const rule = PROVIDER_TARGET_OPTION_RULES[provider].options[optionId];
+  const rule = providerTargetOptionConfig(provider).options[optionId];
   return rule ? { key: optionId, ...rule } : undefined;
 }
 
@@ -571,7 +612,13 @@ function validateKnownProviderOption(
     case "context-window": {
       const available = descriptor.contextWindowOptions?.map((entry) => entry.value) ?? [];
       if (available.includes(String(value))) return;
-      validateDiscoveredDescriptorOption(target, descriptor, rule.key, value);
+      const optionId =
+        target.provider === "claudeAgent" &&
+        rule.key === "contextWindow" &&
+        descriptor.optionDescriptors?.some((option) => option.id === "autoCompactWindow")
+          ? "autoCompactWindow"
+          : rule.key;
+      validateDiscoveredDescriptorOption(target, descriptor, optionId, value);
       return;
     }
     case "non-empty-string": {
@@ -629,7 +676,45 @@ export function resolveAgentGatewayTarget(input: {
         ),
       );
     }
-    const descriptor = catalog.models.find((model) => model.slug === input.target.model);
+    const exactDescriptor = catalog.models.find((model) => model.slug === input.target.model);
+    // The Claude picker can show a concrete resolved id for a newly discovered
+    // alias. Discovery still advertises the alias as its slug, so validate that
+    // id against a single non-default descriptor carrying it. Prefer an exact
+    // resolved id before ignoring its context qualifier.
+    const resolvedClaudeDescriptors =
+      !exactDescriptor && input.target.provider === "claudeAgent"
+        ? catalog.models.filter((model) => model.slug !== "default" && model.resolvedModel)
+        : [];
+    const exactResolved = resolvedClaudeDescriptors.filter(
+      (model) => model.resolvedModel === input.target.model,
+    );
+    const unqualifiedResolved =
+      getClaudeContextWindowSuffix(input.target.model) === null
+        ? resolvedClaudeDescriptors.filter(
+            (model) =>
+              model.resolvedModel &&
+              stripClaudeContextWindowSuffix(model.resolvedModel) === input.target.model,
+          )
+        : [];
+    const resolvedMatches = exactResolved.length > 0 ? exactResolved : unqualifiedResolved;
+    const descriptor =
+      exactDescriptor ?? (resolvedMatches.length === 1 ? resolvedMatches[0] : undefined);
+    // Capability claims come from discovery, never the agent's target input. Keep
+    // unknown distinct from false so Auto-mode validation can still fail closed.
+    const target: ModelSelection =
+      input.target.provider === "claudeAgent"
+        ? {
+            provider: input.target.provider,
+            ...(input.target.instanceId !== undefined
+              ? { instanceId: input.target.instanceId }
+              : {}),
+            model: input.target.model,
+            ...(input.target.options !== undefined ? { options: input.target.options } : {}),
+            ...(descriptor?.supportsAutoMode !== undefined
+              ? { supportsAutoMode: descriptor.supportsAutoMode }
+              : {}),
+          }
+        : input.target;
 
     if (catalog.models.length > 0 && descriptor === undefined) {
       return yield* Effect.fail(
@@ -670,7 +755,7 @@ export function resolveAgentGatewayTarget(input: {
         if (error instanceof AgentGatewayTargetError) return yield* Effect.fail(error);
         throw error;
       }
-      return input.target;
+      return target;
     }
 
     try {
@@ -679,6 +764,22 @@ export function resolveAgentGatewayTarget(input: {
       if (error instanceof AgentGatewayTargetError) return yield* Effect.fail(error);
       throw error;
     }
-    return input.target;
+    // Explicit Claude windows must reach the runtime with the same concrete model
+    // whose capabilities were discovered; custom SDK aliases have no static caps.
+    if (
+      input.target.provider === "claudeAgent" &&
+      (input.target.options?.autoCompactWindow !== undefined ||
+        input.target.options?.contextWindow !== undefined) &&
+      descriptor?.resolvedModel &&
+      stripClaudeContextWindowSuffix(descriptor.resolvedModel) !== input.target.model
+    ) {
+      const suffix =
+        getClaudeContextWindowSuffix(input.target.model) === "1m" &&
+        getClaudeContextWindowSuffix(descriptor.resolvedModel) === null
+          ? "[1m]"
+          : "";
+      return { ...target, model: `${descriptor.resolvedModel}${suffix}` };
+    }
+    return target;
   });
 }

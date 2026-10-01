@@ -4,6 +4,7 @@
 
 import type { ProjectId, ThreadEnvironmentMode, ThreadId } from "@synara/contracts";
 import { isAutomationRunThread } from "@synara/shared/automationMode";
+import { isSidechatThread, sidechatContextMatchesGitHubItem } from "@synara/shared/sidechatThread";
 
 import type { AppState } from "./storeState";
 import { ACCOUNT_RATE_LIMIT_ACTIVITY_KINDS } from "./lib/rateLimits";
@@ -279,6 +280,65 @@ export function createThreadWorkspaceMetadataSelector(
   };
 }
 
+export interface ThreadGitActionsMetadata {
+  readonly worktreePath: string | null;
+  readonly branch: string | null;
+  readonly associatedWorktreeBranch: string | null | undefined;
+  readonly createBranchFlowCompleted: boolean;
+  readonly title: string | undefined;
+}
+
+const EMPTY_THREAD_GIT_ACTIONS_METADATA: ThreadGitActionsMetadata = {
+  worktreePath: null,
+  branch: null,
+  associatedWorktreeBranch: null,
+  createBranchFlowCompleted: false,
+  title: undefined,
+};
+
+/** Shell-only git-action inputs (worktree, branch, title) that stay reference-stable
+ *  while a turn streams. The git actions control is always mounted on the chat
+ *  surface and only reads these fields; subscribing it to the full derived Thread
+ *  re-rendered it on every message/activity delta. */
+export function createThreadGitActionsMetadataSelector(
+  threadId: ThreadId | null | undefined,
+): (state: AppState) => ThreadGitActionsMetadata {
+  let previousResult = EMPTY_THREAD_GIT_ACTIONS_METADATA;
+
+  return (state) => {
+    if (!threadId) {
+      return EMPTY_THREAD_GIT_ACTIONS_METADATA;
+    }
+    const source = state.threadShellById?.[threadId];
+    if (!source) {
+      previousResult = EMPTY_THREAD_GIT_ACTIONS_METADATA;
+      return previousResult;
+    }
+    const worktreePath = source.worktreePath ?? null;
+    const branch = source.branch ?? null;
+    const associatedWorktreeBranch = source.associatedWorktreeBranch;
+    const createBranchFlowCompleted = source.createBranchFlowCompleted ?? false;
+    const title = source.title;
+    if (
+      previousResult.worktreePath === worktreePath &&
+      previousResult.branch === branch &&
+      previousResult.associatedWorktreeBranch === associatedWorktreeBranch &&
+      previousResult.createBranchFlowCompleted === createBranchFlowCompleted &&
+      previousResult.title === title
+    ) {
+      return previousResult;
+    }
+    previousResult = {
+      worktreePath,
+      branch,
+      associatedWorktreeBranch,
+      createBranchFlowCompleted,
+      title,
+    };
+    return previousResult;
+  };
+}
+
 export function createThreadExistsSelector(
   threadId: ThreadId | null | undefined,
 ): (state: AppState) => boolean {
@@ -326,7 +386,7 @@ export function createComposerThreadMentionSourcesSelector(): (
 
     const nextSources = (threadIds ?? []).flatMap((threadId) => {
       const thread = summaryById[threadId];
-      return thread
+      return thread && !isSidechatThread(thread)
         ? [
             {
               id: thread.id,
@@ -373,16 +433,69 @@ export interface SidebarThreadVisibilityOptions {
 
 /**
  * Whether a thread row belongs in user-facing thread lists (sidebar tree, Kanban,
- * project picker). Housekeeping consumers that must see every thread (retention,
- * spaces controller, search) read the unfiltered summaries selector instead.
+ * project picker, search). Housekeeping consumers that must see every thread
+ * (retention and reconciliation) read the unfiltered summaries selector instead.
  */
 export function isSidebarThreadVisible(
   thread: SidebarThreadSummary,
   options?: SidebarThreadVisibilityOptions,
 ): boolean {
+  // Sidechats live in their host's dock (a thread's, or the inbox's for standalone ones).
+  if (isSidechatThread(thread)) return false;
   if (!options?.hideAutomationRunThreads) return true;
   if (thread.isPinned) return true;
   return !isAutomationRunThread(thread);
+}
+
+// Newest activity first, so index 0 is the sidechat a host reopens.
+function createSortedSidechatSummariesSelector(
+  matches: (thread: SidebarThreadSummary) => boolean,
+): (state: AppState) => readonly SidebarThreadSummary[] {
+  const selectSidebarSummaries = createSidebarThreadSummariesSelector();
+  let previousSummaries: readonly SidebarThreadSummary[] | undefined;
+  let previousSidechats: readonly SidebarThreadSummary[] = [];
+
+  return (state) => {
+    const summaries = selectSidebarSummaries(state);
+    if (summaries === previousSummaries) return previousSidechats;
+    previousSummaries = summaries;
+    const nextSidechats = summaries
+      .filter((thread) => thread.archivedAt == null && matches(thread))
+      .toSorted(
+        (left, right) =>
+          Date.parse(right.sidechatLastActivityAt ?? right.updatedAt ?? right.createdAt) -
+          Date.parse(left.sidechatLastActivityAt ?? left.updatedAt ?? left.createdAt),
+      );
+    if (
+      nextSidechats.length === previousSidechats.length &&
+      nextSidechats.every((thread, index) => thread === previousSidechats[index])
+    ) {
+      return previousSidechats;
+    }
+    previousSidechats = nextSidechats;
+    return previousSidechats;
+  };
+}
+
+export function createSidechatSummariesForSourceSelector(
+  sourceThreadId: ThreadId,
+): (state: AppState) => readonly SidebarThreadSummary[] {
+  return createSortedSidechatSummariesSelector(
+    (thread) => thread.sidechatSourceThreadId === sourceThreadId,
+  );
+}
+
+/** Sidechats for one GitHub item; Ask can scope reuse to its chosen project. */
+export function createSidechatSummariesForGitHubItemSelector(item: {
+  readonly projectId?: ProjectId;
+  readonly repository: string;
+  readonly number: number;
+}): (state: AppState) => readonly SidebarThreadSummary[] {
+  return createSortedSidechatSummariesSelector(
+    (thread) =>
+      (item.projectId === undefined || thread.projectId === item.projectId) &&
+      sidechatContextMatchesGitHubItem(thread.sidechatContext, item),
+  );
 }
 
 export function createSidebarDisplayThreadsSelector(

@@ -21,7 +21,32 @@ export interface SettingsSearchEntry {
   title: string;
   keywords: string;
   target?: string | null;
+  /**
+   * Whether this row exists on the machine the user is actually looking at.
+   * Omitted means "always". A search result for a row the panel does not render
+   * is a dead end: it scrolls to an anchor that is not there, and it tells the
+   * user Synara has a setting it does not.
+   */
+  applies?: (context: SettingsSearchContext) => boolean;
 }
+
+/**
+ * What the index needs to know about this server to decide which rows exist.
+ * Deliberately a handful of booleans rather than the status objects themselves —
+ * the index answers "does this row render", not "what does it say".
+ */
+export interface SettingsSearchContext {
+  /**
+   * The desktop backend drives the screen the user is already looking at, so
+   * the preview describes the same visible desktop. True only once the status
+   * is known.
+   */
+  readonly computerBackendIsVisibleDesktop: boolean;
+}
+
+const DEFAULT_SETTINGS_SEARCH_CONTEXT: SettingsSearchContext = {
+  computerBackendIsVisibleDesktop: false,
+};
 
 /** DOM id a result deep-links to, or null for panel-level entries with no anchored row. */
 export function settingsSearchEntryTarget(entry: SettingsSearchEntry): string | null {
@@ -47,6 +72,20 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
       "Pick the default workspace mode for newly created draft threads. local worktree environment",
   },
   {
+    id: "general:delete-worktree-on-archive",
+    section: "general",
+    title: "Delete worktree on archive",
+    keywords:
+      "After Archive's Undo period, remove a clean worktree only when its task has stopped and no other task uses it. Keep its branch for recovery. worktree archive cleanup disk space remove delete",
+  },
+  {
+    id: "general:welcome-tour",
+    section: "general",
+    title: "Welcome tour",
+    keywords:
+      "Replay the first-run setup: feature tour, provider selection, appearance, and first project. onboarding welcome wizard getting started setup",
+  },
+  {
     id: "general:project-order",
     section: "general",
     title: "Project order",
@@ -67,10 +106,10 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
       "Show the standalone Chats list in the sidebar footer chats not tied to a project. sidebar section",
   },
   {
-    id: "general:studio-section",
+    id: "general:groups-section",
     section: "general",
-    title: "Studio",
-    keywords: "Show the Studio tab in the sidebar switcher. sidebar section content outbox",
+    title: "Hubs",
+    keywords: "Show the Hubs tab in the sidebar switcher. sidebar section content outbox groups",
   },
   {
     id: "general:automation-run-threads",
@@ -123,12 +162,6 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     section: "general",
     title: "Pinned messages",
     keywords: "Show the pinned-messages checklist in the Environment panel.",
-  },
-  {
-    id: "general:environment-markers",
-    section: "general",
-    title: "Text markers",
-    keywords: "Show highlighted and underlined transcript text in the Environment panel.",
   },
   {
     id: "general:environment-instructions",
@@ -273,6 +306,49 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     target: null,
   },
 
+  // ── Computer use ──────────────────────────────────────────────────────────────
+  {
+    id: "computer:status",
+    section: "computer",
+    title: "Computer status",
+    keywords:
+      "Whether agents can see and control this computer's desktop right now. desktop backend beta availability health kwin hyprland nested wayland linux mac macos screen recording accessibility computer use control status set up install plugin repair",
+    // The status row is conditional and its title is dynamic (Ready /
+    // Reconnecting / Unavailable), so link to the section rather than an
+    // anchored row.
+    target: null,
+  },
+  {
+    id: "computer:open-automatically",
+    section: "computer",
+    title: "Preview",
+    keywords:
+      "Show the in-chat Computer preview the first time an agent acts on the desktop, and choose its size. open automatically compact large. auto open computer use",
+    applies: () => true,
+  },
+  {
+    id: "computer:how-agents-use-the-desktop",
+    section: "computer",
+    title: "Computer control",
+    keywords:
+      "Let the agent use the desktop in any chat. Approval gates and Stop still apply. enable toggle permission desktop agent computer use control",
+  },
+  {
+    id: "computer:cursor-colors",
+    section: "computer",
+    title: "Cursor colors",
+    keywords:
+      "The agent pointer's colors: stock monochrome by default, or custom fill and rim. agent cursor arrow pointer color hex custom",
+  },
+  {
+    id: "computer:always-allowed",
+    section: "computer",
+    title: "Always allowed",
+    keywords:
+      "Durable per-app always-allow grants from computer approvals, with expiry and revoke. always allow approval grant revoke app bundle consent computer use",
+    target: null,
+  },
+
   // ── Behavior ──────────────────────────────────────────────────────────────────
   {
     id: "behavior:follow-up-behavior",
@@ -286,6 +362,27 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     section: "behavior",
     title: "Assistant output",
     keywords: "Show token-by-token output while a response is in progress. streaming",
+  },
+  {
+    id: "behavior:effort-slider",
+    section: "behavior",
+    title: "Effort slider",
+    keywords:
+      "Show reasoning effort as a slider in the composer model menu once a chat has started. fast mode reasoning thinking level picker",
+  },
+  {
+    id: "behavior:auto-open-simulator",
+    section: "behavior",
+    title: "Automatically open simulator",
+    keywords:
+      "Disable automatic iOS Simulator device pane opening. Use Simulator.app without the mirrored panel reopening. background launch",
+  },
+  {
+    id: "behavior:include-fork-upstreams",
+    section: "behavior",
+    title: "Include fork upstreams",
+    keywords:
+      "Also list pull requests and issues from each project's other GitHub remotes, such as the repository a fork was made from. code review inbox github upstream remote fork",
   },
   {
     id: "behavior:diff-line-wrapping",
@@ -453,12 +550,17 @@ export function settingsSectionLabel(section: SettingsSectionId): string {
 export function rankSettingsSearchEntries(
   query: string,
   limit: number,
+  context: SettingsSearchContext | undefined = DEFAULT_SETTINGS_SEARCH_CONTEXT,
 ): readonly SettingsSearchEntry[] {
   const trimmed = query.trim();
   if (trimmed.length === 0) {
     return [];
   }
-  const ranked = rankProviderDiscoveryItems(SETTINGS_SEARCH_ENTRIES, trimmed, (entry) => [
+  const resolvedContext = context ?? DEFAULT_SETTINGS_SEARCH_CONTEXT;
+  const available = SETTINGS_SEARCH_ENTRIES.filter(
+    (entry) => entry.applies?.(resolvedContext) ?? true,
+  );
+  const ranked = rankProviderDiscoveryItems(available, trimmed, (entry) => [
     { value: entry.title },
     { value: entry.keywords, weight: 200 },
     { value: settingsSectionLabel(entry.section), weight: 400 },

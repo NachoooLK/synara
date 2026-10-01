@@ -14,6 +14,7 @@ import {
   type TurnId,
 } from "@synara/contracts";
 import { resolveThreadBranchRegressionGuard } from "@synara/shared/git";
+import { mergeAsyncUserInput } from "@synara/shared/asyncUserInput";
 import { normalizeModelSlug } from "@synara/shared/model";
 import { deriveThreadSummaryMetadata } from "@synara/shared/threadSummary";
 
@@ -21,6 +22,7 @@ import { isStalePendingRequestFailureDetail } from "./lib/pendingInteraction";
 import { toAttachmentPreviewUrl } from "./lib/wsHttpUrl";
 import { hasLiveTurnTailWork } from "./session-logic";
 import { getRememberedProjectUiState, projectCwdKey } from "./storePersistence";
+import { resolveInitialLastVisitedAt } from "./threadVisitedPersistence";
 import type {
   ChatAttachment,
   ChatMessage,
@@ -173,16 +175,22 @@ export function threadShellsEqual(left: ThreadShell | undefined, right: ThreadSh
     (left.subagentRole ?? null) === (right.subagentRole ?? null) &&
     (left.forkSourceThreadId ?? null) === (right.forkSourceThreadId ?? null) &&
     (left.sidechatSourceThreadId ?? null) === (right.sidechatSourceThreadId ?? null) &&
+    // The context never changes after creation; its URL identifies the item.
+    (left.sidechatContext?.url ?? null) === (right.sidechatContext?.url ?? null) &&
+    (left.sidechatLastActivityAt ?? null) === (right.sidechatLastActivityAt ?? null) &&
+    (left.sidechatExpiredAt ?? null) === (right.sidechatExpiredAt ?? null) &&
     deepEqualJson(left.lastKnownPr ?? null, right.lastKnownPr ?? null) &&
     (left.handoff ?? null) === (right.handoff ?? null) &&
+    deepEqualJson(left.claudeCacheReview ?? null, right.claudeCacheReview ?? null) &&
+    left.claudeCacheReviewSequence === right.claudeCacheReviewSequence &&
     deepEqualJson(left.pinnedMessages ?? null, right.pinnedMessages ?? null) &&
-    deepEqualJson(left.threadMarkers ?? null, right.threadMarkers ?? null) &&
     (left.notes ?? "") === (right.notes ?? "") &&
     (left.goal ?? "") === (right.goal ?? "") &&
     (left.goalStartedAt ?? null) === (right.goalStartedAt ?? null) &&
     (left.goalPausedAt ?? null) === (right.goalPausedAt ?? null) &&
     deepEqualJson(left.goalAchievements ?? null, right.goalAchievements ?? null) &&
     left.latestUserMessageAt === right.latestUserMessageAt &&
+    left.latestHumanMessageAt === right.latestHumanMessageAt &&
     left.hasPendingApprovals === right.hasPendingApprovals &&
     left.hasPendingUserInput === right.hasPendingUserInput &&
     left.hasActionableProposedPlan === right.hasActionableProposedPlan &&
@@ -368,14 +376,32 @@ export function normalizeProject(
   const folderName = basenameOfPath(incoming.workspaceRoot) ?? incoming.title;
   const localName =
     previous?.localName ?? rememberedUiState.projectNameForCwd(workspaceRootKey) ?? null;
+  const appearance =
+    previous?.appearance ?? rememberedUiState.projectAppearanceForCwd(workspaceRootKey) ?? null;
   const defaultModelSelection =
     incoming.defaultModelSelection === null
       ? null
       : normalizeModelSelection(incoming.defaultModelSelection, previous?.defaultModelSelection);
   const scripts = normalizeProjectScripts(incoming.scripts, previous?.scripts);
+  const persistedProjectOrderIndex = rememberedUiState.projectOrderIndexForCwd(workspaceRootKey);
+  const hasKnownLegacyExpansion =
+    rememberedUiState.projectOrderCount === 0 &&
+    (rememberedUiState.expandedProjectCount > 0 || rememberedUiState.isLegacyExpansionPayload);
+  // Expansion resolves from three states, in priority order:
+  // 1. Previous match — a previous project with the same workspace root keeps its
+  //    live expansion, so server syncs never clobber local toggles.
+  // 2. Remembered state — when this cwd is known to the persisted order, or the
+  //    payload is a legacy expansion-only payload, reuse the remembered expansion.
+  // 3. Default — a project we have never seen starts expanded.
+  // `isLegacyExpansionPayload` is true only while the remembered payload uses the
+  // legacy shape (expandedProjectCwds with no projectOrderCwds). It flips off for
+  // good once modern order state is remembered, and is what lets an empty legacy
+  // list mean "all collapsed" instead of "no preference, default expanded".
   const expanded =
-    previous?.expanded ??
-    (rememberedUiState.expandedProjectCount > 0
+    (previous && projectCwdKey(previous.cwd) === workspaceRootKey
+      ? previous.expanded
+      : undefined) ??
+    (persistedProjectOrderIndex !== undefined || hasKnownLegacyExpansion
       ? rememberedUiState.isProjectExpanded(workspaceRootKey)
       : true);
 
@@ -387,6 +413,7 @@ export function normalizeProject(
     previous.remoteName === incoming.title &&
     previous.folderName === folderName &&
     previous.localName === localName &&
+    (previous.appearance ?? null) === appearance &&
     previous.cwd === incoming.workspaceRoot &&
     previous.defaultModelSelection === defaultModelSelection &&
     previous.expanded === expanded &&
@@ -406,6 +433,7 @@ export function normalizeProject(
     remoteName: incoming.title,
     folderName,
     localName,
+    appearance,
     cwd: incoming.workspaceRoot,
     defaultModelSelection,
     expanded,
@@ -414,7 +442,7 @@ export function normalizeProject(
     createdAt: incoming.createdAt,
     updatedAt: incoming.updatedAt,
     scripts,
-  } satisfies Project;
+  };
 }
 
 export function normalizeSpace(
@@ -531,14 +559,18 @@ export function normalizeChatMessage(
   const previousSkills = previous?.skills ?? [];
   const previousMentions = previous?.mentions ?? [];
   const completedAt = incoming.streaming ? undefined : incoming.updatedAt;
+  const asyncUserInput = mergeAsyncUserInput(previous?.asyncUserInput, incoming.asyncUserInput);
   if (
     previous &&
     previous.role === incoming.role &&
     previous.text === incoming.text &&
+    previous.asyncUserInput === asyncUserInput &&
     previous.dispatchMode === incoming.dispatchMode &&
     previous.dispatchOrigin === incoming.dispatchOrigin &&
+    previous.startsNewTurn === incoming.startsNewTurn &&
     previous.turnId === incoming.turnId &&
     previous.createdAt === incoming.createdAt &&
+    previous.updatedAt === incoming.updatedAt &&
     previous.streaming === incoming.streaming &&
     previous.source === incoming.source &&
     previous.completedAt === completedAt &&
@@ -554,13 +586,16 @@ export function normalizeChatMessage(
     id: incoming.id,
     role: incoming.role,
     text: incoming.text,
+    ...(asyncUserInput ? { asyncUserInput } : {}),
     ...(incoming.textSegments !== undefined && incoming.textSegments.length > 0
       ? { textSegments: [...incoming.textSegments] }
       : {}),
     ...(incoming.dispatchMode ? { dispatchMode: incoming.dispatchMode } : {}),
     ...(incoming.dispatchOrigin ? { dispatchOrigin: incoming.dispatchOrigin } : {}),
+    ...(incoming.startsNewTurn !== undefined ? { startsNewTurn: incoming.startsNewTurn } : {}),
     turnId: incoming.turnId,
     createdAt: incoming.createdAt,
+    updatedAt: incoming.updatedAt,
     streaming: incoming.streaming,
     source: incoming.source,
     ...(completedAt ? { completedAt } : {}),
@@ -618,13 +653,15 @@ function readModelMessageFromChatMessage(
     id: message.id,
     role: message.role,
     text: message.text,
+    ...(message.asyncUserInput ? { asyncUserInput: message.asyncUserInput } : {}),
     ...(message.dispatchMode ? { dispatchMode: message.dispatchMode } : {}),
     ...(message.dispatchOrigin ? { dispatchOrigin: message.dispatchOrigin } : {}),
+    ...(message.startsNewTurn !== undefined ? { startsNewTurn: message.startsNewTurn } : {}),
     turnId: message.turnId ?? null,
     streaming: message.streaming,
     source: message.source ?? "native",
     createdAt: message.createdAt,
-    updatedAt: message.completedAt ?? message.createdAt,
+    updatedAt: message.updatedAt ?? message.completedAt ?? message.createdAt,
     attachments: readModelAttachmentsFromChatMessage(message.attachments),
     ...(message.skills && message.skills.length > 0 ? { skills: message.skills } : {}),
     ...(message.mentions && message.mentions.length > 0 ? { mentions: message.mentions } : {}),
@@ -758,10 +795,16 @@ function mergeReadModelMessagesWithLiveHotPath(
       text: previousMessage.text,
       dispatchMode: previousMessage.dispatchMode ?? incomingMessage.dispatchMode,
       dispatchOrigin: incomingMessage.dispatchOrigin ?? previousMessage.dispatchOrigin,
+      startsNewTurn: incomingMessage.startsNewTurn ?? previousMessage.startsNewTurn,
+      asyncUserInput: mergeAsyncUserInput(
+        previousMessage.asyncUserInput,
+        incomingMessage.asyncUserInput,
+      ),
       turnId: previousMessage.turnId ?? incomingMessage.turnId ?? null,
       source: previousMessage.source ?? incomingMessage.source ?? "native",
       streaming: previousMessage.streaming,
-      updatedAt: previousMessage.completedAt ?? incomingMessage.updatedAt,
+      updatedAt:
+        previousMessage.updatedAt ?? previousMessage.completedAt ?? incomingMessage.updatedAt,
       attachments: readModelAttachmentsFromChatMessage(previousMessage.attachments),
       ...(previousMessage.skills && previousMessage.skills.length > 0
         ? { skills: previousMessage.skills }
@@ -843,6 +886,9 @@ function readModelSessionFromThreadSession(
     threadId: previousThread?.id ?? incomingSession?.threadId ?? ThreadId.makeUnsafe("unknown"),
     status: previousSession.orchestrationStatus,
     providerName: previousSession.provider,
+    ...(previousSession.providerInstanceId !== undefined
+      ? { providerInstanceId: previousSession.providerInstanceId }
+      : {}),
     runtimeMode: previousThread?.runtimeMode ?? incomingSession?.runtimeMode ?? "full-access",
     activeTurnId: previousSession.activeTurnId ?? null,
     lastError: previousSession.lastError ?? null,
@@ -876,6 +922,11 @@ function mergeReadModelSessionWithLiveHotPath(
     return {
       ...nextSession,
       providerName: incomingSession.providerName,
+      ...(incomingSession.providerInstanceId !== undefined
+        ? { providerInstanceId: incomingSession.providerInstanceId }
+        : previousSession.providerInstanceId !== undefined
+          ? { providerInstanceId: previousSession.providerInstanceId }
+          : {}),
       runtimeMode: incomingSession.runtimeMode,
       activeTurnId: previousSession.activeTurnId ?? incomingSession.activeTurnId,
       lastError: previousSession.lastError ?? incomingSession.lastError,
@@ -979,6 +1030,7 @@ function clearSettledTurnStreamingFlags(
 export function mergeReadModelThreadDetailWithLiveHotPath(
   incoming: ReadModelThread,
   previousThread: Thread | undefined,
+  snapshotSequence?: number,
 ): ReadModelThread {
   if (!previousThread) {
     return incoming;
@@ -1015,10 +1067,18 @@ export function mergeReadModelThreadDetailWithLiveHotPath(
   const latestTurn = mergeReadModelLatestTurnWithLiveHotPath(incoming.latestTurn, previousThread, {
     preserveRunningTurn,
   });
+  const claudeCacheReview =
+    previousThread.claudeCacheReview !== undefined &&
+    (snapshotSequence === undefined
+      ? incoming.updatedAt < (previousThread.updatedAt ?? previousThread.createdAt)
+      : snapshotSequence < (previousThread.claudeCacheReviewSequence ?? 0))
+      ? previousThread.claudeCacheReview
+      : incoming.claudeCacheReview;
   if (
     messages === incoming.messages &&
     session === incoming.session &&
-    latestTurn === incoming.latestTurn
+    latestTurn === incoming.latestTurn &&
+    claudeCacheReview === incoming.claudeCacheReview
   ) {
     return incoming;
   }
@@ -1027,6 +1087,7 @@ export function mergeReadModelThreadDetailWithLiveHotPath(
     messages,
     session,
     latestTurn,
+    ...(claudeCacheReview !== undefined ? { claudeCacheReview } : {}),
   };
 }
 
@@ -1254,7 +1315,10 @@ export function withOrchestrationEventSequence(
   activity: OrchestrationThreadActivity,
   sequence: number,
 ): OrchestrationThreadActivity {
-  return { ...activity, sequence };
+  // Match the read-model projection: runtime journal activity sequences and
+  // orchestration envelope sequences are different counters. Overwriting the
+  // former only on live updates reorders snapshot history into the new turn.
+  return { ...activity, sequence: activity.sequence ?? sequence };
 }
 
 /**
@@ -1475,6 +1539,9 @@ export function normalizeThreadSession(
       : undefined;
   const nextSession = {
     provider: toLegacyProvider(incoming.providerName),
+    ...(incoming.providerInstanceId !== undefined
+      ? { providerInstanceId: incoming.providerInstanceId }
+      : {}),
     status: toLegacySessionStatus(incoming.status),
     orchestrationStatus: incoming.status,
     activeTurnId: incoming.activeTurnId ?? undefined,
@@ -1485,6 +1552,7 @@ export function normalizeThreadSession(
   if (
     previous &&
     previous.provider === nextSession.provider &&
+    previous.providerInstanceId === nextSession.providerInstanceId &&
     previous.status === nextSession.status &&
     previous.orchestrationStatus === nextSession.orchestrationStatus &&
     previous.activeTurnId === nextSession.activeTurnId &&
@@ -1539,6 +1607,9 @@ function normalizeLatestTurn(
 export function normalizeThreadFromReadModel(
   incoming: ReadModelThread,
   previous: Thread | undefined,
+  snapshotSequence?: number,
+  /** `restoringSession`: see resolveInitialLastVisitedAt. */
+  options: { readonly restoringSession?: boolean } = {},
 ): Thread {
   const modelSelection = normalizeModelSelection(incoming.modelSelection, previous?.modelSelection);
   const session = normalizeThreadSession(incoming.session, previous?.session);
@@ -1549,6 +1620,19 @@ export function normalizeThreadFromReadModel(
     previous?.handoff && incoming.handoff && deepEqualJson(previous.handoff, incoming.handoff)
       ? previous.handoff
       : (incoming.handoff ?? null);
+  const incomingClaudeCacheReview =
+    snapshotSequence !== undefined && snapshotSequence < (previous?.claudeCacheReviewSequence ?? 0)
+      ? previous?.claudeCacheReview
+      : incoming.claudeCacheReview;
+  const claudeCacheReviewSequence =
+    snapshotSequence === undefined
+      ? previous?.claudeCacheReviewSequence
+      : Math.max(snapshotSequence, previous?.claudeCacheReviewSequence ?? 0);
+  const claudeCacheReview =
+    previous?.claudeCacheReview &&
+    deepEqualJson(previous.claudeCacheReview, incomingClaudeCacheReview ?? null)
+      ? previous.claudeCacheReview
+      : (incomingClaudeCacheReview ?? null);
   const lastKnownPr =
     previous?.lastKnownPr &&
     incoming.lastKnownPr &&
@@ -1560,10 +1644,6 @@ export function normalizeThreadFromReadModel(
     deepEqualJson(previous.pinnedMessages, incoming.pinnedMessages ?? null)
       ? previous.pinnedMessages
       : (incoming.pinnedMessages as Thread["pinnedMessages"]);
-  const threadMarkers =
-    previous?.threadMarkers && deepEqualJson(previous.threadMarkers, incoming.threadMarkers ?? null)
-      ? previous.threadMarkers
-      : (incoming.threadMarkers as Thread["threadMarkers"]);
   const notes = incoming.notes;
   const goal = incoming.goal;
   const goalStartedAt = incoming.goalStartedAt;
@@ -1589,7 +1669,8 @@ export function normalizeThreadFromReadModel(
         ? undefined
         : [...incomingPendingInteractions];
   const error = normalizeThreadErrorMessage(incoming.session?.lastError);
-  const lastVisitedAt = previous?.lastVisitedAt ?? incoming.updatedAt;
+  const lastVisitedAt = previous?.lastVisitedAt ?? resolveInitialLastVisitedAt(incoming, options);
+  const resolvedLatestHumanMessageAt = incoming.latestHumanMessageAt;
   const resolvedLatestUserMessageAt =
     Object.hasOwn(incoming, "latestUserMessageAt") && incoming.latestUserMessageAt !== undefined
       ? (incoming.latestUserMessageAt ?? null)
@@ -1663,15 +1744,21 @@ export function normalizeThreadFromReadModel(
     (previous.associatedWorktreeRef ?? null) === nextAssociatedWorktreeRef &&
     (previous.createBranchFlowCompleted ?? false) === resolvedCreateBranchFlowCompleted &&
     previous.latestUserMessageAt === resolvedLatestUserMessageAt &&
+    previous.latestHumanMessageAt === resolvedLatestHumanMessageAt &&
     previous.hasPendingApprovals === resolvedHasPendingApprovals &&
     previous.hasPendingUserInput === resolvedHasPendingUserInput &&
     previous.hasActionableProposedPlan === resolvedHasActionableProposedPlan &&
     (previous.forkSourceThreadId ?? null) === (incoming.forkSourceThreadId ?? null) &&
     (previous.sidechatSourceThreadId ?? null) === (incoming.sidechatSourceThreadId ?? null) &&
+    // The context never changes after creation; its URL identifies the item.
+    (previous.sidechatContext?.url ?? null) === (incoming.sidechatContext?.url ?? null) &&
+    (previous.sidechatLastActivityAt ?? null) === (incoming.sidechatLastActivityAt ?? null) &&
+    (previous.sidechatExpiredAt ?? null) === (incoming.sidechatExpiredAt ?? null) &&
     deepEqualJson(previous.lastKnownPr ?? null, lastKnownPr) &&
     (previous.handoff ?? null) === handoff &&
+    (previous.claudeCacheReview ?? null) === claudeCacheReview &&
+    previous.claudeCacheReviewSequence === claudeCacheReviewSequence &&
     previous.pinnedMessages === pinnedMessages &&
-    previous.threadMarkers === threadMarkers &&
     previous.notes === notes &&
     previous.goal === goal &&
     (previous.goalStartedAt ?? null) === (goalStartedAt ?? null) &&
@@ -1720,15 +1807,22 @@ export function normalizeThreadFromReadModel(
     createBranchFlowCompleted: resolvedCreateBranchFlowCompleted,
     forkSourceThreadId: incoming.forkSourceThreadId ?? null,
     sidechatSourceThreadId: incoming.sidechatSourceThreadId ?? null,
+    sidechatContext: incoming.sidechatContext ?? null,
+    sidechatLastActivityAt: incoming.sidechatLastActivityAt ?? null,
+    sidechatExpiredAt: incoming.sidechatExpiredAt ?? null,
     lastKnownPr,
     handoff,
+    claudeCacheReview,
+    ...(claudeCacheReviewSequence !== undefined ? { claudeCacheReviewSequence } : {}),
     ...(pinnedMessages !== undefined ? { pinnedMessages } : {}),
-    ...(threadMarkers !== undefined ? { threadMarkers } : {}),
     ...(notes !== undefined ? { notes } : {}),
     ...(goal !== undefined ? { goal } : {}),
     ...(goalStartedAt !== undefined ? { goalStartedAt } : {}),
     ...(goalPausedAt !== undefined ? { goalPausedAt } : {}),
     ...(goalAchievements !== undefined ? { goalAchievements } : {}),
+    ...(resolvedLatestHumanMessageAt !== undefined
+      ? { latestHumanMessageAt: resolvedLatestHumanMessageAt }
+      : {}),
     ...(resolvedLatestUserMessageAt !== undefined
       ? { latestUserMessageAt: resolvedLatestUserMessageAt }
       : {}),
@@ -1750,6 +1844,9 @@ export function normalizeThreadFromReadModel(
 export function normalizeThreadShellSnapshot(
   incoming: ShellSnapshotThread,
   previous: Thread | undefined,
+  snapshotSequence?: number,
+  /** `restoringSession`: see resolveInitialLastVisitedAt. */
+  options: { readonly restoringSession?: boolean } = {},
 ): {
   shell: ThreadShell;
   session: ThreadSession | null;
@@ -1762,6 +1859,19 @@ export function normalizeThreadShellSnapshot(
     previous?.handoff && incoming.handoff && deepEqualJson(previous.handoff, incoming.handoff)
       ? previous.handoff
       : (incoming.handoff ?? null);
+  const incomingClaudeCacheReview =
+    snapshotSequence !== undefined && snapshotSequence < (previous?.claudeCacheReviewSequence ?? 0)
+      ? previous?.claudeCacheReview
+      : incoming.claudeCacheReview;
+  const claudeCacheReviewSequence =
+    snapshotSequence === undefined
+      ? previous?.claudeCacheReviewSequence
+      : Math.max(snapshotSequence, previous?.claudeCacheReviewSequence ?? 0);
+  const claudeCacheReview =
+    previous?.claudeCacheReview &&
+    deepEqualJson(previous.claudeCacheReview, incomingClaudeCacheReview ?? null)
+      ? previous.claudeCacheReview
+      : (incomingClaudeCacheReview ?? null);
   const lastKnownPr =
     previous?.lastKnownPr &&
     incoming.lastKnownPr &&
@@ -1769,7 +1879,7 @@ export function normalizeThreadShellSnapshot(
       ? previous.lastKnownPr
       : (incoming.lastKnownPr ?? null);
   const error = normalizeThreadErrorMessage(incoming.session?.lastError);
-  const lastVisitedAt = previous?.lastVisitedAt ?? incoming.updatedAt;
+  const lastVisitedAt = previous?.lastVisitedAt ?? resolveInitialLastVisitedAt(incoming, options);
   const nextWorktreePath = incoming.worktreePath;
   const nextWorkingDirectory = incoming.workingDirectory ?? null;
   const nextAssociatedWorktreePath = incoming.associatedWorktreePath ?? null;
@@ -1828,12 +1938,16 @@ export function normalizeThreadShellSnapshot(
     subagentRole: incoming.subagentRole ?? null,
     forkSourceThreadId: incoming.forkSourceThreadId ?? null,
     sidechatSourceThreadId: incoming.sidechatSourceThreadId ?? null,
+    sidechatContext: incoming.sidechatContext ?? null,
+    sidechatLastActivityAt: incoming.sidechatLastActivityAt ?? null,
+    sidechatExpiredAt: incoming.sidechatExpiredAt ?? null,
     lastKnownPr,
     handoff,
+    claudeCacheReview,
+    ...(claudeCacheReviewSequence !== undefined ? { claudeCacheReviewSequence } : {}),
     // The sidebar shell snapshot/event does not carry detail-only annotations, so keep those
     // values instead of clobbering them with `undefined`. Goals are shell state and update here.
     ...(previous?.pinnedMessages !== undefined ? { pinnedMessages: previous.pinnedMessages } : {}),
-    ...(previous?.threadMarkers !== undefined ? { threadMarkers: previous.threadMarkers } : {}),
     ...(previous?.notes !== undefined ? { notes: previous.notes } : {}),
     ...(previous?.goalAchievements !== undefined
       ? { goalAchievements: previous.goalAchievements }
@@ -1841,6 +1955,9 @@ export function normalizeThreadShellSnapshot(
     ...(goal !== undefined ? { goal } : {}),
     ...(goalStartedAt !== undefined ? { goalStartedAt } : {}),
     ...(goalPausedAt !== undefined ? { goalPausedAt } : {}),
+    ...(incoming.latestHumanMessageAt !== undefined
+      ? { latestHumanMessageAt: incoming.latestHumanMessageAt }
+      : {}),
     ...(incoming.latestUserMessageAt !== undefined
       ? { latestUserMessageAt: incoming.latestUserMessageAt ?? null }
       : {}),
@@ -1887,8 +2004,9 @@ export function mapProjects(
 
   const mappedProjects = incoming
     .map((project) => {
+      const previousWithSameId = previousById.get(project.id);
       const existing =
-        previousById.get(project.id) ?? previousByCwd.get(projectCwdKey(project.workspaceRoot));
+        previousWithSameId ?? previousByCwd.get(projectCwdKey(project.workspaceRoot));
       return normalizeProject(project, existing);
     })
     .map((project, incomingIndex) => {
@@ -1932,7 +2050,7 @@ function toLegacySessionStatus(
   }
 }
 
-function toLegacyProvider(providerName: string | null): ProviderKind {
+export function toLegacyProvider(providerName: string | null): ProviderKind {
   if (
     providerName === "codex" ||
     providerName === "claudeAgent" ||
@@ -1940,11 +2058,15 @@ function toLegacyProvider(providerName: string | null): ProviderKind {
     providerName === "antigravity" ||
     providerName === "grok" ||
     providerName === "droid" ||
-    providerName === "kilo" ||
     providerName === "opencode" ||
-    providerName === "pi"
+    providerName === "pi" ||
+    providerName === "devin" ||
+    providerName === "omp"
   ) {
     return providerName;
+  }
+  if (providerName === "kilo") {
+    return "opencode";
   }
   return "codex";
 }
@@ -1958,6 +2080,7 @@ export function resolveThreadSidebarMetadata(
 ): Pick<
   SidebarThreadSummary,
   | "latestUserMessageAt"
+  | "latestHumanMessageAt"
   | "hasPendingApprovals"
   | "hasPendingUserInput"
   | "hasActionableProposedPlan"
@@ -1965,6 +2088,7 @@ export function resolveThreadSidebarMetadata(
 > {
   const needsDerivedMetadata =
     thread.latestUserMessageAt === undefined ||
+    thread.latestHumanMessageAt === undefined ||
     thread.hasPendingApprovals === undefined ||
     thread.hasPendingUserInput === undefined ||
     thread.hasActionableProposedPlan === undefined;
@@ -1979,6 +2103,10 @@ export function resolveThreadSidebarMetadata(
 
   return {
     latestUserMessageAt: thread.latestUserMessageAt ?? derivedMetadata?.latestUserMessageAt ?? null,
+    latestHumanMessageAt:
+      thread.latestHumanMessageAt !== undefined
+        ? thread.latestHumanMessageAt
+        : (derivedMetadata?.latestHumanMessageAt ?? null),
     hasPendingApprovals:
       thread.hasPendingApprovals ?? derivedMetadata?.hasPendingApprovals ?? false,
     hasPendingUserInput:

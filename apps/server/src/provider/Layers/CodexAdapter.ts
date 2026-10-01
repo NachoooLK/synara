@@ -7,6 +7,7 @@
  * @module CodexAdapterLive
  */
 import {
+  AsyncUserInputQuestions,
   type ChatAttachment,
   type CanonicalItemType,
   type CanonicalRequestType,
@@ -19,6 +20,8 @@ import {
   type ProviderSendTurnInput,
   type ProviderListSkillsResult,
   type ProviderRuntimeEvent,
+  type ProviderInstanceId,
+  type ProviderSession,
   type ServerVoiceTranscriptionResult,
   type ThreadTokenUsageSnapshot,
   type ProviderUserInputAnswers,
@@ -54,18 +57,28 @@ import {
   resolveAcpTurnIdleTimeoutMs,
 } from "../acp/AcpTurnIdleWatchdog.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
-import { acquireAgentGatewaySessionLease } from "../../agentGateway/sessionLease.ts";
+import {
+  acquireAgentGatewaySessionLease,
+  AGENT_GATEWAY_NO_CAPABILITIES,
+  captureAgentGatewayCapabilityInput,
+} from "../../agentGateway/sessionLease.ts";
 import { filterProviderPromptImageAttachments } from "../promptAttachments.ts";
 import { resolveProviderAttachmentPath } from "../providerAttachmentPaths.ts";
 import {
   codexGeneratedImageArtifact,
+  type CodexGeneratedImageHomeCandidate,
+  type CodexGeneratedImageHomeContext,
   extractCodexGeneratedImageReference,
   firstStringValue,
   isCodexGeneratedImageItemType,
   sanitizeNestedCodexGeneratedImagePayloads,
 } from "../../codexGeneratedImages.ts";
-import { isNonFatalCodexErrorMessage } from "../../codexErrorClassification.ts";
+import {
+  CodexSessionStartError,
+  isNonFatalCodexErrorMessage,
+} from "../../codexErrorClassification.ts";
 import { ServerConfig } from "../../config.ts";
+import { resolveCodexServiceTier } from "../../codexServiceTier.ts";
 import { makeRuntimeTaskListItem } from "../runtimeTaskList.ts";
 import { extractProposedPlanMarkdown } from "../planMode.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
@@ -188,12 +201,13 @@ function codexModelSelectionOverrides(
     return {};
   }
 
+  const serviceTier = resolveCodexServiceTier(modelSelection);
   return {
     model: modelSelection.model,
     ...(modelSelection.options?.reasoningEffort !== undefined
       ? { effort: modelSelection.options.reasoningEffort }
       : {}),
-    ...(modelSelection.options?.fastMode ? { serviceTier: "fast" } : {}),
+    ...(serviceTier !== undefined ? { serviceTier } : {}),
   };
 }
 
@@ -264,6 +278,7 @@ function providerErrorMapsToWarning(event: ProviderEvent): boolean {
   return (
     event.kind === "error" &&
     (event.method === "process/stderr" ||
+      event.method === "mcpServer/elicitation/request/unrenderable" ||
       (event.method === "error" &&
         typeof event.message === "string" &&
         isNonFatalCodexErrorMessage(event.message)))
@@ -291,8 +306,24 @@ function normalizeCodexTokenUsage(value: unknown): ThreadTokenUsageSnapshot | un
   const reasoningOutputTokens =
     asNumber(lastUsage?.reasoning_output_tokens) ?? asNumber(lastUsage?.reasoningOutputTokens);
 
+  const totalInput = asNumber(totalUsage?.input_tokens) ?? asNumber(totalUsage?.inputTokens);
+  const totalOutput = asNumber(totalUsage?.output_tokens) ?? asNumber(totalUsage?.outputTokens);
+  const totalCached =
+    asNumber(totalUsage?.cached_input_tokens) ?? asNumber(totalUsage?.cachedInputTokens);
+  const totalWrites =
+    asNumber(totalUsage?.cacheWriteInputTokens) ?? asNumber(totalUsage?.cache_write_input_tokens);
   return {
     usedTokens,
+    ...(totalInput !== undefined && totalOutput !== undefined
+      ? {
+          cumulativeUsage: {
+            inputTokens: totalInput,
+            outputTokens: totalOutput,
+            ...(totalCached !== undefined ? { cachedInputTokens: totalCached } : {}),
+            ...(totalWrites !== undefined ? { cacheCreationInputTokens: totalWrites } : {}),
+          },
+        }
+      : {}),
     ...(totalProcessedTokens !== undefined && totalProcessedTokens > usedTokens
       ? { totalProcessedTokens }
       : {}),
@@ -365,7 +396,27 @@ function toCanonicalItemType(raw: unknown): CanonicalItemType {
   return "unknown";
 }
 
-function itemTitle(itemType: CanonicalItemType): string | undefined {
+function toolItemTitle(item: Record<string, unknown> | undefined): string | undefined {
+  if (!item) return undefined;
+  const appContext = asObject(item.appContext);
+  const action =
+    asTrimmedString(appContext?.actionName) ??
+    asTrimmedString(item.title) ??
+    asTrimmedString(item.tool) ??
+    asTrimmedString(item.name);
+  if (!action) return undefined;
+
+  const appName = asTrimmedString(appContext?.appName);
+  if (!appName || action.toLowerCase().includes(appName.toLowerCase())) {
+    return action;
+  }
+  return `${action} in ${appName}`;
+}
+
+function itemTitle(
+  itemType: CanonicalItemType,
+  item?: Record<string, unknown>,
+): string | undefined {
   switch (itemType) {
     case "assistant_message":
       return "Assistant message";
@@ -380,9 +431,9 @@ function itemTitle(itemType: CanonicalItemType): string | undefined {
     case "file_change":
       return "File change";
     case "mcp_tool_call":
-      return "MCP tool call";
+      return toolItemTitle(item) ?? "MCP tool call";
     case "dynamic_tool_call":
-      return "Tool call";
+      return toolItemTitle(item) ?? "Tool call";
     case "web_search":
       return "Web search";
     case "image_generation":
@@ -469,6 +520,8 @@ function toRequestTypeFromMethod(method: string): CanonicalRequestType {
       return "file_change_approval";
     case "item/permissions/requestApproval":
       return "permissions_approval";
+    case "mcpServer/elicitation/request":
+      return "tool_approval";
     case "applyPatchApproval":
       return "apply_patch_approval";
     case "execCommandApproval":
@@ -494,6 +547,8 @@ function toRequestTypeFromKind(kind: unknown): CanonicalRequestType {
       return "file_change_approval";
     case "permissions":
       return "permissions_approval";
+    case "tool":
+      return "tool_approval";
     default:
       return "unknown";
   }
@@ -656,11 +711,16 @@ function codexGeneratedImageThreadId(
   );
 }
 
-function sanitizeGeneratedImagePayload(event: ProviderEvent, canonicalThreadId: ThreadId): unknown {
+function sanitizeGeneratedImagePayload(
+  event: ProviderEvent,
+  canonicalThreadId: ThreadId,
+  codexHome?: CodexGeneratedImageHomeContext,
+): unknown {
   const payload = asObject(event.payload);
   return sanitizeNestedCodexGeneratedImagePayloads({
     value: event.payload ?? {},
     threadId: codexGeneratedImageThreadId(event, payload) ?? canonicalThreadId,
+    ...(codexHome ? { codexHome } : {}),
   });
 }
 
@@ -668,13 +728,14 @@ function withSanitizedGeneratedImageRaw(
   base: Omit<ProviderRuntimeEvent, "type" | "payload">,
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  codexHome?: CodexGeneratedImageHomeContext,
 ): Omit<ProviderRuntimeEvent, "type" | "payload"> {
   return {
     ...base,
     raw: {
       source: eventRawSource(event),
       method: event.method,
-      payload: sanitizeGeneratedImagePayload(event, canonicalThreadId),
+      payload: sanitizeGeneratedImagePayload(event, canonicalThreadId, codexHome),
     },
   };
 }
@@ -711,6 +772,7 @@ function generatedImageEventCandidate(event: ProviderEvent): Record<string, unkn
 function mapGeneratedImageEndEvent(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  codexHome?: CodexGeneratedImageHomeContext,
 ): ProviderRuntimeEvent | undefined {
   if (
     event.method !== "codex/event/image_generation_end" &&
@@ -723,6 +785,7 @@ function mapGeneratedImageEndEvent(
   const reference = extractCodexGeneratedImageReference({
     value: candidate,
     threadId: codexGeneratedImageThreadId(event, payload) ?? canonicalThreadId,
+    ...(codexHome ? { codexHome } : {}),
   });
   if (!reference) {
     return undefined;
@@ -755,6 +818,7 @@ function mapGeneratedImageEndEvent(
     },
     event,
     canonicalThreadId,
+    codexHome,
   );
 
   return {
@@ -805,6 +869,7 @@ function runtimeEventBase(
     ...(event.parentTurnId ? { parentTurnId: event.parentTurnId } : {}),
     ...(event.itemId ? { itemId: asRuntimeItemId(event.itemId) } : {}),
     ...(event.requestId ? { requestId: asRuntimeRequestId(event.requestId) } : {}),
+    ...(event.providerInstanceId ? { providerInstanceId: event.providerInstanceId } : {}),
     ...(refs ? { providerRefs: refs } : {}),
     raw: {
       source: eventRawSource(event),
@@ -847,6 +912,7 @@ function mapItemLifecycle(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
   lifecycle: "item.started" | "item.updated" | "item.completed",
+  codexHome?: CodexGeneratedImageHomeContext,
 ): ProviderRuntimeEvent | undefined {
   const payload = asObject(event.payload);
   const item = asObject(payload?.item);
@@ -864,6 +930,7 @@ function mapItemLifecycle(
       ? extractCodexGeneratedImageReference({
           value: source,
           threadId: codexGeneratedImageThreadId(event, payload) ?? canonicalThreadId,
+          ...(codexHome ? { codexHome } : {}),
         })
       : undefined;
   if (
@@ -882,6 +949,20 @@ function mapItemLifecycle(
   const detail =
     itemType === "reasoning" ? reasoningSummaryDetail(source) : itemDetail(source, payload ?? {});
   const status = itemStatus(lifecycle, source.status);
+  const title = itemTitle(canonicalItemType, source);
+  const asyncQuestions =
+    itemType === "assistant_message" && Array.isArray(source.questions)
+      ? Schema.decodeUnknownOption(AsyncUserInputQuestions)(
+          source.questions.map((value: unknown) => {
+            const question = asObject(value);
+            return question
+              ? question.options == null
+                ? { title: question.title }
+                : { title: question.title, options: question.options }
+              : value;
+          }),
+        )
+      : Option.none();
 
   return {
     ...(generatedImageReference
@@ -889,13 +970,15 @@ function mapItemLifecycle(
           runtimeEventBase(event, canonicalThreadId),
           event,
           canonicalThreadId,
+          codexHome,
         )
       : runtimeEventBase(event, canonicalThreadId)),
     type: lifecycle,
     payload: {
       itemType: canonicalItemType,
+      ...(Option.isSome(asyncQuestions) ? { asyncQuestions: asyncQuestions.value } : {}),
       ...(status ? { status } : {}),
-      ...(itemTitle(canonicalItemType) ? { title: itemTitle(canonicalItemType) } : {}),
+      ...(title ? { title } : {}),
       ...(generatedImageReference
         ? { detail: generatedImageReference.path }
         : detail
@@ -909,6 +992,113 @@ function mapItemLifecycle(
     },
   };
 }
+
+type CodexHookRunStatus = "completed" | "failed" | "blocked" | "stopped";
+
+function toCodexHookRunStatus(value: unknown): CodexHookRunStatus | undefined {
+  return value === "completed" || value === "failed" || value === "blocked" || value === "stopped"
+    ? value
+    : undefined;
+}
+
+function toHookOutcome(status: CodexHookRunStatus | undefined): "success" | "error" | "cancelled" {
+  if (status === "completed") return "success";
+  if (status === "blocked" || status === "stopped") return "cancelled";
+  return "error";
+}
+
+function hookRunOutput(run: Record<string, unknown>): string | undefined {
+  if (!Array.isArray(run.entries)) {
+    return undefined;
+  }
+  const output = run.entries
+    .flatMap((entry) => {
+      const record = asObject(entry);
+      const text = asTrimmedString(record?.text);
+      if (!text) return [];
+      const kind = asTrimmedString(record?.kind);
+      return [kind ? `${kind}: ${text}` : text];
+    })
+    .join("\n");
+  return output ? sanitizeUnmappedProviderDetail(output) : undefined;
+}
+
+function withSanitizedHookRaw(
+  event: ProviderEvent,
+  canonicalThreadId: ThreadId,
+): Omit<ProviderRuntimeEvent, "type" | "payload"> {
+  return {
+    ...runtimeEventBase(event, canonicalThreadId),
+    raw: {
+      source: eventRawSource(event),
+      method: event.method,
+      payload: { synaraSanitized: true },
+    },
+  };
+}
+
+function mapCodexHookEvent(
+  event: ProviderEvent,
+  canonicalThreadId: ThreadId,
+): ProviderRuntimeEvent | undefined {
+  if (event.method !== "hook/started" && event.method !== "hook/completed") {
+    return undefined;
+  }
+  const run = asObject(asObject(event.payload)?.run);
+  const hookId = asTrimmedString(run?.id);
+  const hookEvent = asTrimmedString(run?.eventName);
+  if (!run || !hookId || !hookEvent) {
+    return undefined;
+  }
+  const hookName = asTrimmedString(run.sourcePath) ?? asTrimmedString(run.handlerType) ?? hookEvent;
+  const statusMessage = sanitizeUnmappedProviderDetail(asTrimmedString(run.statusMessage));
+  const data = sanitizeUnmappedProviderData(run);
+  const base = withSanitizedHookRaw(event, canonicalThreadId);
+
+  if (event.method === "hook/started") {
+    return {
+      ...base,
+      type: "hook.started",
+      payload: {
+        hookId,
+        hookName,
+        hookEvent,
+        ...(statusMessage ? { statusMessage } : {}),
+        data,
+      },
+    };
+  }
+
+  const status = toCodexHookRunStatus(run.status);
+  const durationCandidate = asNumber(run.durationMs);
+  const durationMs =
+    durationCandidate !== undefined && Number.isInteger(durationCandidate) && durationCandidate >= 0
+      ? durationCandidate
+      : undefined;
+  const output = hookRunOutput(run);
+  return {
+    ...base,
+    type: "hook.completed",
+    payload: {
+      hookId,
+      hookName,
+      hookEvent,
+      outcome: toHookOutcome(status),
+      ...(status ? { status } : {}),
+      ...(statusMessage ? { statusMessage } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(output ? { output } : {}),
+      data,
+    },
+  };
+}
+
+// Configuration/lifecycle bookkeeping belongs in native diagnostics, not the transcript.
+const DIAGNOSTIC_ONLY_CODEX_METHODS = new Set([
+  "remoteControl/status/changed",
+  "skills/changed",
+  "session/threadOpenRequested",
+]);
 
 function mapUnmappedCodexEvent(
   event: ProviderEvent,
@@ -945,12 +1135,17 @@ function mapUnmappedCodexEvent(
 function mapToRuntimeEvents(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  codexHome?: CodexGeneratedImageHomeContext,
 ): ReadonlyArray<ProviderRuntimeEvent> {
   const payload = asObject(event.payload);
   const turn = asObject(payload?.turn);
-  const generatedImageEndEvent = mapGeneratedImageEndEvent(event, canonicalThreadId);
+  const generatedImageEndEvent = mapGeneratedImageEndEvent(event, canonicalThreadId, codexHome);
   if (generatedImageEndEvent) {
     return [generatedImageEndEvent];
+  }
+  const hookEvent = mapCodexHookEvent(event, canonicalThreadId);
+  if (hookEvent) {
+    return [hookEvent];
   }
 
   if (event.kind === "error") {
@@ -991,7 +1186,10 @@ function mapToRuntimeEvents(
     }
 
     const detail =
-      asString(payload?.command) ?? asString(payload?.reason) ?? asString(payload?.prompt);
+      asString(payload?.command) ??
+      asString(payload?.reason) ??
+      asString(payload?.prompt) ??
+      asString(payload?.message);
     return [
       {
         ...runtimeEventBase(event, canonicalThreadId),
@@ -1280,7 +1478,7 @@ function mapToRuntimeEvents(
   }
 
   if (event.method === "item/started") {
-    const started = mapItemLifecycle(event, canonicalThreadId, "item.started");
+    const started = mapItemLifecycle(event, canonicalThreadId, "item.started", codexHome);
     return started ? [started] : [];
   }
 
@@ -1307,7 +1505,7 @@ function mapToRuntimeEvents(
         },
       ];
     }
-    const completed = mapItemLifecycle(event, canonicalThreadId, "item.completed");
+    const completed = mapItemLifecycle(event, canonicalThreadId, "item.completed", codexHome);
     return completed ? [completed] : [];
   }
 
@@ -1315,7 +1513,7 @@ function mapToRuntimeEvents(
     event.method === "item/reasoning/summaryPartAdded" ||
     event.method === "item/commandExecution/terminalInteraction"
   ) {
-    const updated = mapItemLifecycle(event, canonicalThreadId, "item.updated");
+    const updated = mapItemLifecycle(event, canonicalThreadId, "item.updated", codexHome);
     return updated ? [updated] : [];
   }
 
@@ -1373,14 +1571,16 @@ function mapToRuntimeEvents(
   }
 
   if (event.method === "item/mcpToolCall/progress") {
+    const toolUseId = asString(payload?.toolUseId) ?? asString(payload?.itemId);
+    const summary = asString(payload?.summary) ?? asString(payload?.message);
     return [
       {
         ...runtimeEventBase(event, canonicalThreadId),
         type: "tool.progress",
         payload: {
-          ...(asString(payload?.toolUseId) ? { toolUseId: asString(payload?.toolUseId) } : {}),
+          ...(toolUseId ? { toolUseId } : {}),
           ...(asString(payload?.toolName) ? { toolName: asString(payload?.toolName) } : {}),
-          ...(asString(payload?.summary) ? { summary: asString(payload?.summary) } : {}),
+          ...(summary ? { summary } : {}),
           ...(asNumber(payload?.elapsedSeconds) !== undefined
             ? { elapsedSeconds: asNumber(payload?.elapsedSeconds) }
             : {}),
@@ -1772,8 +1972,16 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
               ? {
                   agentGatewayMcp: {
                     endpointUrl: () => agentGatewayCredentials.mcpEndpointUrl,
-                    acquireSessionLease: (threadId) =>
-                      acquireAgentGatewaySessionLease(agentGatewayCredentials, threadId, PROVIDER)!,
+                    // Codex leases inside the app-server manager, which owns
+                    // session restarts. The manager carries the start input's
+                    // capability facts; review runtimes request none.
+                    acquireSessionLease: (threadId, capabilityInput) =>
+                      acquireAgentGatewaySessionLease(
+                        agentGatewayCredentials,
+                        threadId,
+                        PROVIDER,
+                        capabilityInput ?? AGENT_GATEWAY_NO_CAPABILITIES,
+                      )!,
                   },
                 }
               : {}),
@@ -1921,15 +2129,20 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
       const managerInput: CodexAppServerStartSessionInput = {
         threadId: input.threadId,
         provider: "codex",
+        ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
         ...(input.lifecycleGeneration !== undefined
           ? { lifecycleGeneration: input.lifecycleGeneration }
           : {}),
         ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
         ...(input.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+        ...(input.expectedCodexContinuationGeneration
+          ? { expectedCodexContinuationGeneration: input.expectedCodexContinuationGeneration }
+          : {}),
         ...(input.forkSourceResumeCursor !== undefined
           ? { forkSourceResumeCursor: input.forkSourceResumeCursor }
           : {}),
         ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
+        agentGatewayCapabilityInput: captureAgentGatewayCapabilityInput(input),
         runtimeMode: input.runtimeMode,
         ...codexModelSelectionOverrides(input.modelSelection),
       };
@@ -1941,9 +2154,12 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
             provider: PROVIDER,
             threadId: input.threadId,
             detail: toMessage(cause, "Failed to start Codex adapter session."),
+            ...(cause instanceof CodexSessionStartError
+              ? { reason: "startup-failed" as const }
+              : {}),
             cause,
           }),
-      }).pipe(Effect.map((session) => session));
+      });
     };
 
     const sendTurn: CodexAdapterShape["sendTurn"] = (input) =>
@@ -2034,7 +2250,12 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
 
     const readExternalThread: NonNullable<CodexAdapterShape["readExternalThread"]> = (input) =>
       Effect.tryPromise({
-        try: () => manager.readExternalThread(input),
+        try: () =>
+          manager.readExternalThread({
+            externalThreadId: input.externalThreadId,
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+            ...(input.providerOptions?.codex ? { codexOptions: input.providerOptions.codex } : {}),
+          }),
         catch: (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -2080,7 +2301,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
 
     const forkThread: CodexAdapterShape["forkThread"] = (input) =>
       Effect.tryPromise({
-        try: () => manager.forkThread(input),
+        try: (signal) => manager.forkThread(input, signal),
         catch: (cause) => toRequestError(input.sourceThreadId, "thread/fork", cause),
       });
 
@@ -2119,6 +2340,31 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
     const listSessions: CodexAdapterShape["listSessions"] = () =>
       Effect.sync(() => manager.listSessions());
 
+    const listGeneratedImageHomePaths: NonNullable<
+      CodexAdapterShape["listGeneratedImageHomePaths"]
+    > = (input) =>
+      Effect.sync(() => {
+        const homePaths = new Map<string, CodexGeneratedImageHomeCandidate>();
+        for (const { session, codexOptions } of manager.inspectSessions()) {
+          const instanceId = session.providerInstanceId ?? (PROVIDER as ProviderInstanceId);
+          if (
+            input?.enabledProviderInstanceIds &&
+            !input.enabledProviderInstanceIds.has(instanceId)
+          ) {
+            continue;
+          }
+          if (!codexOptions) {
+            continue;
+          }
+          const candidateKey =
+            typeof codexOptions === "string"
+              ? `path:${codexOptions}`
+              : JSON.stringify(codexOptions);
+          homePaths.set(candidateKey, codexOptions);
+        }
+        return [...homePaths.values()];
+      });
+
     const hasSession: CodexAdapterShape["hasSession"] = (threadId) =>
       Effect.sync(() => manager.hasSession(threadId));
 
@@ -2143,6 +2389,13 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           manager.listSkills({
             cwd: input.cwd,
             ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+            codexOptions: {
+              ...(input.binaryPath ? { binaryPath: input.binaryPath } : {}),
+              ...(input.homePath ? { homePath: input.homePath } : {}),
+              ...(input.shadowHomePath ? { shadowHomePath: input.shadowHomePath } : {}),
+              ...(input.accountId ? { accountId: input.accountId } : {}),
+              ...(input.environment ? { environment: input.environment } : {}),
+            },
             ...(input.forceReload !== undefined ? { forceReload: input.forceReload } : {}),
           }),
         catch: (cause) =>
@@ -2160,6 +2413,13 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           manager.listPlugins({
             ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
             ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+            codexOptions: {
+              ...(input.binaryPath ? { binaryPath: input.binaryPath } : {}),
+              ...(input.homePath ? { homePath: input.homePath } : {}),
+              ...(input.shadowHomePath ? { shadowHomePath: input.shadowHomePath } : {}),
+              ...(input.accountId ? { accountId: input.accountId } : {}),
+              ...(input.environment ? { environment: input.environment } : {}),
+            },
             ...(input.forceRemoteSync !== undefined
               ? { forceRemoteSync: input.forceRemoteSync }
               : {}),
@@ -2180,6 +2440,15 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           manager.readPlugin({
             marketplacePath: input.marketplacePath,
             pluginName: input.pluginName,
+            ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+            ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+            codexOptions: {
+              ...(input.binaryPath ? { binaryPath: input.binaryPath } : {}),
+              ...(input.homePath ? { homePath: input.homePath } : {}),
+              ...(input.shadowHomePath ? { shadowHomePath: input.shadowHomePath } : {}),
+              ...(input.accountId ? { accountId: input.accountId } : {}),
+              ...(input.environment ? { environment: input.environment } : {}),
+            },
           }),
         catch: (cause) =>
           new ProviderAdapterRequestError({
@@ -2190,9 +2459,19 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           }),
       }).pipe(Effect.map((result) => result satisfies ProviderReadPluginResult));
 
-    const listModels: NonNullable<CodexAdapterShape["listModels"]> = (_input) =>
+    const listModels: NonNullable<CodexAdapterShape["listModels"]> = (input) =>
       Effect.tryPromise({
-        try: () => manager.listModels(),
+        try: () =>
+          manager.listModels({
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+            codexOptions: {
+              ...(input.binaryPath ? { binaryPath: input.binaryPath } : {}),
+              ...(input.homePath ? { homePath: input.homePath } : {}),
+              ...(input.shadowHomePath ? { shadowHomePath: input.shadowHomePath } : {}),
+              ...(input.accountId ? { accountId: input.accountId } : {}),
+              ...(input.environment ? { environment: input.environment } : {}),
+            },
+          }),
         catch: (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -2204,7 +2483,11 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
 
     const transcribeVoice: NonNullable<CodexAdapterShape["transcribeVoice"]> = (input) =>
       Effect.tryPromise({
-        try: () => manager.transcribeVoice(input),
+        try: () =>
+          manager.transcribeVoice({
+            ...input,
+            ...(input.providerOptions?.codex ? { codexOptions: input.providerOptions.codex } : {}),
+          }),
         catch: (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -2220,6 +2503,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           manager.prewarmVoice({
             cwd: input.cwd,
             ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+            ...(input.providerOptions?.codex ? { codexOptions: input.providerOptions.codex } : {}),
           }),
         catch: (cause) =>
           new ProviderAdapterRequestError({
@@ -2239,6 +2523,14 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
             }
             yield* nativeEventLogger.write(event, event.threadId);
           });
+        const stampEventWithLiveSession = (event: ProviderEvent): ProviderEvent => {
+          const session = manager
+            .listSessions()
+            .find((entry: ProviderSession) => entry.threadId === event.threadId);
+          return event.providerInstanceId === undefined && session?.providerInstanceId
+            ? { ...event, providerInstanceId: session.providerInstanceId }
+            : event;
+        };
 
         const ingress = yield* makeBoundedCallbackIngress<CodexRuntimeIngressItem, never, never>(
           (item) =>
@@ -2273,8 +2565,13 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           },
         );
         const listener = (event: ProviderEvent) => {
+          const stampedEvent = stampEventWithLiveSession(event);
           const mappedRuntimeEvents = assignDerivedProviderRuntimeEventIds(
-            mapToRuntimeEvents(event, event.threadId),
+            mapToRuntimeEvents(
+              stampedEvent,
+              stampedEvent.threadId,
+              manager.getSessionCodexOptions(stampedEvent.threadId),
+            ),
           );
           const hasUnmappedEvent = mappedRuntimeEvents.some(
             (runtimeEvent) => runtimeEvent.type === "event.unmapped",
@@ -2282,13 +2579,15 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
           const sizedRuntimeEvents = mappedRuntimeEvents
             .filter(
               (runtimeEvent) =>
-                runtimeEvent.type !== "event.unmapped" || shouldSurfaceUnmappedEvent(event),
+                runtimeEvent.type !== "event.unmapped" ||
+                (!DIAGNOSTIC_ONLY_CODEX_METHODS.has(stampedEvent.method) &&
+                  shouldSurfaceUnmappedEvent(stampedEvent)),
             )
             .map(compactProviderRuntimeEventForIngress);
           const runtimeEvents = sizedRuntimeEvents.map((item) => item.event);
-          trackTurnWatchdogActivity(event.threadId, runtimeEvents);
+          trackTurnWatchdogActivity(stampedEvent.threadId, runtimeEvents);
           const nativeEvent = compactCodexNativeEventForIngress(
-            hasUnmappedEvent ? sanitizeUnmappedProviderEvent(event) : event,
+            hasUnmappedEvent ? sanitizeUnmappedProviderEvent(stampedEvent) : stampedEvent,
           );
           const result = ingress.offer({
             nativeEvent: nativeEvent.event,
@@ -2301,8 +2600,8 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
             // The runtime reconciler remains the final recovery fence.
             void Effect.runPromise(
               Effect.logError("Codex callback ingress exhausted terminal reserve", {
-                threadId: event.threadId,
-                method: event.method,
+                threadId: stampedEvent.threadId,
+                method: stampedEvent.method,
                 status: ingress.status(),
               }),
             );
@@ -2320,7 +2619,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
             turnWatchdogs.clear();
             manager.off("event", listener);
           });
-          yield* ingress.stop;
+          yield* ingress.abort;
           yield* Queue.shutdown(runtimeEventQueue);
         }),
     );
@@ -2352,6 +2651,7 @@ const makeCodexAdapter = (options?: CodexAdapterLiveOptions) =>
       respondToUserInput,
       stopSession,
       listSessions,
+      listGeneratedImageHomePaths,
       hasSession,
       stopAll,
       getComposerCapabilities,

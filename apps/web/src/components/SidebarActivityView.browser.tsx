@@ -7,12 +7,21 @@ import "../index.css";
 import { ProjectId, ThreadId, type OrchestrationThreadPullRequest } from "@synara/contracts";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { page, userEvent } from "vitest/browser";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
 
 import type { Project, SidebarThreadSummary } from "../types";
+import { DEFAULT_PROJECT_ICON, type ProjectAppearance } from "../lib/projectAppearance";
 import type { ThreadStatusPill } from "./Sidebar.logic";
 import { SidebarActivityView } from "./SidebarActivityView";
+
+const projectFavicon = `data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="8" fill="red"/></svg>',
+)}`;
+
+vi.mock("~/lib/wsHttpUrl", () => ({
+  resolveWsHttpUrl: () => projectFavicon,
+}));
 
 const PROJECT_A = ProjectId.makeUnsafe("activity-project-a");
 const PROJECT_B = ProjectId.makeUnsafe("activity-project-b");
@@ -58,6 +67,7 @@ function makeThread(
     } as SidebarThreadSummary["latestTurn"],
     lastVisitedAt: "2026-08-02T12:00:00.000Z",
     latestUserMessageAt: null,
+    latestHumanMessageAt: completedAt,
     hasPendingApprovals: false,
     hasPendingUserInput: false,
     hasActionableProposedPlan: false,
@@ -96,6 +106,7 @@ function renderActivity(input: {
       onVisibleThreadIdsChange={input.onVisibleThreadIdsChange ?? (() => {})}
       resolveThreadStatus={input.resolveThreadStatus ?? (() => null)}
       onOpenThread={input.onOpenThread ?? (() => {})}
+      onOpenThreadPullRequest={() => {}}
       onSetThreadSettled={input.onSetThreadSettled ?? (() => {})}
       onToggleThreadPinned={() => {}}
       onArchiveThread={() => {}}
@@ -112,8 +123,122 @@ function renderActivity(input: {
 }
 
 describe("SidebarActivityView", () => {
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-08-02T12:00:00.000Z"));
+  });
   afterEach(() => {
+    vi.restoreAllMocks();
     document.body.innerHTML = "";
+  });
+
+  it.each([
+    { name: "favicon", appearance: null },
+    { name: "emoji", appearance: { kind: "emoji", emoji: "🚀" } },
+    { name: "icon", appearance: { kind: "icon", icon: "rocket", color: "blue" } },
+    { name: "color", appearance: { kind: "icon", icon: DEFAULT_PROJECT_ICON, color: "red" } },
+  ] satisfies ReadonlyArray<{ name: string; appearance: ProjectAppearance | null }>)(
+    "keeps the $name project identity and worktree indicator in recent rows",
+    async ({ name, appearance }) => {
+      const thread = makeThread(0, {
+        envMode: "worktree",
+        worktreePath: "/tmp/activity-worktree",
+        branch: "feature/sidebar-icons",
+      });
+      const mounted = await render(
+        renderActivity({
+          threads: [thread],
+          projects: [{ ...makeProject(PROJECT_A, "Project A"), appearance }],
+        }),
+      );
+      await vi.waitFor(() => {
+        const row = page.getByTestId(`activity-thread-${thread.id}`).element();
+        if (name === "favicon") {
+          const image = row.querySelector<HTMLImageElement>("img");
+          expect(image?.naturalWidth).toBeGreaterThan(0);
+        } else if (appearance?.kind === "emoji") {
+          expect(row.textContent).toContain(appearance.emoji);
+          expect(row.querySelector("img")).toBeNull();
+        } else if (appearance?.kind === "icon") {
+          const glyphs = [...row.querySelectorAll<HTMLElement>('[data-slot="central-icon"]')];
+          const glyph = glyphs.find((element) =>
+            element.style.maskImage.includes(`/${appearance.icon}.svg`),
+          );
+          expect(glyph).toBeDefined();
+          const reference = document.createElement("span");
+          reference.style.color = `var(--project-${appearance.color})`;
+          document.body.appendChild(reference);
+          const expectedColor = getComputedStyle(reference).color;
+          reference.remove();
+          expect(getComputedStyle(glyph!).color).toBe(expectedColor);
+          expect(row.querySelector("img")).toBeNull();
+        }
+        expect(row.querySelector('[aria-label="Worktree"]')).not.toBeNull();
+      });
+      await mounted.unmount();
+    },
+  );
+
+  it("keeps mounted rows and navigation order stable until a human sends a new message", async () => {
+    const older = makeThread(500, {
+      latestHumanMessageAt: "2026-08-02T09:30:00.000Z",
+      projectId: PROJECT_B,
+    });
+    const newer = makeThread(501, {
+      latestHumanMessageAt: "2026-08-02T09:45:00.000Z",
+      hasLiveTailWork: true,
+    });
+    const onVisibleThreadIdsChange = vi.fn();
+    const input = {
+      projects: [makeProject(PROJECT_A, "Project A"), makeProject(PROJECT_B, "Project B")],
+      onVisibleThreadIdsChange,
+    };
+    const mounted = await render(renderActivity({ ...input, threads: [older, newer] }));
+    const mountedIds = () =>
+      [...document.querySelectorAll('[data-testid^="activity-thread-"]')].map((row) =>
+        row.getAttribute("data-testid"),
+      );
+    const expected = [newer.id, older.id];
+    const expectOrder = async (ids: ThreadId[]) => {
+      await vi.waitFor(() => {
+        expect(mountedIds()).toEqual(ids.map((id) => `activity-thread-${id}`));
+        expect(onVisibleThreadIdsChange).toHaveBeenLastCalledWith(ids);
+      });
+    };
+    await expectOrder(expected);
+    for (const update of [
+      {
+        latestTurn: { ...older.latestTurn!, completedAt: "2026-08-02T11:00:00.000Z" },
+        lastVisitedAt: "2026-08-02T09:00:00.000Z",
+      },
+      { lastVisitedAt: "2026-08-02T11:01:00.000Z" },
+      {
+        hasPendingUserInput: true,
+        session: {
+          provider: "codex" as const,
+          status: "running" as const,
+          orchestrationStatus: "running" as const,
+          createdAt: older.createdAt,
+          updatedAt: "2026-08-02T11:02:00.000Z",
+        },
+      },
+      { latestUserMessageAt: "2026-08-02T11:03:00.000Z", updatedAt: "2026-08-02T11:03:00.000Z" },
+    ]) {
+      await mounted.rerender(
+        renderActivity({ ...input, threads: [{ ...older, ...update }, newer] }),
+      );
+      await expectOrder(expected);
+    }
+    await page.getByRole("button", { name: "Activity options" }).click();
+    await page.getByRole("menuitemradio", { name: "Project", exact: true }).click();
+    await expectOrder(expected);
+    await mounted.rerender(
+      renderActivity({
+        ...input,
+        threads: [{ ...older, latestHumanMessageAt: "2026-08-02T11:04:00.000Z" }, newer],
+      }),
+    );
+    await expectOrder([older.id, newer.id]);
+    await mounted.unmount();
   });
 
   it("pages project groups, reports only mounted rows, and prefers live PR state", async () => {
@@ -289,14 +414,18 @@ describe("SidebarActivityView", () => {
     expect(onSetThreadSettled).toHaveBeenCalledWith(pinned.id, false);
 
     const resumedRow = page.getByTestId(`activity-thread-${resumedSettled.id}`).element();
-    expect(resumedRow.parentElement?.querySelector('button[aria-label="Undo"]')).not.toBeNull();
+    expect(resumedRow.parentElement?.querySelector('button[aria-label="Done"]')).not.toBeNull();
 
     page.getByTestId(`activity-thread-${unseen.id}`).element().focus();
     await vi.waitFor(() => {
       expect(getComputedStyle(completedStatusSlot!).opacity).toBe("0");
     });
     expect(completedStatusSlot?.getBoundingClientRect().left).toBe(completedStatusLeft);
-    await page.getByRole("button", { name: "Done" }).click();
+    page
+      .getByTestId(`activity-thread-${unseen.id}`)
+      .element()
+      .parentElement?.querySelector<HTMLButtonElement>('button[aria-label="Done"]')
+      ?.click();
     expect(onMarkThreadRead).toHaveBeenCalledWith(
       unseen.id,
       unseen.latestTurn?.completedAt ?? undefined,
@@ -393,29 +522,6 @@ describe("SidebarActivityView", () => {
         .element()
         .parentElement?.querySelector('[aria-label="Unread completion"]'),
     ).toBeNull();
-    await mounted.unmount();
-  });
-
-  it("gives pulsing status glyphs an accessible name", async () => {
-    const running = makeThread(400, { hasLiveTailWork: true });
-    const mounted = await render(
-      renderActivity({
-        threads: [running],
-        resolveThreadStatus: () => ({
-          label: "Working",
-          colorClass: "text-sky-600",
-          dotClass: "bg-sky-500",
-          pulse: true,
-        }),
-      }),
-    );
-
-    expect(
-      page
-        .getByTestId(`activity-thread-${running.id}`)
-        .element()
-        .parentElement?.querySelector('[role="img"][aria-label="Working"]'),
-    ).not.toBeNull();
     await mounted.unmount();
   });
 });

@@ -33,6 +33,7 @@ import {
   selectRepresentativeTerminalVisualIdentity,
 } from "../terminalVisualIdentity";
 import type { useHandleNewThread } from "./useHandleNewThread";
+import { isSidechatThread } from "@synara/shared/sidechatThread";
 
 type NewThreadContext = ReturnType<typeof useHandleNewThread>;
 
@@ -170,8 +171,10 @@ export function useRecentViewSwitcher(input: UseRecentViewSwitcherInput) {
     const activeDraftThread = activeDraftThreadRef.current;
 
     const availableThreadIds = new Set<ThreadId>();
-    for (const threadId of Object.keys(sidebarThreadSummaryById)) {
-      availableThreadIds.add(ThreadId.makeUnsafe(threadId));
+    for (const [threadId, thread] of Object.entries(sidebarThreadSummaryById)) {
+      if (!thread || !isSidechatThread(thread)) {
+        availableThreadIds.add(ThreadId.makeUnsafe(threadId));
+      }
     }
     for (const threadId of Object.keys(draftThreadsByThreadId)) {
       availableThreadIds.add(ThreadId.makeUnsafe(threadId));

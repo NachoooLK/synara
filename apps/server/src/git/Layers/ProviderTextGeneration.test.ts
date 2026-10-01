@@ -1,15 +1,16 @@
 import { Effect, Layer } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
-import { ServerSettingsService } from "../../serverSettings.ts";
 import {
+  ClaudeTextGeneration,
   CodexTextGeneration,
   CursorTextGeneration,
-  KiloTextGeneration,
+  DroidTextGeneration,
   OpenCodeTextGeneration,
   type TextGenerationShape,
   TextGeneration,
 } from "../Services/TextGeneration.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderTextGenerationLive } from "./ProviderTextGeneration.ts";
 
 function createTextGenerationDouble(label: string) {
@@ -45,6 +46,12 @@ function createTextGenerationDouble(label: string) {
       recap: `${label} recap`,
     }),
   );
+  const generateProjectDigest = vi.fn<TextGenerationShape["generateProjectDigest"]>(() =>
+    Effect.succeed({
+      summary: `${label} digest`,
+      focusItems: [],
+    }),
+  );
   const generateAutomationIntent = vi.fn<TextGenerationShape["generateAutomationIntent"]>(() =>
     Effect.succeed({
       isAutomation: true,
@@ -77,6 +84,7 @@ function createTextGenerationDouble(label: string) {
       generateBranchName,
       generateThreadTitle,
       generateThreadRecap,
+      generateProjectDigest,
       generateAutomationIntent,
       evaluateAutomationCompletion,
     } satisfies TextGenerationShape,
@@ -94,28 +102,30 @@ function createTextGenerationDouble(label: string) {
 function makeProviderTextGenerationTestLayer(
   settingsOverrides: Parameters<typeof ServerSettingsService.layerTest>[0] = {},
 ) {
+  const claude = createTextGenerationDouble("claude");
   const codex = createTextGenerationDouble("codex");
   const cursor = createTextGenerationDouble("cursor");
-  const kilo = createTextGenerationDouble("kilo");
+  const droid = createTextGenerationDouble("droid");
   const opencode = createTextGenerationDouble("opencode");
   const layer = ProviderTextGenerationLive.pipe(
+    Layer.provide(Layer.succeed(ClaudeTextGeneration, claude.service)),
     Layer.provide(Layer.succeed(CodexTextGeneration, codex.service)),
     Layer.provide(Layer.succeed(CursorTextGeneration, cursor.service)),
-    Layer.provide(Layer.succeed(KiloTextGeneration, kilo.service)),
+    Layer.provide(Layer.succeed(DroidTextGeneration, droid.service)),
     Layer.provide(Layer.succeed(OpenCodeTextGeneration, opencode.service)),
     Layer.provide(ServerSettingsService.layerTest(settingsOverrides)),
   );
 
-  return { layer, codex, cursor, kilo, opencode };
+  return { layer, claude, codex, cursor, droid, opencode };
 }
 
 describe("ProviderTextGenerationLive", () => {
   it("blocks generation when the selected provider is disabled", async () => {
-    const { layer, codex, cursor, kilo, opencode } = makeProviderTextGenerationTestLayer({
+    const { layer, codex, cursor, opencode } = makeProviderTextGenerationTestLayer({
       providers: {
         codex: { enabled: false },
         cursor: { enabled: false },
-        kilo: { enabled: false },
+        droid: { enabled: false },
         opencode: { enabled: false },
       },
     });
@@ -133,11 +143,10 @@ describe("ProviderTextGenerationLive", () => {
       ),
     ).rejects.toMatchObject({
       _tag: "TextGenerationError",
-      detail: "Codex is disabled in Settings > Providers.",
+      detail: "Provider instance 'codex' is disabled.",
     });
     expect(codex.generateDiffSummary).not.toHaveBeenCalled();
     expect(cursor.generateDiffSummary).not.toHaveBeenCalled();
-    expect(kilo.generateDiffSummary).not.toHaveBeenCalled();
     expect(opencode.generateDiffSummary).not.toHaveBeenCalled();
   });
 
@@ -152,8 +161,8 @@ describe("ProviderTextGenerationLive", () => {
         yield* textGeneration.generateDiffSummary({
           cwd: "/repo",
           patch: "diff --git a/file.ts b/file.ts",
-          model: "claude-opus-4-8",
-          modelSelection: { provider: "claudeAgent", model: "claude-opus-4-8" },
+          model: "Gemini 3.5 Flash",
+          modelSelection: { provider: "antigravity", model: "Gemini 3.5 Flash" },
         });
       }).pipe(Effect.provide(layer)),
     );
@@ -162,7 +171,7 @@ describe("ProviderTextGenerationLive", () => {
     expect(cursor.generateDiffSummary).toHaveBeenCalledWith(
       expect.objectContaining({
         model: "composer-2",
-        modelSelection: { provider: "cursor", model: "composer-2" },
+        modelSelection: { provider: "cursor", instanceId: "cursor", model: "composer-2" },
       }),
     );
   });
@@ -187,6 +196,37 @@ describe("ProviderTextGenerationLive", () => {
     expect(opencode.generateDiffSummary).not.toHaveBeenCalled();
   });
 
+  it("keeps canonical Codex text generation on Codex when settings try to retarget its id", async () => {
+    const { layer, claude, codex } = makeProviderTextGenerationTestLayer({
+      providerInstances: {
+        codex: {
+          driver: "claudeAgent",
+          enabled: true,
+          config: { binaryPath: "/malicious/claude" },
+        },
+      },
+    });
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const textGeneration = yield* TextGeneration;
+        return yield* textGeneration.generateDiffSummary({
+          cwd: "/repo",
+          patch: "diff --git a/file.ts b/file.ts",
+          modelSelection: {
+            provider: "codex",
+            instanceId: "codex",
+            model: "gpt-5.4-mini",
+          },
+        });
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(result.summary).toBe("codex summary");
+    expect(codex.generateDiffSummary).toHaveBeenCalledTimes(1);
+    expect(claude.generateDiffSummary).not.toHaveBeenCalled();
+  });
+
   it("routes OpenCode provider/model slugs to OpenCode", async () => {
     const { layer, codex, cursor, opencode } = makeProviderTextGenerationTestLayer();
 
@@ -205,28 +245,6 @@ describe("ProviderTextGenerationLive", () => {
     expect(opencode.generateDiffSummary).toHaveBeenCalledTimes(1);
     expect(codex.generateDiffSummary).not.toHaveBeenCalled();
     expect(cursor.generateDiffSummary).not.toHaveBeenCalled();
-  });
-
-  it("routes explicit Kilo model selections through Kilo text generation", async () => {
-    const { layer, codex, kilo, opencode } = makeProviderTextGenerationTestLayer();
-
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const textGeneration = yield* TextGeneration;
-        yield* textGeneration.generateDiffSummary({
-          cwd: "/repo",
-          patch: "diff --git a/file.ts b/file.ts",
-          modelSelection: {
-            provider: "kilo",
-            model: "kilo/kilo-auto/free",
-          },
-        });
-      }).pipe(Effect.provide(layer)),
-    );
-
-    expect(kilo.generateDiffSummary).toHaveBeenCalledTimes(1);
-    expect(opencode.generateDiffSummary).not.toHaveBeenCalled();
-    expect(codex.generateDiffSummary).not.toHaveBeenCalled();
   });
 
   it("routes explicit OpenCode model selections and preserves provider options", async () => {
@@ -259,14 +277,15 @@ describe("ProviderTextGenerationLive", () => {
     expect(result.title).toBe("opencode title");
     expect(opencode.generateThreadTitle).toHaveBeenCalledWith(
       expect.objectContaining({
-        modelSelection: {
+        modelSelection: expect.objectContaining({
+          instanceId: "opencode",
           provider: "opencode",
           model: "openai/gpt-5",
           options: {
             agent: "plan",
             variant: "balanced",
           },
-        },
+        }),
         providerOptions: {
           opencode: {
             binaryPath: "/custom/bin/opencode",
@@ -279,55 +298,73 @@ describe("ProviderTextGenerationLive", () => {
     expect(cursor.generateThreadTitle).not.toHaveBeenCalled();
   });
 
-  it("routes explicit Cursor model selections and preserves provider options", async () => {
-    const { layer, codex, cursor, opencode } = makeProviderTextGenerationTestLayer();
+  it("routes explicit Droid selections and preserves provider options", async () => {
+    const { layer, codex, cursor, droid, opencode } = makeProviderTextGenerationTestLayer();
+    const providerOptions = { droid: { binaryPath: "/custom/bin/droid" } };
 
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const textGeneration = yield* TextGeneration;
         return yield* textGeneration.generateThreadTitle({
           cwd: "/repo",
-          message: "Plan the Cursor integration work",
+          message: "Plan the Droid integration work",
           modelSelection: {
-            provider: "cursor",
-            model: "composer-2",
-            options: {
-              reasoningEffort: "high",
-              fastMode: true,
-            },
+            provider: "droid",
+            model: "deepseek-v4-flash-0731",
+            options: { reasoningEffort: "high" },
           },
-          providerOptions: {
-            cursor: {
-              binaryPath: "/custom/bin/agent",
-              apiEndpoint: "http://127.0.0.1:3947",
-            },
-          },
+          providerOptions,
         });
       }).pipe(Effect.provide(layer)),
     );
 
-    expect(result.title).toBe("cursor title");
-    expect(cursor.generateThreadTitle).toHaveBeenCalledWith(
+    expect(result.title).toBe("droid title");
+    expect(droid.generateThreadTitle).toHaveBeenCalledWith(
       expect.objectContaining({
         modelSelection: {
-          provider: "cursor",
-          model: "composer-2",
-          options: {
-            reasoningEffort: "high",
-            fastMode: true,
-          },
+          provider: "droid",
+          instanceId: "droid",
+          model: "deepseek-v4-flash-0731",
+          options: { reasoningEffort: "high" },
         },
-        providerOptions: {
-          cursor: {
-            binaryPath: "/custom/bin/agent",
-            apiEndpoint: "http://127.0.0.1:3947",
-          },
-        },
+        providerOptions,
       }),
     );
     expect(codex.generateThreadTitle).not.toHaveBeenCalled();
+    expect(cursor.generateThreadTitle).not.toHaveBeenCalled();
     expect(opencode.generateThreadTitle).not.toHaveBeenCalled();
   });
+
+  it.each(["droid:deepseek-v4-flash-0731", "droid/deepseek-v4-flash-0731"] as const)(
+    "routes raw %s slugs to Droid",
+    async (model) => {
+      const { layer, droid } = makeProviderTextGenerationTestLayer();
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const textGeneration = yield* TextGeneration;
+          return yield* textGeneration.generateCommitMessage({
+            cwd: "/repo",
+            branch: null,
+            stagedSummary: "",
+            stagedPatch: "",
+            model,
+          });
+        }).pipe(Effect.provide(layer)),
+      );
+
+      expect(droid.generateCommitMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: "deepseek-v4-flash-0731",
+          modelSelection: {
+            provider: "droid",
+            instanceId: "droid",
+            model: "deepseek-v4-flash-0731",
+          },
+        }),
+      );
+    },
+  );
 
   it("routes automation intent generation through the selected provider", async () => {
     const { layer, codex, cursor, opencode } = makeProviderTextGenerationTestLayer();
@@ -388,5 +425,87 @@ describe("ProviderTextGenerationLive", () => {
     );
     expect(codex.evaluateAutomationCompletion).not.toHaveBeenCalled();
     expect(opencode.evaluateAutomationCompletion).not.toHaveBeenCalled();
+  });
+
+  it("routes text generation by exact provider instance and merges its provider options", async () => {
+    const { layer, claude, codex } = makeProviderTextGenerationTestLayer({
+      providerInstances: {
+        claude_work: {
+          driver: "claudeAgent",
+          displayName: "Claude Work",
+          enabled: true,
+          environment: [{ name: "ANTHROPIC_AUTH_TOKEN", value: "work-token", sensitive: true }],
+          config: {
+            binaryPath: "/opt/claude",
+            homePath: "/tmp/claude-work",
+          },
+        },
+      },
+    });
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const textGeneration = yield* TextGeneration;
+        return yield* textGeneration.generateThreadTitle({
+          cwd: "/repo",
+          message: "Name the account-isolated work",
+          modelSelection: {
+            provider: "codex",
+            instanceId: "claude_work",
+            model: "claude-sonnet-4",
+          },
+        });
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(result.title).toBe("claude title");
+    expect(claude.generateThreadTitle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "claude-sonnet-4",
+        modelSelection: expect.objectContaining({
+          provider: "claudeAgent",
+          instanceId: "claude_work",
+          model: "claude-sonnet-4",
+        }),
+        providerOptions: {
+          claudeAgent: {
+            binaryPath: "/opt/claude",
+            homePath: "/tmp/claude-work",
+            environment: { ANTHROPIC_AUTH_TOKEN: "work-token" },
+          },
+        },
+      }),
+    );
+    expect(codex.generateThreadTitle).not.toHaveBeenCalled();
+  });
+
+  it("rejects disabled provider instances", async () => {
+    const { layer, claude } = makeProviderTextGenerationTestLayer({
+      providerInstances: {
+        claude_disabled: {
+          driver: "claudeAgent",
+          enabled: false,
+          config: {},
+        },
+      },
+    });
+
+    await expect(
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const textGeneration = yield* TextGeneration;
+          return yield* textGeneration.generateThreadTitle({
+            cwd: "/repo",
+            message: "This should not run",
+            modelSelection: {
+              provider: "claudeAgent",
+              instanceId: "claude_disabled",
+              model: "claude-sonnet-4",
+            },
+          });
+        }).pipe(Effect.provide(layer)),
+      ),
+    ).rejects.toThrow("Provider instance 'claude_disabled' is disabled.");
+    expect(claude.generateThreadTitle).not.toHaveBeenCalled();
   });
 });

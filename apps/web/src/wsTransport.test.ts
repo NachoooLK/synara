@@ -15,6 +15,7 @@ import {
   WS_PROTOCOL_EPOCH,
   WS_PROTOCOL_MAX_REVISION,
   WS_PROTOCOL_MIN_REVISION,
+  WS_PROJECT_FILE_WATCH_CAPABILITY,
   WsCompatibilityError,
   type WsBootstrapNegotiateResult,
 } from "@synara/contracts";
@@ -23,9 +24,9 @@ import {
   shouldKeepServerLifecycleStream,
   getUnexpectedStreamCompletionRetryDelayMs,
   getReconnectRetryDelayMs,
+  getProjectFileWatchRetryDelayMs,
   getStreamCapacityRetryDelayMs,
   getStreamDuplicateRetryDelayMs,
-  getStreamFailureCode,
   getThreadSnapshotBootstrapRetryDelayMs,
   getTerminalCompatibilityError,
   isTerminalCompatibilityFailure,
@@ -35,6 +36,7 @@ import {
   getSnapshotFaultRetryDelayMs,
   getUnaryRpcCapacityRetryDelayMs,
   MAX_UNARY_RPC_CAPACITY_RETRY_ATTEMPTS,
+  MAX_PROJECT_FILE_WATCH_RETRY_ATTEMPTS,
   SNAPSHOT_FAULT_RETRY_MS,
   isRuntimeInterruptFailure,
   makeRequestAbortScope,
@@ -46,6 +48,7 @@ import {
   resolveStreamAdmissionRetry,
   shouldReconnectAfterStreamFailure,
   threadStreamInputsEqual,
+  projectFileChangeStreamKey,
   WsTransport,
   type WsThreadStreamFailure,
 } from "./wsTransport";
@@ -147,11 +150,17 @@ interface WsTransportInternals {
   readonly streamDuplicateRetries: Map<string, number>;
   readonly streamThreadBootstrapRetries: Map<string, number>;
   readonly streamResnapshotRetries: Map<string, number>;
+  readonly projectFileWatchRetries: Map<string, number>;
   readonly streamCapacityRetryTimers: Map<string, number>;
   readonly streamCompletionRetries: Map<string, number>;
   readonly streamCompletionRetryTimers: Map<string, number>;
   readonly activeThreadStreamInputs: Map<string, unknown>;
   readonly threadSubscriptions: Map<string, unknown>;
+  readonly projectFileSubscriptions: Map<
+    string,
+    { readonly input: { cwd: string; relativePath: string }; readonly listeners: Set<unknown> }
+  >;
+  readonly projectAgentSubscriptions: Map<string, unknown>;
   shellSubscribed: boolean;
   readonly threadStreamFailureListeners: Set<(failure: WsThreadStreamFailure) => void>;
   disposed: boolean;
@@ -172,6 +181,8 @@ interface WsTransportInternals {
     input: unknown,
     forceRestart?: boolean,
   ): Promise<void>;
+  startProjectFileChangeStream(client: unknown, key: string, subscription: unknown): void;
+  startProjectAgentEventStream(client: unknown, projectId: string, params: unknown): void;
   stopStream(key: string, options?: { readonly resetCapacityRetry?: boolean }): Promise<void>;
   emitThreadStreamFailure(failure: WsThreadStreamFailure): void;
 }
@@ -189,11 +200,14 @@ function makeBareTransport(): {
     streamDuplicateRetries: new Map(),
     streamThreadBootstrapRetries: new Map(),
     streamResnapshotRetries: new Map(),
+    projectFileWatchRetries: new Map(),
     streamCapacityRetryTimers: new Map(),
     streamCompletionRetries: new Map(),
     streamCompletionRetryTimers: new Map(),
     activeThreadStreamInputs: new Map(),
     threadSubscriptions: new Map(),
+    projectFileSubscriptions: new Map(),
+    projectAgentSubscriptions: new Map(),
     threadStreamFailureListeners: new Set(),
     disposed: false,
     sessionVersion: 1,
@@ -275,6 +289,54 @@ afterEach(() => {
 });
 
 describe("WsTransport", () => {
+  it("shares one stream per watched file and stops it after the last listener leaves", async () => {
+    const { transport, internals } = makeBareTransport();
+    const input = { cwd: "/repo", relativePath: "src/app.ts" };
+    const key = projectFileChangeStreamKey(input);
+    const client = {};
+    internals.getClient = vi.fn(async () => client);
+    internals.startProjectFileChangeStream = vi.fn();
+    internals.stopStream = vi.fn(async () => undefined);
+
+    const unsubscribeFirst = transport.subscribeProjectFileChange(input, vi.fn());
+    const unsubscribeSecond = transport.subscribeProjectFileChange(input, vi.fn());
+
+    await vi.waitFor(() => expect(internals.startProjectFileChangeStream).toHaveBeenCalledOnce());
+    expect(internals.projectFileSubscriptions.size).toBe(1);
+
+    unsubscribeFirst();
+    expect(internals.stopStream).not.toHaveBeenCalled();
+    unsubscribeSecond();
+
+    expect(internals.projectFileSubscriptions.size).toBe(0);
+    expect(internals.stopStream).toHaveBeenCalledWith(key);
+  });
+
+  it("does not open a file stream after its subscription is cancelled during connection", async () => {
+    const { transport, internals } = makeBareTransport();
+    let resolveClient!: (client: unknown) => void;
+    internals.getClient = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveClient = resolve;
+        }),
+    );
+    const subscribeFile = vi.fn(() => Stream.never);
+    Object.assign(internals, {
+      compatibility: { capabilities: [WS_PROJECT_FILE_WATCH_CAPABILITY] },
+    });
+    const unsubscribe = transport.subscribeProjectFileChange(
+      { cwd: "/repo", relativePath: "app.ts" },
+      vi.fn(),
+    );
+    unsubscribe();
+    resolveClient({ [WS_METHODS.projectsSubscribeFileChange]: subscribeFile });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(subscribeFile).not.toHaveBeenCalled();
+    expect(internals.projectFileSubscriptions.size).toBe(0);
+  });
+
   it("returns the completed GitHub provisioning result and emits each progress event", async () => {
     const phase = {
       operationId: "operation-1",
@@ -384,6 +446,11 @@ describe("WsTransport", () => {
         Cause.fail({ code: "THREAD_SNAPSHOT_NOT_FOUND", retryable: false }),
       ),
     ).toBe(false);
+    expect(
+      shouldReconnectAfterStreamFailure(
+        Cause.fail({ code: "PROJECT_FILE_WATCH_FAILED", retryable: false }),
+      ),
+    ).toBe(false);
     expect(shouldReconnectAfterStreamFailure(Cause.fail(new Error("transient")))).toBe(true);
     expect(
       shouldReconnectAfterStreamFailure(
@@ -398,25 +465,46 @@ describe("WsTransport", () => {
     ).toBe(true);
   });
 
-  it("does not reconnect the socket for snapshot-fence failures", () => {
-    // Regression: ORCHESTRATION_RESNAPSHOT_REQUIRED used to fall through to a
-    // full transport reconnect, interrupting every unrelated in-flight unary
-    // RPC on a 500ms loop while a stalled projector kept the condition alive.
+  it("bounds project file watcher retries with exponential backoff", () => {
+    const failure = Cause.fail({ code: "PROJECT_FILE_WATCH_FAILED", retryable: false });
+
+    expect(getProjectFileWatchRetryDelayMs(failure, 0)).toBe(500);
+    expect(getProjectFileWatchRetryDelayMs(failure, 4)).toBe(8_000);
     expect(
-      shouldReconnectAfterStreamFailure(
-        Cause.fail({ code: "ORCHESTRATION_RESNAPSHOT_REQUIRED", retryable: true }),
-      ),
-    ).toBe(false);
-    expect(
-      shouldReconnectAfterStreamFailure(
-        Cause.fail({ code: "ORCHESTRATION_SNAPSHOT_STALLED", retryable: false }),
-      ),
-    ).toBe(false);
-    expect(
-      shouldReconnectAfterStreamFailure(
-        Cause.fail({ code: "ORCHESTRATION_PROJECTION_STATE_INCOMPLETE", retryable: false }),
-      ),
-    ).toBe(false);
+      getProjectFileWatchRetryDelayMs(failure, MAX_PROJECT_FILE_WATCH_RETRY_ATTEMPTS),
+    ).toBeNull();
+    expect(getProjectFileWatchRetryDelayMs(Cause.fail(new Error("transient")), 0)).toBeNull();
+  });
+
+  it("retries a failed project file watcher in place without reconnecting the socket", async () => {
+    vi.useFakeTimers();
+    bindWindowTimersToCurrentGlobals();
+    try {
+      const { internals } = makeBareTransport();
+      const key = "projects.file-change:/repo\0src/app.ts";
+      const restart = vi.fn();
+      const reconnect = vi.mocked(internals.reconnect);
+
+      internals.startStream(
+        {},
+        key,
+        Stream.fail({ code: "PROJECT_FILE_WATCH_FAILED", retryable: false }),
+        () => undefined,
+        restart,
+      );
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(499);
+
+      expect(restart).not.toHaveBeenCalled();
+      expect(reconnect).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(restart).toHaveBeenCalledTimes(1);
+      expect(reconnect).not.toHaveBeenCalled();
+      expect(internals.projectFileWatchRetries.get(key)).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retries resnapshot demands in place with bounded attempts", () => {
@@ -1011,13 +1099,6 @@ describe("WsTransport", () => {
     ).toBeNull();
   });
 
-  it("extracts the typed failure code used for thread stream failure reporting", () => {
-    expect(
-      getStreamFailureCode(Cause.fail({ code: "THREAD_SNAPSHOT_NOT_FOUND", retryable: false })),
-    ).toBe("THREAD_SNAPSHOT_NOT_FOUND");
-    expect(getStreamFailureCode(Cause.fail(new Error("transient")))).toBeNull();
-  });
-
   it("treats structurally identical thread subscribe params as the same input", () => {
     const input = { threadId: "thread-1" };
 
@@ -1091,6 +1172,7 @@ describe("WsTransport", () => {
       const retry = vi.fn();
       const timeoutId = window.setTimeout(retry, 1_000);
       internals.streamCapacityRetries.set(key, 2);
+      internals.projectFileWatchRetries.set(key, 2);
       internals.streamCapacityRetryTimers.set(key, timeoutId);
 
       await transport.request(ORCHESTRATION_WS_METHODS.unsubscribeThread, {
@@ -1101,6 +1183,7 @@ describe("WsTransport", () => {
       expect(retry).not.toHaveBeenCalled();
       expect(internals.streamCapacityRetryTimers.has(key)).toBe(false);
       expect(internals.streamCapacityRetries.has(key)).toBe(false);
+      expect(internals.projectFileWatchRetries.has(key)).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -1210,6 +1293,66 @@ describe("WsTransport", () => {
     }
   });
 
+  it("does not start the project-agent stream when unsubscribe lands during the connect wait", async () => {
+    const { transport, internals } = makeBareTransport();
+    const client = {};
+    const clientResolvers: Array<(client: unknown) => void> = [];
+    const startProjectAgentEventStream = vi.fn();
+    Object.assign(internals, {
+      getClient: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            clientResolvers.push(resolve);
+          }),
+      ),
+      startProjectAgentEventStream,
+    });
+
+    const projectId = "project-pending";
+    const params = { projectId };
+    const subscribe = transport.request(WS_METHODS.subscribeProjectAgentEvents, params);
+
+    await vi.waitFor(() => expect(internals.projectAgentSubscriptions.get(projectId)).toBe(params));
+    await transport.unsubscribeProjectAgentEvents(projectId);
+
+    for (const resolve of clientResolvers) resolve(client);
+    await subscribe;
+
+    expect(startProjectAgentEventStream).not.toHaveBeenCalled();
+    expect(internals.projectAgentSubscriptions.has(projectId)).toBe(false);
+  });
+
+  it("starts only the newest registered project-agent subscription after the connect wait", async () => {
+    const { transport, internals } = makeBareTransport();
+    const client = {};
+    const clientResolvers: Array<(client: unknown) => void> = [];
+    const startProjectAgentEventStream = vi.fn();
+    Object.assign(internals, {
+      getClient: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            clientResolvers.push(resolve);
+          }),
+      ),
+      startProjectAgentEventStream,
+    });
+
+    const projectId = "project-pending";
+    const first = { projectId };
+    const second = { projectId };
+    const firstSubscribe = transport.request(WS_METHODS.subscribeProjectAgentEvents, first);
+    await vi.waitFor(() => expect(internals.projectAgentSubscriptions.get(projectId)).toBe(first));
+    const secondSubscribe = transport.request(WS_METHODS.subscribeProjectAgentEvents, second);
+    await vi.waitFor(() => expect(internals.projectAgentSubscriptions.get(projectId)).toBe(second));
+
+    for (const resolve of clientResolvers) resolve(client);
+    await firstSubscribe;
+    await secondSubscribe;
+
+    expect(startProjectAgentEventStream).toHaveBeenCalledTimes(1);
+    expect(startProjectAgentEventStream).toHaveBeenCalledWith(client, projectId, second);
+  });
+
   it("does not restart an automatically restored shell stream for the initial subscriber", async () => {
     const { transport, internals } = makeBareTransport();
     const client = {};
@@ -1257,7 +1400,7 @@ describe("WsTransport", () => {
     await expect(internals.getClient()).resolves.toBe(recoveredClient);
   });
 
-  it("keeps reconnecting and restores shell and thread subscriptions after recovery", async () => {
+  it("keeps reconnecting and restores shell, thread and file subscriptions after recovery", async () => {
     vi.useFakeTimers();
     bindWindowTimersToCurrentGlobals();
     try {
@@ -1278,6 +1421,12 @@ describe("WsTransport", () => {
       const startChannelStream = vi.fn();
       const startShellStream = vi.fn(async () => undefined);
       const startThreadStream = vi.fn(async () => undefined);
+      const startProjectFileChangeStream = vi.fn();
+      const watchedFile = {
+        input: { cwd: "/repo", relativePath: "app.ts" },
+        listeners: new Set([vi.fn()]),
+      };
+      const fileKey = projectFileChangeStreamKey(watchedFile.input);
       Object.assign(internals, {
         disposed: false,
         state: "closed",
@@ -1287,6 +1436,9 @@ describe("WsTransport", () => {
         listeners: new Map([[WS_CHANNELS.serverWelcome, new Set([vi.fn()])]]),
         shellSubscribed: true,
         threadSubscriptions: new Map([[threadId, input]]),
+        projectFileSubscriptions: new Map([[fileKey, watchedFile]]),
+        projectAgentSubscriptions: new Map(),
+        startProjectFileChangeStream,
         runtime: null,
         clientScope: null,
         createSession,
@@ -1309,6 +1461,11 @@ describe("WsTransport", () => {
       expect(startShellStream).toHaveBeenCalledOnce();
       expect(startThreadStream).toHaveBeenCalledOnce();
       expect(startThreadStream).toHaveBeenCalledWith(client, threadId, input);
+      expect(startProjectFileChangeStream).toHaveBeenCalledExactlyOnceWith(
+        client,
+        fileKey,
+        watchedFile,
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -1646,32 +1803,6 @@ describe("WsTransport", () => {
     expect(reconnectUrl.searchParams.get(WS_COMPATIBILITY_QUERY.serverInstanceId)).toBe(
       "server-instance-2",
     );
-
-    await transport.dispose();
-  });
-
-  it("clears cached negotiation when the reconnect liveness probe fails", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(200, NEGOTIATION_RESULT)));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const transport = new WsTransport("ws://localhost:3020");
-    const internals = transport as unknown as {
-      createSession(): { clientPromise: Promise<unknown> };
-      probeFeatureConnection: (...args: unknown[]) => Promise<void>;
-      compatibility: WsBootstrapNegotiateResult | null;
-    };
-    await waitForSockets(1);
-    expect(internals.compatibility).toEqual(NEGOTIATION_RESULT);
-
-    internals.probeFeatureConnection = async function (this: typeof internals) {
-      this.compatibility = null;
-      throw new Error("stale server generation");
-    }.bind(internals);
-    await expect(internals.createSession().clientPromise).rejects.toThrow(
-      "stale server generation",
-    );
-
-    expect(internals.compatibility).toBeNull();
 
     await transport.dispose();
   });

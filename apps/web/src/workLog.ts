@@ -1,4 +1,8 @@
 import {
+  type ComputerPermission,
+  type ComputerBuildSignature,
+  COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
+  COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND,
   isToolLifecycleItemType,
   STUDIO_OUTPUTS_ACTIVITY_KIND,
   type OrchestrationLatestTurnState,
@@ -17,8 +21,12 @@ import {
   approvalRequestKindFromRequestType,
   type ApprovalRequestKind,
 } from "@synara/shared/threadSummary";
-import { summarizeToolRawOutput } from "@synara/shared/toolOutputSummary";
-import { pluralize } from "@synara/shared/text";
+import {
+  stripTrailingToolExitCode,
+  summarizeToolRawOutput,
+} from "@synara/shared/toolOutputSummary";
+import { pluralize, stripTerminalControlSequences } from "@synara/shared/text";
+import { suppressCoordinatorCheckinMessages } from "@synara/shared/coordinatorCheckin";
 import { PROVIDER_DESCRIPTORS } from "@synara/shared/providerMetadata";
 import {
   deriveReadableToolTitle,
@@ -29,6 +37,7 @@ import {
   type SynaraMcpToolStatus,
 } from "./lib/toolCallLabel";
 import { toolArgumentSummaryToolName } from "./lib/toolArgumentSummary";
+import { computerToolName, describeComputerToolCall } from "./lib/computerToolPresentation";
 import {
   deriveWorkLogToolDetails,
   mergeWorkLogToolDetails,
@@ -44,6 +53,47 @@ export type WorkLogRequestKind = ApprovalRequestKind;
 // apps/server/src/orchestration/commandInvariants.ts, which the web app cannot
 // import.
 const CHECKPOINT_REVERT_FAILED_ACTIVITY_KIND = "checkpoint.revert.failed";
+export const PROVIDER_CONTEXT_LIFECYCLE_ACTIVITY_KIND = "provider.context.changed";
+const SESSION_CONTEXT_RECAP_PREVIEW_MAX_CHARS = 600;
+
+export type ProviderContextLifecycleReason =
+  | "conversation-rebuilt"
+  | "fresh-session"
+  | "interrupt-escalation"
+  | "native-history-unavailable"
+  | "native-resume-failed";
+
+export interface ProviderContextLifecycleInfo {
+  provider: ProviderKind;
+  nativeHistory: "available" | "unavailable";
+  restartReason: ProviderContextLifecycleReason;
+  sessionRestarted: boolean;
+  recapInjected: boolean;
+  recapCharacters: number;
+  recapPreview: string | null;
+  recapPreviewTruncated: boolean;
+}
+
+export interface WorkLogComputerSetupRequired {
+  /**
+   * The grants the OS is withholding, so the card can name them. Empty when the
+   * backend refused without naming one — the card then says what it can.
+   */
+  missing: readonly ComputerPermission[];
+  /**
+   * How the running build is signed, when the backend could say. Only an
+   * `adhoc` build gets the stale-grant explanation, because only there can
+   * System Settings show the switch on while the grant does not apply.
+   */
+  buildSignature?: ComputerBuildSignature;
+  /**
+   * The app macOS files this Synara's grants against, when a desktop shell told
+   * the server which flavor it is. The card's `tccutil` advice names it, and
+   * absent means that advice is withheld rather than guessed — a guessed
+   * identifier resets a different Synara's grants.
+   */
+  bundleId?: string;
+}
 
 export interface WorkLogEntry {
   id: string;
@@ -70,6 +120,15 @@ export interface WorkLogEntry {
   subagentAction?: WorkLogSubagentAction;
   automation?: WorkLogAutomation;
   synaraThreadCreation?: WorkLogSynaraThreadCreation;
+  // Deterministic coordinator-monitor rows (worker settled / stuck /
+  // batch roll-up) render as compact centered pills in the coordinator
+  // conversation, each carrying a link into the reported thread.
+  synaraWorkerNotice?: WorkLogSynaraWorkerNotice;
+  // Computer-control denial rows render as an actionable card (enable control
+  // and retry) instead of a plain error line; carry just what that card needs.
+  computerControlDenied?: WorkLogComputerControlDenied;
+  computerSetupRequired?: WorkLogComputerSetupRequired;
+  providerContextLifecycle?: ProviderContextLifecycleInfo;
   // Source activity kind, kept so the timeline can pick a kind-specific icon
   // (e.g. user-input.requested -> question glyph) instead of the generic
   // tone fallback. Same rationale as `toolName` below.
@@ -108,6 +167,10 @@ export interface WorkLogAutomation {
   proposalState?: "pending" | "accepted" | "dismissed";
 }
 
+export interface WorkLogComputerControlDenied {
+  toolName: string | null;
+}
+
 export interface WorkLogSynaraCreatedThread {
   threadId: string;
   title: string;
@@ -122,6 +185,25 @@ export interface WorkLogSynaraThreadCreation {
   requestedCount: number;
   createdCount: number;
   threads: ReadonlyArray<WorkLogSynaraCreatedThread>;
+}
+
+export interface WorkLogSynaraWorkerNoticeThread {
+  threadId: string;
+  title: string;
+  outcome: string | null;
+  result: string | null;
+  pr: string | null;
+  /** Owning group project — the needs-you actions resolve against it. */
+  projectId: string | null;
+}
+
+export interface WorkLogSynaraWorkerNotice {
+  kind: "settled" | "stuck" | "needs-you" | "rollup";
+  marker: string | null;
+  phrase: string | null;
+  threads: ReadonlyArray<WorkLogSynaraWorkerNoticeThread>;
+  /** Synara-native action ids on a needs-you card (retry / stop / open). */
+  actions?: ReadonlyArray<"retry" | "stop" | "open">;
 }
 
 export interface WorkLogSubagent {
@@ -323,6 +405,12 @@ function shouldKeepActivityForWorkLog(
   latestTurnId: TurnId | undefined,
   visibleTurnIds: ReadonlySet<TurnId | string> | undefined,
 ): boolean {
+  // Context lifecycle evidence must survive message visibility filters. It is
+  // the durable explanation for why a turn may behave differently after reload.
+  if (activity.kind === PROVIDER_CONTEXT_LIFECYCLE_ACTIVITY_KIND) {
+    return true;
+  }
+
   // Thread-level compaction progress has no provider turn id but should stay visible.
   if (activity.kind === "context-compaction" && activity.turnId === null) {
     return true;
@@ -339,6 +427,27 @@ function shouldKeepActivityForWorkLog(
   // turn that the revert itself just rolled out of view), so never let the
   // turn-visibility filter drop them.
   if (activity.kind === CHECKPOINT_REVERT_FAILED_ACTIVITY_KIND) {
+    return true;
+  }
+
+  // A computer-control denial is the only actionable feedback for a desktop
+  // tool call rejected mid-turn; never let turn-visibility filtering hide it.
+  if (activity.kind === COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND) {
+    return true;
+  }
+  if (activity.kind === COMPUTER_CONTROL_DENIED_ACTIVITY_KIND) {
+    return true;
+  }
+
+  // Coordinator monitor rows are posted server-side with no turn id; a
+  // coordinator conversation is all turns, so the turn filter would hide every
+  // settle/stuck/roll-up pill.
+  if (
+    activity.kind === "synara.worker.settled" ||
+    activity.kind === "synara.worker.stuck" ||
+    activity.kind === "synara.worker.needs-you" ||
+    activity.kind === "synara.workers.settled"
+  ) {
     return true;
   }
 
@@ -452,6 +561,71 @@ function extractWorkLogSynaraThreadCreation(
   return { operationId, requestedCount, createdCount, threads };
 }
 
+function extractWorkLogSynaraWorkerNotice(
+  payload: Record<string, unknown> | null,
+  activityKind: OrchestrationThreadActivity["kind"],
+): WorkLogSynaraWorkerNotice | null {
+  if (!payload || payload.source !== "worker_monitor") {
+    return null;
+  }
+  const parseThreads = (values: unknown): WorkLogSynaraWorkerNoticeThread[] => {
+    if (!Array.isArray(values)) {
+      return [];
+    }
+    return values.flatMap((value): WorkLogSynaraWorkerNoticeThread[] => {
+      const thread = asRecord(value);
+      const threadId = asTrimmedString(thread?.threadId);
+      const title = asTrimmedString(thread?.title);
+      if (!threadId || !title) {
+        return [];
+      }
+      return [
+        {
+          threadId,
+          title,
+          outcome: asTrimmedString(thread?.outcome) ?? null,
+          result: asTrimmedString(thread?.result) ?? null,
+          pr: asTrimmedString(thread?.pr) ?? null,
+          projectId: asTrimmedString(thread?.projectId) ?? null,
+        },
+      ];
+    });
+  };
+  if (activityKind === "synara.workers.settled") {
+    const threads = parseThreads(payload.threads);
+    return threads.length > 0 ? { kind: "rollup", marker: null, phrase: null, threads } : null;
+  }
+  if (
+    activityKind === "synara.worker.settled" ||
+    activityKind === "synara.worker.stuck" ||
+    activityKind === "synara.worker.needs-you"
+  ) {
+    const threads = parseThreads([payload.thread]);
+    if (threads.length === 0) {
+      return null;
+    }
+    const actions = Array.isArray(payload.actions)
+      ? payload.actions.flatMap(
+          (action): Array<"retry" | "stop" | "open"> =>
+            action === "retry" || action === "stop" || action === "open" ? [action] : [],
+        )
+      : undefined;
+    return {
+      kind:
+        activityKind === "synara.worker.needs-you"
+          ? "needs-you"
+          : activityKind === "synara.worker.stuck"
+            ? "stuck"
+            : "settled",
+      marker: asTrimmedString(payload.marker) ?? null,
+      phrase: asTrimmedString(payload.phrase) ?? null,
+      threads,
+      ...(actions ? { actions } : {}),
+    };
+  }
+  return null;
+}
+
 export interface TaskListTaskSnapshot {
   task: string;
   status: "pending" | "inProgress" | "completed";
@@ -489,6 +663,62 @@ export function parseTaskListTasks(payload: unknown): TaskListTaskSnapshot[] | n
   return tasks;
 }
 
+function isProviderContextLifecycleReason(value: unknown): value is ProviderContextLifecycleReason {
+  return (
+    value === "conversation-rebuilt" ||
+    value === "fresh-session" ||
+    value === "interrupt-escalation" ||
+    value === "native-history-unavailable" ||
+    value === "native-resume-failed"
+  );
+}
+
+function extractProviderContextLifecycleInfo(
+  payload: Record<string, unknown> | null,
+): ProviderContextLifecycleInfo | null {
+  const provider = PROVIDER_DESCRIPTORS.find(
+    (descriptor) => descriptor.kind === payload?.provider,
+  )?.kind;
+  const nativeHistory = payload?.nativeHistory;
+  const restartReason = payload?.restartReason;
+  const sessionRestarted = payload?.sessionRestarted;
+  const recapInjected = payload?.recapInjected;
+  const recapCharacters = payload?.recapCharacters;
+  const recapPreview = payload?.recapPreview;
+  const recapPreviewTruncated = payload?.recapPreviewTruncated;
+  if (
+    !provider ||
+    (nativeHistory !== "available" && nativeHistory !== "unavailable") ||
+    !isProviderContextLifecycleReason(restartReason) ||
+    typeof sessionRestarted !== "boolean" ||
+    typeof recapInjected !== "boolean" ||
+    typeof recapCharacters !== "number" ||
+    !Number.isInteger(recapCharacters) ||
+    recapCharacters < 0 ||
+    (recapPreview !== null && typeof recapPreview !== "string") ||
+    typeof recapPreviewTruncated !== "boolean"
+  ) {
+    return null;
+  }
+  const boundedPreview =
+    typeof recapPreview === "string" &&
+    recapPreview.length > SESSION_CONTEXT_RECAP_PREVIEW_MAX_CHARS
+      ? `…${recapPreview.slice(-(SESSION_CONTEXT_RECAP_PREVIEW_MAX_CHARS - 1)).trimStart()}`
+      : recapPreview;
+  return {
+    provider,
+    nativeHistory,
+    restartReason,
+    sessionRestarted,
+    recapInjected,
+    recapCharacters,
+    recapPreview: boundedPreview,
+    recapPreviewTruncated:
+      recapPreviewTruncated ||
+      (typeof recapPreview === "string" && recapPreview.length > (boundedPreview?.length ?? 0)),
+  };
+}
+
 function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWorkLogEntry {
   const payload =
     activity.payload && typeof activity.payload === "object"
@@ -516,7 +746,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   const itemType = extractWorkLogItemType(payload);
   const requestKind = extractWorkLogRequestKind(payload);
   if (payload && typeof payload.detail === "string" && payload.detail.length > 0) {
-    const detail = stripTrailingExitCode(payload.detail).output;
+    const detail = stripTrailingExitCode(stripTerminalControlSequences(payload.detail)).output;
     if (detail) {
       entry.detail = detail;
     }
@@ -524,11 +754,11 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   const outputDetail =
     activity.kind === "provider.event.unmapped" ? null : summarizeToolPayloadOutput(payload);
   if (outputDetail && (!entry.detail || toolStatus === "failed")) {
-    entry.detail = outputDetail;
+    entry.detail = stripTerminalControlSequences(outputDetail);
   }
   const collabTaskOutputDetail = extractCollabTaskOutputDetail(payload);
   if (collabTaskOutputDetail) {
-    entry.detail = collabTaskOutputDetail;
+    entry.detail = stripTerminalControlSequences(collabTaskOutputDetail);
   }
   const nativeEventType =
     payload && typeof payload.nativeEventType === "string" && payload.nativeEventType.length > 0
@@ -541,7 +771,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
     activity.kind === "runtime.warning" &&
     typeof payload?.message === "string" &&
     payload.message.trim().length > 0
-      ? payload.message.trim()
+      ? stripTerminalControlSequences(payload.message).trim()
       : undefined;
   if (runtimeWarningMessage) {
     entry.detail = runtimeWarningMessage;
@@ -616,8 +846,44 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       entry.synaraThreadCreation = synaraThreadCreation;
     }
   }
+  if (
+    activity.kind === "synara.worker.settled" ||
+    activity.kind === "synara.worker.stuck" ||
+    activity.kind === "synara.worker.needs-you" ||
+    activity.kind === "synara.workers.settled"
+  ) {
+    const notice = extractWorkLogSynaraWorkerNotice(payload, activity.kind);
+    if (notice) {
+      entry.synaraWorkerNotice = notice;
+    }
+  }
+  if (activity.kind === COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND) {
+    const buildSignature = asComputerBuildSignature(payload?.buildSignature);
+    const bundleId = asTrimmedString(payload?.bundleId);
+    entry.computerSetupRequired = {
+      missing: asComputerPermissions(payload?.missing),
+      ...(buildSignature ? { buildSignature } : {}),
+      ...(bundleId ? { bundleId } : {}),
+    };
+  }
+  if (activity.kind === COMPUTER_CONTROL_DENIED_ACTIVITY_KIND) {
+    entry.computerControlDenied = { toolName: asTrimmedString(payload?.toolName) };
+  }
+  if (activity.kind === PROVIDER_CONTEXT_LIFECYCLE_ACTIVITY_KIND) {
+    const providerContextLifecycle = extractProviderContextLifecycleInfo(payload);
+    if (providerContextLifecycle) {
+      entry.providerContextLifecycle = providerContextLifecycle;
+    }
+  }
+  const computerToolDescription = deriveComputerToolDescription({
+    activity,
+    payload,
+    toolName,
+    title: commandActionDisplay?.title ?? title,
+  });
   const readableTitle =
     extractCollabActionTitle(payload) ??
+    computerToolDescription?.summary ??
     deriveSynaraMcpToolTitle({
       toolName,
       title: commandActionDisplay?.title ?? title,
@@ -699,9 +965,15 @@ function deriveProviderRuntimeReconciliationCollapseKey(
   ) {
     return undefined;
   }
+  // Session and turn projections converge independently. A single stale turn
+  // can therefore be observed first as interrupted, then as terminal or
+  // failed. Those settlement actions refine one recovery; a runtime
+  // realignment remains distinct because its live turn id identifies separate
+  // evidence.
+  const operation = action === "align-running-turn" ? action : "settle-running-turn";
   return `provider-runtime-reconcile:${JSON.stringify([
     provider,
-    action,
+    operation,
     projectedTurnId,
     runtimeTurnId ?? null,
   ])}`;
@@ -917,7 +1189,8 @@ function collapseDerivedWorkLogEntries(
   // Older servers included the current observation sequence in recovery ids,
   // so the same repair could be persisted more than once while projections
   // converged. Preserve the first row for each semantic repair and hide only
-  // exact repeats; different turns/actions remain independently visible.
+  // exact repeats; different turns and runtime realignments remain independently
+  // visible.
   const seenRuntimeReconciliationKeys = new Set<string>();
   // Task-list snapshots (collapseKey "taskList:<turnId>") fold into one row per
   // turn: each update replaces the row's content while the row itself stays
@@ -1020,6 +1293,9 @@ function mergeRuntimeWarningEntries(
   return {
     ...previous,
     ...next,
+    id: previous.id,
+    createdAt: previous.createdAt,
+    ...(previous.sequence !== undefined ? { sequence: previous.sequence } : {}),
     runtimeWarningRepeatCount: repeatCount,
     ...(runtimeWarningMessage ? { runtimeWarningMessage } : {}),
     detail: repeatPreview,
@@ -1041,14 +1317,22 @@ function mergeTaskListEntries(
   if (previous.taskListHasTasks && !next.taskListHasTasks) {
     return previous;
   }
-  return { ...next, id: previous.id, createdAt: previous.createdAt };
+  return {
+    ...next,
+    id: previous.id,
+    createdAt: previous.createdAt,
+    ...(previous.sequence !== undefined ? { sequence: previous.sequence } : {}),
+  };
 }
 
-// Ingestion emits compaction progress ("Compacting conversation...") and its
+// Ingestion emits compaction progress ("Compacting context") and its
 // terminal row ("Context compacted" / "... failed" / "... manually") as separate
 // activities; fold the terminal row into the in-progress one so the work log
 // shows a single resolving compaction entry instead of a stale spinner row.
-const CONTEXT_COMPACTION_PROGRESS_LABEL = "Compacting conversation...";
+function isContextCompactionProgressLabel(label: string): boolean {
+  // Keep resolving progress rows persisted by older servers, too.
+  return label === "Compacting context" || label === "Compacting conversation...";
+}
 
 function shouldCollapseContextCompactionEntries(
   previous: DerivedWorkLogEntry,
@@ -1065,7 +1349,7 @@ function shouldCollapseContextCompactionEntries(
   }
   // Only merge into a row that is still in progress; a terminal row belongs to
   // an earlier compaction and must not swallow the next one's progress row.
-  return previous.label === CONTEXT_COMPACTION_PROGRESS_LABEL;
+  return isContextCompactionProgressLabel(previous.label);
 }
 
 function shouldCollapseToolLifecycleEntries(
@@ -1141,10 +1425,15 @@ function mergeDerivedWorkLogEntries(
     : (next.toolStatus ?? previous.toolStatus);
   const liveActivity = mergeWorkLogLiveActivity(previous.liveActivity, next.liveActivity);
   const toolDetails = mergeWorkLogToolDetails(previous.toolDetails, next.toolDetails);
+  // Keep the visual anchor below, but let the latest known turn own lifecycle
+  // settlement and live composer state when a background tool spans turns.
   const turnId = next.turnId ?? previous.turnId;
   return {
     ...previous,
     ...next,
+    id: previous.id,
+    createdAt: previous.createdAt,
+    ...(previous.sequence !== undefined ? { sequence: previous.sequence } : {}),
     ...(turnId !== undefined ? { turnId } : {}),
     ...(detail ? { detail } : {}),
     ...(command ? { command } : {}),
@@ -1458,6 +1747,18 @@ function areToolLifecycleChangedFilesCompatible(
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function asComputerPermissions(value: unknown): readonly ComputerPermission[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (entry): entry is ComputerPermission =>
+      entry === "accessibility" || entry === "screenRecording",
+  );
+}
+
+function asComputerBuildSignature(value: unknown): ComputerBuildSignature | undefined {
+  return value === "adhoc" || value === "signed" ? value : undefined;
 }
 
 function asTrimmedString(value: unknown): string | null {
@@ -1954,7 +2255,21 @@ function extractToolName(payload: Record<string, unknown> | null): string | null
   const data = asRecord(payload?.data);
   const item = asRecord(data?.item);
   const itemInput = asRecord(item?.input);
-  const candidates = [data?.toolName, data?.tool, item?.toolName, item?.name, itemInput?.toolName];
+  const dataInvocation = asRecord(data?.invocation);
+  const itemInvocation = asRecord(item?.invocation);
+  const candidates = [
+    payload?.toolName,
+    data?.toolName,
+    data?.tool,
+    dataInvocation?.tool,
+    dataInvocation?.toolName,
+    item?.toolName,
+    item?.tool,
+    item?.name,
+    itemInvocation?.tool,
+    itemInvocation?.toolName,
+    itemInput?.toolName,
+  ];
   for (const candidate of candidates) {
     const normalized = asTrimmedString(candidate);
     if (normalized) {
@@ -1962,6 +2277,136 @@ function extractToolName(payload: Record<string, unknown> | null): string | null
     }
   }
   return null;
+}
+
+function deriveComputerToolDescription(input: {
+  activity: OrchestrationThreadActivity;
+  payload: Record<string, unknown> | null;
+  toolName: string | null;
+  title: string | null;
+}) {
+  if (input.payload?.approvalScope === "computer-foreground") {
+    return {
+      summary:
+        input.activity.kind === "approval.requested"
+          ? "Asked to show Computer on screen"
+          : input.payload.decision === "accept"
+            ? "Computer allowed on screen"
+            : input.payload.decision === "decline"
+              ? "Computer kept in the background"
+              : "On-screen request cancelled",
+    };
+  }
+  if (
+    input.payload?.approvalScope === "computer-task" ||
+    input.payload?.approvalScope === "device-task"
+  ) {
+    const family = input.payload.approvalScope === "device-task" ? "Device" : "Computer";
+    return {
+      summary:
+        input.activity.kind === "approval.requested"
+          ? `${family} task approval requested`
+          : input.payload.decision === "accept"
+            ? `${family} task approved`
+            : input.payload.decision === "decline"
+              ? `${family} task declined`
+              : `${family} task approval cancelled`,
+    };
+  }
+  if (!computerToolName(input.toolName)) {
+    return null;
+  }
+  const explicitTitle = normalizeCompactToolLabel(input.title ?? "");
+  if (
+    explicitTitle.length > 0 &&
+    !isGenericToolTitle(explicitTitle) &&
+    !computerToolName(explicitTitle)
+  ) {
+    return null;
+  }
+  const progressTitle = normalizeCompactToolLabel(input.activity.summary);
+  if (
+    input.activity.kind === "tool.updated" &&
+    progressTitle.length > 0 &&
+    !isGenericToolTitle(progressTitle) &&
+    !computerToolName(progressTitle)
+  ) {
+    return { summary: progressTitle };
+  }
+  return describeComputerToolCall({
+    toolName: input.toolName,
+    args: extractComputerToolArgs(input.payload) ?? undefined,
+  });
+}
+
+function extractComputerToolArgs(
+  payload: Record<string, unknown> | null,
+): Readonly<Record<string, unknown>> | null {
+  if (!payload) {
+    return null;
+  }
+  const data = asRecord(payload.data);
+  const item = asRecord(data?.item);
+  const dataInvocation = asRecord(data?.invocation);
+  const itemInvocation = asRecord(item?.invocation);
+  const dataInput = asRecord(data?.input);
+  const itemInput = asRecord(item?.input);
+  const candidates = [
+    item?.arguments,
+    itemInput?.arguments,
+    itemInput?.args,
+    item?.input,
+    itemInvocation?.arguments,
+    itemInvocation?.input,
+    dataInvocation?.arguments,
+    dataInvocation?.input,
+    data?.arguments,
+    dataInput?.arguments,
+    dataInput?.args,
+    data?.input,
+    data?.rawInput,
+    payload.arguments,
+    payload.input,
+  ];
+  for (const candidate of candidates) {
+    const args = asArgumentRecord(candidate);
+    if (args) {
+      return args;
+    }
+  }
+  return parseHistoricalToolParamsDisplay(payload.toolParamsDisplay);
+}
+
+function asArgumentRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === "string") {
+    try {
+      return asArgumentRecord(JSON.parse(value));
+    } catch {
+      return null;
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function parseHistoricalToolParamsDisplay(value: unknown): Record<string, unknown> | null {
+  const record = asArgumentRecord(value);
+  if (record) {
+    return record;
+  }
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const result: Record<string, unknown> = {};
+  for (const entry of value) {
+    const row = asRecord(entry);
+    const name = asTrimmedString(row?.name ?? row?.display_name ?? row?.displayName);
+    if (name) {
+      result[name] = row?.value;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 function extractToolCallId(payload: Record<string, unknown> | null): string | null {
@@ -1976,21 +2421,7 @@ function stripTrailingExitCode(value: string): {
   output: string | null;
   exitCode?: number | undefined;
 } {
-  const trimmed = value.trim();
-  const match = /^(?<output>[\s\S]*?)(?:\s*<exited with exit code (?<code>\d+)>)\s*$/i.exec(
-    trimmed,
-  );
-  if (!match?.groups) {
-    return {
-      output: trimmed.length > 0 ? trimmed : null,
-    };
-  }
-  const exitCode = Number.parseInt(match.groups.code ?? "", 10);
-  const normalizedOutput = match.groups.output?.trim() ?? "";
-  return {
-    output: normalizedOutput.length > 0 ? normalizedOutput : null,
-    ...(Number.isInteger(exitCode) ? { exitCode } : {}),
-  };
+  return stripTrailingToolExitCode(value.trim());
 }
 
 function extractDetailCollapseHint(detail: string | undefined): string {
@@ -2032,7 +2463,8 @@ function extractWorkLogRequestKind(
     payload?.requestKind === "command" ||
     payload?.requestKind === "file-read" ||
     payload?.requestKind === "file-change" ||
-    payload?.requestKind === "permissions"
+    payload?.requestKind === "permissions" ||
+    payload?.requestKind === "tool"
   ) {
     return payload.requestKind;
   }
@@ -2167,7 +2599,7 @@ function compareActivitiesByOrder(
 }
 
 function contextCompactionOrderRank(summary: string): number {
-  return summary === CONTEXT_COMPACTION_PROGRESS_LABEL ? 0 : 1;
+  return isContextCompactionProgressLabel(summary) ? 0 : 1;
 }
 
 function compareActivityLifecycleRank(kind: string): number {
@@ -2196,22 +2628,31 @@ function compareTimelineEntries(left: TimelineEntry, right: TimelineEntry): numb
   return left.createdAt.localeCompare(right.createdAt);
 }
 
-function areTimelineEntriesOrdered(entries: ReadonlyArray<TimelineEntry>): boolean {
+type TimelineComparator = (left: TimelineEntry, right: TimelineEntry) => number;
+
+function areTimelineEntriesOrdered(
+  entries: ReadonlyArray<TimelineEntry>,
+  compare: TimelineComparator,
+): boolean {
   for (let index = 1; index < entries.length; index += 1) {
-    if (compareTimelineEntries(entries[index - 1]!, entries[index]!) > 0) {
+    if (compare(entries[index - 1]!, entries[index]!) > 0) {
       return false;
     }
   }
   return true;
 }
 
-function sortedTimelineEntries(entries: TimelineEntry[]): TimelineEntry[] {
-  return areTimelineEntriesOrdered(entries) ? entries : entries.toSorted(compareTimelineEntries);
+function sortedTimelineEntries(
+  entries: TimelineEntry[],
+  compare: TimelineComparator,
+): TimelineEntry[] {
+  return areTimelineEntriesOrdered(entries, compare) ? entries : entries.toSorted(compare);
 }
 
 function mergeTimelineEntries(
   left: ReadonlyArray<TimelineEntry>,
   right: ReadonlyArray<TimelineEntry>,
+  compare: TimelineComparator,
 ): TimelineEntry[] {
   if (left.length === 0) {
     return [...right];
@@ -2226,7 +2667,7 @@ function mergeTimelineEntries(
   while (leftIndex < left.length && rightIndex < right.length) {
     const leftEntry = left[leftIndex]!;
     const rightEntry = right[rightIndex]!;
-    if (compareTimelineEntries(leftEntry, rightEntry) <= 0) {
+    if (compare(leftEntry, rightEntry) <= 0) {
       merged.push(leftEntry);
       leftIndex += 1;
     } else {
@@ -2245,15 +2686,118 @@ function mergeTimelineEntries(
   return merged;
 }
 
+// Keep one grouping per source message; obsolete snapshots can be collected.
+const coalescedMessageCache = new WeakMap<
+  ChatMessage,
+  { readonly signature: string; readonly displayMessage: ChatMessage }
+>();
+
+/** Old snapshots can contain one segment per token. Only a visible intervening
+ * row warrants another Markdown document; keep the persisted text untouched. */
+function coalesceAdjacentMessageSegments(entries: TimelineEntry[]): TimelineEntry[] {
+  if (
+    !entries.some((entry, index) => {
+      const previous = entries[index - 1];
+      return (
+        entry.kind === "message-segment" &&
+        previous?.kind === "message-segment" &&
+        entry.message === previous.message &&
+        entry.segmentIndex === previous.segmentIndex + 1
+      );
+    })
+  ) {
+    return entries;
+  }
+  type SegmentEntry = Extract<TimelineEntry, { kind: "message-segment" }>;
+  const groupsByMessage = new Map<ChatMessage, SegmentEntry[][]>();
+  const runs: Array<TimelineEntry | SegmentEntry[]> = [];
+  for (const entry of entries) {
+    const previous = runs.at(-1);
+    if (entry.kind !== "message-segment") {
+      runs.push(entry);
+    } else if (
+      Array.isArray(previous) &&
+      previous[0]!.message === entry.message &&
+      previous.at(-1)!.segmentIndex + 1 === entry.segmentIndex
+    ) {
+      previous.push(entry);
+    } else {
+      const group = [entry];
+      runs.push(group);
+      const groups = groupsByMessage.get(entry.message) ?? [];
+      groups.push(group);
+      groupsByMessage.set(entry.message, groups);
+    }
+  }
+
+  const replacements = new Map<SegmentEntry[], TimelineEntry>();
+  for (const [message, groups] of groupsByMessage) {
+    if (!groups.some((group) => group.length > 1)) continue;
+    const signature = groups
+      .map((group) => `${group[0]!.segmentIndex}:${group.at(-1)!.segmentIndex}`)
+      .join(",");
+    const cached = coalescedMessageCache.get(message);
+    let displayMessage = cached?.signature === signature ? cached.displayMessage : undefined;
+    if (displayMessage === undefined) {
+      const textSegments = groups.map((group) => {
+        const first = message.textSegments![group[0]!.segmentIndex]!;
+        const last = message.textSegments![group.at(-1)!.segmentIndex]!;
+        return {
+          ...first,
+          endedAt: last.endedAt,
+          text: group.map((entry) => message.textSegments![entry.segmentIndex]!.text).join(""),
+        };
+      });
+      displayMessage =
+        groups.length === 1 && textSegments[0]!.text === message.text
+          ? message
+          : { ...message, textSegments };
+      coalescedMessageCache.set(message, { signature, displayMessage });
+    }
+    if (displayMessage === message) {
+      replacements.set(groups[0]!, {
+        id: message.id,
+        kind: "message",
+        createdAt: groups[0]![0]!.createdAt,
+        message,
+      });
+      continue;
+    }
+    const coalescedMessage = displayMessage;
+    groups.forEach((group, segmentIndex) => {
+      replacements.set(group, { ...group[0]!, message: coalescedMessage, segmentIndex });
+    });
+  }
+  return runs.map((run) => (Array.isArray(run) ? (replacements.get(run) ?? run[0]!) : run));
+}
+
 export function deriveTimelineEntries(
   messages: ChatMessage[],
   proposedPlans: ProposedPlan[],
   workEntries: WorkLogEntry[],
+  options?: { readonly suppressCoordinatorCheckins?: boolean },
 ): TimelineEntry[] {
+  // Coordinator check-ins (automation-dispatched heartbeat/wake turns) never
+  // render: the automation prompt row, its work/plan rows bound to the check-in
+  // turn, and the reply when it is a silent "nothing to report". A non-silent
+  // reply stays as an ordinary coordinator message.
+  const checkinSuppression = options?.suppressCoordinatorCheckins
+    ? suppressCoordinatorCheckinMessages(messages)
+    : null;
+  const visibleMessages = checkinSuppression ? checkinSuppression.messages : messages;
+  const checkinTurnIds = checkinSuppression?.checkinTurnIds;
+  const visibleProposedPlans = checkinTurnIds
+    ? proposedPlans.filter((plan) => plan.turnId == null || !checkinTurnIds.has(plan.turnId))
+    : proposedPlans;
+  const visibleWorkEntries = checkinTurnIds
+    ? workEntries.filter((entry) => entry.turnId == null || !checkinTurnIds.has(entry.turnId))
+    : workEntries;
   const proposedPlanTurnIds = new Set(
-    proposedPlans.flatMap((proposedPlan) => (proposedPlan.turnId ? [proposedPlan.turnId] : [])),
+    visibleProposedPlans.flatMap((proposedPlan) =>
+      proposedPlan.turnId ? [proposedPlan.turnId] : [],
+    ),
   );
-  const messageRows: TimelineEntry[] = messages.flatMap((message): TimelineEntry[] => {
+  const messageRows: TimelineEntry[] = visibleMessages.flatMap((message): TimelineEntry[] => {
     const displayMessage =
       message.role === "assistant" && message.turnId && proposedPlanTurnIds.has(message.turnId)
         ? { ...message, text: stripProposedPlanBlocksFromText(message.text) }
@@ -2296,13 +2840,13 @@ export function deriveTimelineEntries(
       },
     ];
   });
-  const proposedPlanRows: TimelineEntry[] = proposedPlans.map((proposedPlan) => ({
+  const proposedPlanRows: TimelineEntry[] = visibleProposedPlans.map((proposedPlan) => ({
     id: proposedPlan.id,
     kind: "proposed-plan",
     createdAt: proposedPlan.createdAt,
     proposedPlan,
   }));
-  const workRows: TimelineEntry[] = workEntries.map((entry) => ({
+  const workRows: TimelineEntry[] = visibleWorkEntries.map((entry) => ({
     id: entry.id,
     kind: "work",
     createdAt: entry.createdAt,
@@ -2310,11 +2854,77 @@ export function deriveTimelineEntries(
     entry,
   }));
 
-  return mergeTimelineEntries(
+  // Late tool completion/replay timestamps must not move an earlier turn's
+  // work below a new user request and inflate that request's tool disclosure.
+  const userStarts: string[] = [];
+  const messageOrder = new Map<string, number>();
+  const turnOrder = new Map<string, number>();
+  const messagesOrdered = visibleMessages.every(
+    (message, index) =>
+      index === 0 || visibleMessages[index - 1]!.createdAt.localeCompare(message.createdAt) <= 0,
+  );
+  const orderedMessages = messagesOrdered
+    ? visibleMessages
+    : visibleMessages.toSorted((a, b) => a.createdAt.localeCompare(b.createdAt));
+  for (const message of orderedMessages) {
+    // Effective dispatch semantics are recorded before an emulated steer waits
+    // for interruption/promotion. Fall back to turn binding for events written
+    // before startsNewTurn existed; native steers remain continuations.
+    const startsNewTurn =
+      message.startsNewTurn ??
+      (message.dispatchMode !== "steer" ||
+        (message.turnId !== null && message.turnId !== undefined));
+    if (message.role === "user" && startsNewTurn) {
+      userStarts.push(message.createdAt);
+    }
+    const order = userStarts.length;
+    messageOrder.set(message.id, order);
+    if (message.turnId && !turnOrder.has(message.turnId)) turnOrder.set(message.turnId, order);
+  }
+  // Unattributed legacy activity keeps its chronological position.
+  const chronologicalOrder = (createdAt: string): number => {
+    let low = 0;
+    let high = userStarts.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (userStarts[mid]!.localeCompare(createdAt) <= 0) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  };
+  const orderByEntry = new Map<TimelineEntry, number>();
+  for (const entry of [...messageRows, ...proposedPlanRows, ...workRows]) {
+    if (entry.kind === "message" || entry.kind === "message-segment") {
+      orderByEntry.set(
+        entry,
+        messageOrder.get(entry.message.id) ?? chronologicalOrder(entry.createdAt),
+      );
+      continue;
+    }
+    // A merged work/plan row can carry a newer turnId than its anchor (a
+    // background tool's update owns the new turn) while a late replay can carry
+    // an old turnId with a fresh timestamp. Anchor it at whichever is earlier.
+    const turnId =
+      (entry.kind === "work" ? entry.entry.turnId : entry.proposedPlan.turnId) ?? undefined;
+    const turnBlock = turnId === undefined ? undefined : turnOrder.get(turnId);
+    const chronological = chronologicalOrder(entry.createdAt);
+    orderByEntry.set(
+      entry,
+      turnBlock === undefined ? chronological : Math.min(turnBlock, chronological),
+    );
+  }
+  const compare: TimelineComparator = (left, right) =>
+    orderByEntry.get(left)! - orderByEntry.get(right)! || compareTimelineEntries(left, right);
+
+  return coalesceAdjacentMessageSegments(
     mergeTimelineEntries(
-      sortedTimelineEntries(messageRows),
-      sortedTimelineEntries(proposedPlanRows),
+      mergeTimelineEntries(
+        sortedTimelineEntries(messageRows, compare),
+        sortedTimelineEntries(proposedPlanRows, compare),
+        compare,
+      ),
+      sortedTimelineEntries(workRows, compare),
+      compare,
     ),
-    sortedTimelineEntries(workRows),
   );
 }

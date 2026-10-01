@@ -112,6 +112,36 @@ import Migration0093 from "./Migrations/093_BackfillMaxIterationsDisabledReason.
 import Migration0094 from "./Migrations/094_ProjectionThreadsGoal.ts";
 import Migration0095 from "./Migrations/095_ProjectionThreadsGoalTiming.ts";
 import Migration0096 from "./Migrations/096_ProjectionThreadsGoalAchievements.ts";
+import Migration0097 from "./Migrations/097_ProjectionThreadsSidechatLifecycle.ts";
+import Migration0098 from "./Migrations/098_MigrateKiloToOpenCode.ts";
+import Migration0099 from "./Migrations/099_InvalidateProjectionThreadsCursor.ts";
+import Migration0100 from "./Migrations/100_MessageTextChunks.ts";
+import Migration0101 from "./Migrations/101_RemoveTranscriptMarkers.ts";
+import Migration0102 from "./Migrations/102_ProjectionThreadMessagesTurnBoundary.ts";
+import AsyncUserInputMigration from "./Migrations/105_AsyncUserInput.ts";
+import ClaudeTokenAccountingMigration from "./Migrations/103_ClaudeTokenAccounting.ts";
+import Migration0104 from "./Migrations/104_ProjectionThreadsClaudeCacheReview.ts";
+import ProjectImportOriginsMigration from "./Migrations/106_ProjectImportOrigins.ts";
+import Migration0108 from "./Migrations/108_GatewayCompletions.ts";
+import Migration0107 from "./Migrations/107_ProjectionThreadsHumanMessage.ts";
+import Migration0109 from "./Migrations/109_ProjectAgent.ts";
+import Migration0110 from "./Migrations/110_Groups.ts";
+import Migration0111 from "./Migrations/111_GroupLibraryHosting.ts";
+import Migration0112 from "./Migrations/112_CoordinatorAppearance.ts";
+import Migration0113 from "./Migrations/113_ProjectAgentWakeCursor.ts";
+import Migration0114 from "./Migrations/114_ProjectAgentLifecycle.ts";
+import Migration0115 from "./Migrations/115_ProjectAgentManagedWorkers.ts";
+import Migration0116 from "./Migrations/116_ProjectAgentWorkerRecovery.ts";
+import Migration0117 from "./Migrations/117_WorkerMonitoringLiveness.ts";
+import Migration0118 from "./Migrations/118_ProjectionThreadSessionProviderInstance.ts";
+import Migration0119 from "./Migrations/119_ProviderSessionRuntimeInstanceId.ts";
+import Migration0120 from "./Migrations/120_ProfileStatsDeletedProviderInstances.ts";
+import Migration0121 from "./Migrations/121_ClearAutomationDefinitionProviderOptions.ts";
+import Migration0122 from "./Migrations/122_ClearAutomationRunProviderOptions.ts";
+import Migration0123 from "./Migrations/123_ScrubOrchestrationEventProviderOptions.ts";
+import Migration0124 from "./Migrations/124_ProjectionTurnsPendingMessageIndex.ts";
+import Migration0125 from "./Migrations/125_Todos.ts";
+import Migration0126 from "./Migrations/126_ProjectionThreadsSidechatContext.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -223,6 +253,37 @@ export const migrationEntries = [
   [94, "ProjectionThreadsGoal", Migration0094],
   [95, "ProjectionThreadsGoalTiming", Migration0095],
   [96, "ProjectionThreadsGoalAchievements", Migration0096],
+  [97, "ProjectionThreadsSidechatLifecycle", Migration0097],
+  [98, "MigrateKiloToOpenCode", Migration0098],
+  [99, "InvalidateProjectionThreadsCursor", Migration0099],
+  [100, "MessageTextChunks", Migration0100],
+  [101, "RemoveTranscriptMarkers", Migration0101],
+  [102, "ProjectionThreadMessagesTurnBoundary", Migration0102],
+  // Keep this ID literal: scripts/check-migration-lineage.ts parses this list.
+  [103, "ClaudeTokenAccounting", ClaudeTokenAccountingMigration],
+  [104, "ProjectionThreadsClaudeCacheReview", Migration0104],
+  [105, "AsyncUserInput", AsyncUserInputMigration],
+  [106, "ProjectImportOrigins", ProjectImportOriginsMigration],
+  [107, "ProjectionThreadsHumanMessage", Migration0107],
+  [108, "GatewayCompletions", Migration0108],
+  [109, "ProjectAgent", Migration0109],
+  [110, "Groups", Migration0110],
+  [111, "GroupLibraryHosting", Migration0111],
+  [112, "CoordinatorAppearance", Migration0112],
+  [113, "ProjectAgentWakeCursor", Migration0113],
+  [114, "ProjectAgentLifecycle", Migration0114],
+  [115, "ProjectAgentManagedWorkers", Migration0115],
+  [116, "ProjectAgentWorkerRecovery", Migration0116],
+  [117, "WorkerMonitoringLiveness", Migration0117],
+  [118, "ProjectionThreadSessionProviderInstance", Migration0118],
+  [119, "ProviderSessionRuntimeInstanceId", Migration0119],
+  [120, "ProfileStatsDeletedProviderInstances", Migration0120],
+  [121, "ClearAutomationDefinitionProviderOptions", Migration0121],
+  [122, "ClearAutomationRunProviderOptions", Migration0122],
+  [123, "ScrubOrchestrationEventProviderOptions", Migration0123],
+  [124, "ProjectionTurnsPendingMessageIndex", Migration0124],
+  [125, "Todos", Migration0125],
+  [126, "ProjectionThreadsSidechatContext", Migration0126],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
@@ -248,7 +309,7 @@ export const makeMigrationLoader = (throughId?: number) =>
  * prevented at the source instead, by `scripts/check-migration-lineage.ts`.
  */
 export const LAST_SHARED_LINEAGE_MIGRATION_ID = 16;
-const LATEST_MIGRATION_ID = Math.max(...migrationEntries.map(([id]) => id));
+export const LATEST_MIGRATION_ID = Math.max(...migrationEntries.map(([id]) => id));
 
 const canonicalMigrationNamesById: ReadonlyMap<number, string> = new Map(
   migrationEntries.map(([id, name]) => [id, name] as const),

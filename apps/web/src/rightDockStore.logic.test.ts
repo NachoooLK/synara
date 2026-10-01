@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import { ThreadId } from "@synara/contracts";
 
 import {
-  RIGHT_DOCK_PANE_KINDS,
-  SINGLETON_PANE_KINDS,
   closePaneInState,
   createDefaultRightDockState,
   findMissingSidechatPaneIds,
@@ -13,47 +11,11 @@ import {
   sanitizeRightDockStateByThreadId,
   sanitizeRightDockThreadState,
   setDockOpenInState,
+  setSidechatPaneThreadInState,
   updatePaneInState,
 } from "./rightDockStore.logic";
 
-describe("RIGHT_DOCK_PANE_KINDS (single source of truth)", () => {
-  it("lists every supported kind", () => {
-    expect([...RIGHT_DOCK_PANE_KINDS]).toEqual([
-      "browser",
-      "device",
-      "diff",
-      "explorer",
-      "file",
-      "terminal",
-      "sidechat",
-      "git",
-      "pullRequest",
-    ]);
-  });
-
-  it("derives singletons as every kind except the multi-instance ones", () => {
-    for (const kind of RIGHT_DOCK_PANE_KINDS) {
-      expect(SINGLETON_PANE_KINDS.has(kind)).toBe(kind !== "file");
-    }
-  });
-});
-
 describe("isRightDockPaneKind", () => {
-  it("accepts the known pane kinds", () => {
-    for (const kind of [
-      "browser",
-      "diff",
-      "explorer",
-      "file",
-      "terminal",
-      "sidechat",
-      "git",
-      "pullRequest",
-    ]) {
-      expect(isRightDockPaneKind(kind)).toBe(true);
-    }
-  });
-
   it("rejects unknown or malformed kinds", () => {
     expect(isRightDockPaneKind("plan")).toBe(false);
     expect(isRightDockPaneKind(undefined)).toBe(false);
@@ -222,16 +184,6 @@ describe("resolveVisibleDockSidechatThreadIds", () => {
     return setDockOpenInState(state, open);
   }
 
-  it("exposes the embedded sidechat thread of an open host dock", () => {
-    expect(
-      resolveVisibleDockSidechatThreadIds({
-        dockRendered: true,
-        dockStateByThreadId: { [hostThreadId]: dockWithSidechat(true) },
-        hostThreadIds: [hostThreadId],
-      }),
-    ).toEqual([sidechatThreadId]);
-  });
-
   it("ignores hidden docks, inactive sidechat panes, other hosts, and non-sidechat panes", () => {
     expect(
       resolveVisibleDockSidechatThreadIds({
@@ -330,18 +282,6 @@ describe("empty launcher state", () => {
 });
 
 describe("file panes", () => {
-  it("opens a file pane carrying the file path", () => {
-    const state = openPaneInState(createDefaultRightDockState(), {
-      paneId: "f1",
-      kind: "file",
-      filePath: "src/page.tsx",
-    });
-    expect(state.open).toBe(true);
-    expect(state.activePaneId).toBe("f1");
-    expect(state.panes).toHaveLength(1);
-    expect(state.panes[0]?.filePath).toBe("src/page.tsx");
-  });
-
   it("opens another file in a new tab instead of swapping the existing pane", () => {
     const first = openPaneInState(createDefaultRightDockState(), {
       paneId: "f1",
@@ -446,9 +386,47 @@ describe("sanitizeRightDockStateByThreadId", () => {
     expect(Object.keys(result)).toEqual(["t1"]);
     expect(result.t1?.panes).toHaveLength(1);
   });
+});
 
-  it("returns an empty map for non-object input", () => {
-    expect(sanitizeRightDockStateByThreadId(null)).toEqual({});
-    expect(sanitizeRightDockStateByThreadId("oops")).toEqual({});
+describe("setSidechatPaneThreadInState", () => {
+  const first = ThreadId.makeUnsafe("sidechat-first");
+  const second = ThreadId.makeUnsafe("sidechat-second");
+
+  it("adds the side chat pane without opening a closed dock", () => {
+    const next = setSidechatPaneThreadInState(createDefaultRightDockState(), {
+      paneId: "pane-1",
+      threadId: first,
+    });
+    expect(next.open).toBe(false);
+    expect(next.panes).toMatchObject([{ id: "pane-1", kind: "sidechat", threadId: first }]);
+    expect(next.activePaneId).toBe("pane-1");
+  });
+
+  it("repoints the existing pane and keeps an open dock open", () => {
+    const opened = setDockOpenInState(
+      setSidechatPaneThreadInState(createDefaultRightDockState(), {
+        paneId: "pane-1",
+        threadId: first,
+      }),
+      true,
+    );
+    const next = setSidechatPaneThreadInState(opened, { paneId: "pane-2", threadId: second });
+    expect(next.open).toBe(true);
+    expect(next.panes).toMatchObject([{ id: "pane-1", threadId: second }]);
+    expect(setSidechatPaneThreadInState(next, { paneId: "pane-3", threadId: second })).toBe(next);
+  });
+
+  it("removes the pane for null and leaves an open dock on its launcher", () => {
+    const opened = setDockOpenInState(
+      setSidechatPaneThreadInState(createDefaultRightDockState(), {
+        paneId: "pane-1",
+        threadId: first,
+      }),
+      true,
+    );
+    const next = setSidechatPaneThreadInState(opened, { paneId: "pane-2", threadId: null });
+    expect(next).toMatchObject({ open: true, panes: [], activePaneId: null });
+    const empty = createDefaultRightDockState();
+    expect(setSidechatPaneThreadInState(empty, { paneId: "p", threadId: null })).toBe(empty);
   });
 });

@@ -17,15 +17,16 @@ import type {
   ProviderKind,
   ResolvedKeybindingsConfig,
   ThreadId,
-  ThreadMarker,
-  ThreadMarkerId,
 } from "@synara/contracts";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
+import type { ReactNode } from "react";
 
 import { useAppSettings } from "~/appSettings";
 import { SETTINGS_TARGETS } from "~/settingsNavigation";
 import {
   ENVIRONMENT_PANEL_MOTION_CLASS,
+  ENVIRONMENT_PANEL_OVERLAY_WRAPPER_CLASS_NAME as BASE_ENVIRONMENT_PANEL_OVERLAY_WRAPPER_CLASS_NAME,
   ENVIRONMENT_PANEL_SURFACE_CLASS_NAME,
 } from "~/components/chat/composerPickerStyles";
 import BranchToolbar, { type BranchToolbarProps } from "~/components/BranchToolbar";
@@ -41,6 +42,17 @@ import type { RepoDiffTotals } from "~/hooks/useRepoDiffTotals";
 import { ArrowUpRightIcon, ChangesIcon, GitHubIcon, SettingsIcon } from "~/lib/icons";
 import { cn } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
+import { revealFolderInShell } from "~/lib/revealFolder";
+import { deleteActiveThreadFromClient } from "~/lib/activeThreadDelete";
+import { gitRemoveWorktreeMutationOptions } from "~/lib/gitReactQuery";
+import { waitForSidechatCreator } from "~/lib/sidechatCreatorRegistry";
+import { useComposerDraftStore } from "~/composerDraftStore";
+import { showConfirmDialogFallback } from "~/confirmDialogFallback";
+import { usePinnedThreadsStore } from "~/pinnedThreadsStore";
+import { useSplitViewStore } from "~/splitViewStore";
+import { useTerminalStateStore } from "~/terminalStateStore";
+import { useTemporaryThreadStore } from "~/temporaryThreadStore";
+import { useRightDockStore } from "~/rightDockStore";
 
 import { EnvironmentEditorSection } from "./EnvironmentEditorSection";
 import {
@@ -50,13 +62,16 @@ import {
 import { EnvironmentUsageSection } from "./EnvironmentUsageSection";
 import { EnvironmentLocalServersSection } from "./EnvironmentLocalServersSection";
 import { EnvironmentPullRequestSection } from "./EnvironmentPullRequestSection";
-import { EnvironmentMarkersSection } from "./EnvironmentMarkersSection";
 import { EnvironmentStudioOutputsSection } from "./EnvironmentStudioOutputsSection";
+import {
+  EnvironmentSidechatsSection,
+  type EnvironmentSidechatPanelItem,
+} from "./EnvironmentSidechatsSection";
 import { EnvironmentNotesSection } from "./EnvironmentNotesSection";
 import { EnvironmentPinnedSection } from "./EnvironmentPinnedSection";
 import { EnvironmentProjectInstructionsSection } from "./EnvironmentProjectInstructionsSection";
 import { ENVIRONMENT_PANEL_RECAP_MARKDOWN_CLASS_NAME } from "./environmentPanelStyles";
-import { shouldShowStudioFolderRow } from "./EnvironmentPanel.logic";
+import { shouldShowGroupFolderRow } from "./EnvironmentPanel.logic";
 import {
   ENVIRONMENT_ROW_ICON_CLASS_NAME,
   EnvironmentCollapsibleSection,
@@ -72,8 +87,10 @@ import {
 // scrollbar pinned to the viewport's far right.
 export const ENVIRONMENT_DOCKED_CONTENT_INSET_PX = 312;
 
-const ENVIRONMENT_PANEL_OVERLAY_WRAPPER_CLASS_NAME =
-  "pointer-events-none absolute inset-y-0 right-0 z-20 flex flex-col p-3";
+const ENVIRONMENT_PANEL_OVERLAY_WRAPPER_CLASS_NAME = cn(
+  BASE_ENVIRONMENT_PANEL_OVERLAY_WRAPPER_CLASS_NAME,
+  "items-end gap-3 overflow-y-auto",
+);
 
 export interface EnvironmentPanelProps {
   /** Drives the slide-in/out transition; the panel stays mounted so CSS can interpolate. */
@@ -96,21 +113,23 @@ export interface EnvironmentPanelProps {
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
   activeThreadId: ThreadId | null;
-  /** Active provider for the usage row (same chip the header used to show). */
+  /** Active provider for the usage row (same chip the header shows). */
   activeProvider: ProviderKind;
   /**
-   * Whether the active thread is a Studio chat. Studio chats show the Output section:
+   * Whether the active thread is a group chat. Group chats show the Output section:
    * the Outbox files THIS chat produced, so its output stays attached to the chat.
    */
-  isStudioChat: boolean;
-  /** Ordinary cwd selected for this Studio chat; this is not a Git worktree. */
-  studioFolderPath?: string | null;
+  isGroupChat: boolean;
+  /** Ordinary cwd selected for this group chat; this is not a Git worktree. */
+  groupFolderPath?: string | null;
   /** Whether the active runtime exposes git actions (hides "Commit and Push" otherwise). */
   showGitActions: boolean;
   /** Current diff-panel open state, so the "Changes" row reflects/toggles it. */
   diffOpen: boolean;
   /** Heartbeat automations whose target is the active thread. */
   threadAutomations: readonly EnvironmentAutomationPanelItem[];
+  /** Child side chats for a host thread. Null suppresses the section in embedded side chats. */
+  sidechats: readonly EnvironmentSidechatPanelItem[] | null;
   /** Non-null when the diff panel cannot be opened (e.g. no repo / no changes yet). */
   diffDisabledReason?: string | null;
   /** Shared diff totals from ChatView so the mounted panel does not duplicate patch parsing. */
@@ -123,14 +142,16 @@ export interface EnvironmentPanelProps {
     readonly status: "idle" | "pending" | "error";
     readonly updatedAt: string | null;
   } | null;
+  /**
+   * Rail content rendered below the env card inside the overlay wrapper
+   * (the ambient computer preview). The wrapper is a flex column, so this
+   * stacks under the card; see AmbientRailSlot for the closed-state slide.
+   */
+  railBottom?: ReactNode;
   /** Per-thread pinned-message checklist (server-synced). */
   pinnedMessages: readonly PinnedMessage[];
-  /** Per-thread text markers (server-synced). */
-  threadMarkers: readonly ThreadMarker[];
   /** Live text of pinned messages still present in the transcript (for labels/availability). */
   pinnedMessageTextById: ReadonlyMap<MessageId, string>;
-  /** Live text of marked messages still present in the transcript (for labels/availability). */
-  markerMessageTextById: ReadonlyMap<MessageId, string>;
   /** Per-thread freeform scratchpad notes (server-synced). */
   notes: string;
   /** Active project whose local instructions should be edited. */
@@ -157,14 +178,6 @@ export interface EnvironmentPanelProps {
   onUnpinMessage: (messageId: MessageId) => void;
   /** Set (`null` clears to auto) a pinned message's label. */
   onRenamePinnedMessage: (messageId: MessageId, label: string | null) => void;
-  /** Scroll the transcript to a text marker. */
-  onJumpToThreadMarker: (marker: ThreadMarker) => void;
-  /** Toggle a marker's done state. */
-  onToggleThreadMarkerDone: (markerId: ThreadMarkerId) => void;
-  /** Remove a text marker. */
-  onRemoveThreadMarker: (markerId: ThreadMarkerId) => void;
-  /** Set (`null` clears to auto) a marker label. */
-  onRenameThreadMarker: (markerId: ThreadMarkerId, label: string | null) => void;
   /** Persist updated notes for the given thread (bound per section instance, not the active thread). */
   onNotesChange: (threadId: ThreadId, notes: string) => Promise<void>;
   /** Open the in-app editor workspace view (the Editor section's default first row). */
@@ -217,19 +230,18 @@ export function EnvironmentPanel({
   availableEditors,
   activeThreadId,
   activeProvider,
-  isStudioChat,
-  studioFolderPath: studioFolderPathProp,
+  isGroupChat,
+  groupFolderPath: groupFolderPathProp,
   showGitActions,
   diffOpen,
   threadAutomations,
+  sidechats,
   diffDisabledReason: diffDisabledReasonProp,
   diffTotals,
   branchToolbar,
   recap: recapProp,
   pinnedMessages,
-  threadMarkers,
   pinnedMessageTextById,
-  markerMessageTextById,
   notes,
   activeProjectId,
   projectInstructions,
@@ -243,23 +255,23 @@ export function EnvironmentPanel({
   onTogglePinnedMessageDone,
   onUnpinMessage,
   onRenamePinnedMessage,
-  onJumpToThreadMarker,
-  onToggleThreadMarkerDone,
-  onRemoveThreadMarker,
-  onRenameThreadMarker,
   onNotesChange,
   onOpenEditorView: onOpenEditorViewProp,
   onClose,
   onRegisterCommitAndPushTrigger,
+  railBottom,
 }: EnvironmentPanelProps) {
   const githubRepository = githubRepositoryProp ?? null;
   const githubRepositories = githubRepositoriesProp ?? [];
-  const studioFolderPath = studioFolderPathProp ?? null;
+  const groupFolderPath = groupFolderPathProp ?? null;
   const diffDisabledReason = diffDisabledReasonProp ?? null;
   const recap = recapProp ?? null;
   const onOpenEditorView = onOpenEditorViewProp ?? null;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const removeWorktreeMutation = useMutation(gitRemoveWorktreeMutationOptions({ queryClient }));
   const { settings } = useAppSettings();
+  const openRightDockPane = useRightDockStore((store) => store.openPane);
   const { additions, deletions, hasChanges } = diffTotals;
 
   // Disable the Changes row only when the diff cannot be opened *and* is not already open
@@ -267,9 +279,9 @@ export function EnvironmentPanel({
   const changesDisabled = diffDisabledReason !== null && !diffOpen;
   const showRecap = Boolean(recap?.text) || recap?.status === "pending";
   const markdownCwd = openInTarget ?? gitCwd ?? undefined;
-  const showStudioFolderRow = shouldShowStudioFolderRow({
-    isStudioChat,
-    studioFolderPath,
+  const showGroupFolderRow = shouldShowGroupFolderRow({
+    isGroupChat,
+    groupFolderPath,
     nativeShellAvailable: isElectron,
   });
 
@@ -310,36 +322,17 @@ export function EnvironmentPanel({
         </IconButton>
       </div>
 
-      {showStudioFolderRow && studioFolderPath ? (
+      {showGroupFolderRow && groupFolderPath ? (
         <EnvironmentRow
           icon={<FolderClosed className={ENVIRONMENT_ROW_ICON_CLASS_NAME} aria-hidden />}
           label={
-            <span className="truncate" title={studioFolderPath}>
-              {basenameOfPath(studioFolderPath) || studioFolderPath}
+            <span className="truncate" title={groupFolderPath}>
+              {basenameOfPath(groupFolderPath) || groupFolderPath}
             </span>
           }
           trailing={<ArrowUpRightIcon className={ENVIRONMENT_ROW_ICON_CLASS_NAME} aria-hidden />}
           onClick={() => {
-            const api = readNativeApi();
-            if (!api) {
-              toastManager.add({
-                type: "error",
-                title: "Unable to open folder",
-                description: "The desktop connection is not available yet.",
-              });
-              return;
-            }
-            void api.shell
-              .showInFolder(studioFolderPath)
-              .then(onClose)
-              .catch((error) => {
-                toastManager.add({
-                  type: "error",
-                  title: "Unable to open folder",
-                  description:
-                    error instanceof Error ? error.message : "An unknown error occurred.",
-                });
-              });
+            revealFolderInShell({ path: groupFolderPath, onRevealed: onClose });
           }}
         />
       ) : null}
@@ -369,6 +362,84 @@ export function EnvironmentPanel({
       ) : null}
 
       <EnvironmentLocalServersSection enabled={open} />
+
+      {sidechats && activeThreadId ? (
+        <EnvironmentSidechatsSection
+          sidechats={sidechats}
+          onCreate={() => {
+            void waitForSidechatCreator(activeThreadId)
+              .then((createSidechat) => {
+                if (!createSidechat) {
+                  toastManager.add({
+                    type: "warning",
+                    title: "Side chat is unavailable",
+                    description: "Open a server-backed main thread before starting a side chat.",
+                  });
+                  return;
+                }
+                return createSidechat();
+              })
+              .catch((error) => {
+                toastManager.add({
+                  type: "error",
+                  title: "Could not start side chat",
+                  description:
+                    error instanceof Error
+                      ? error.message
+                      : "An error occurred while creating the side chat.",
+                });
+              });
+          }}
+          onOpen={(sidechatThreadId) => {
+            openRightDockPane(activeThreadId, {
+              kind: "sidechat",
+              threadId: sidechatThreadId,
+            });
+            onClose();
+          }}
+          onDelete={(sidechat) => {
+            void (async () => {
+              if (settings.confirmThreadDelete) {
+                const confirmationMessage = [
+                  `Delete side chat "${sidechat.title}"?`,
+                  "This permanently clears conversation history for this side chat and its subagents.",
+                ].join("\n");
+                const api = readNativeApi();
+                const confirmed = api
+                  ? await api.dialogs.confirm(confirmationMessage)
+                  : await showConfirmDialogFallback(confirmationMessage);
+                if (!confirmed) return;
+              }
+              // The host can change workspace after the side chat is created. The shared delete
+              // helper prompts only if this side chat is now the last owner of its worktree.
+              // An open dock pane is pruned once the thread disappears.
+              await deleteActiveThreadFromClient({
+                threadId: sidechat.id,
+                includeSubagentDescendants: true,
+                onDeleted: ({ thread }) => {
+                  usePinnedThreadsStore.getState().unpinThread(thread.id);
+                  const drafts = useComposerDraftStore.getState();
+                  drafts.clearDraftThread(thread.id);
+                  drafts.clearProjectDraftThreadById(thread.projectId, thread.id);
+                  useTerminalStateStore.getState().clearTerminalState(thread.id);
+                  useSplitViewStore.getState().removeThreadFromSplitViews(thread.id);
+                  useTemporaryThreadStore.getState().clearTemporaryThread(thread.id);
+                },
+                removeWorktree: (worktree) => removeWorktreeMutation.mutateAsync(worktree),
+              });
+            })().catch((error) => {
+              toastManager.add({
+                type: "error",
+                title: "Could not delete side chat",
+                description:
+                  error instanceof Error
+                    ? error.message
+                    : "An error occurred while deleting the side chat.",
+              });
+            });
+          }}
+        />
+      ) : null}
 
       {/*
         Optional sections below the git block. Each renders its own leading divider only when it
@@ -404,7 +475,7 @@ export function EnvironmentPanel({
         />
       ) : null}
 
-      {isStudioChat && activeThreadId ? (
+      {isGroupChat && activeThreadId ? (
         <EnvironmentStudioOutputsSection threadId={activeThreadId} enabled={open} />
       ) : null}
 
@@ -441,20 +512,6 @@ export function EnvironmentPanel({
             onToggleDone={onTogglePinnedMessageDone}
             onUnpin={onUnpinMessage}
             onRename={onRenamePinnedMessage}
-          />
-        </>
-      ) : null}
-
-      {settings.showEnvironmentMarkers && threadMarkers.length > 0 ? (
-        <>
-          <EnvironmentSectionDivider />
-          <EnvironmentMarkersSection
-            markers={threadMarkers}
-            messageTextById={markerMessageTextById}
-            onJump={onJumpToThreadMarker}
-            onToggleDone={onToggleThreadMarkerDone}
-            onRemove={onRemoveThreadMarker}
-            onRename={onRenameThreadMarker}
           />
         </>
       ) : null}
@@ -496,6 +553,7 @@ export function EnvironmentPanel({
       className={ENVIRONMENT_PANEL_OVERLAY_WRAPPER_CLASS_NAME}
       data-environment-panel-variant={variant}
       aria-hidden={!open}
+      inert={!open}
     >
       <div
         className={cn(
@@ -509,6 +567,7 @@ export function EnvironmentPanel({
       >
         <div className="min-h-0 overflow-y-auto">{content}</div>
       </div>
+      {railBottom}
     </div>
   );
 }

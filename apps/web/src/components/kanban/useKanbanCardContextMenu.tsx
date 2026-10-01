@@ -16,7 +16,9 @@ import { RenameThreadDialog } from "~/components/RenameThreadDialog";
 import { useCopyPathToClipboard, useCopyThreadIdToClipboard } from "~/hooks/useCopyToClipboard";
 import { deleteActiveThreadFromClient } from "~/lib/activeThreadDelete";
 import { gitRemoveWorktreeMutationOptions } from "~/lib/gitReactQuery";
+import { THREAD_CONTEXT_MENU_ICONS } from "~/lib/contextMenuIcons";
 import { pinActionLabel } from "~/lib/pin";
+import { releaseOrphanedWorktreeAfterArchive } from "~/lib/archiveThreadWorktreeCleanup";
 import { archiveThreadFromClient } from "~/lib/threadArchive";
 import { dispatchThreadRename } from "~/lib/threadRename";
 import { newCommandId } from "~/lib/utils";
@@ -51,7 +53,13 @@ function resolveCardWorkspacePath(card: KanbanCard): string | null {
   });
 }
 
-async function archiveCardThread(threadId: ThreadId) {
+async function archiveCardThread(
+  threadId: ThreadId,
+  worktreeRelease: Omit<
+    Parameters<typeof releaseOrphanedWorktreeAfterArchive>[0],
+    "threadId" | "archiveSequence"
+  >,
+) {
   const api = readNativeApi();
   if (!api) return;
   const thread = getThreadFromState(useStore.getState(), threadId);
@@ -59,7 +67,19 @@ async function archiveCardThread(threadId: ThreadId) {
   // Archived threads leave the board's thread feed, so a live optimistic
   // dispatch entry could never reconcile — drop it with the card.
   useKanbanUiStore.getState().clearOptimisticDispatch(threadId);
-  await archiveThreadFromClient(api.orchestration, threadId);
+  const archiveSequence = await archiveThreadFromClient(api.orchestration, threadId);
+  if (!worktreeRelease.enabled) return;
+  // Kanban has no Undo toast. Give the asynchronous archive cleanup time to
+  // stop the provider before asking the server to validate and remove anything.
+  globalThis.setTimeout(() => {
+    void releaseOrphanedWorktreeAfterArchive({
+      threadId,
+      archiveSequence,
+      ...worktreeRelease,
+    }).catch((error: unknown) => {
+      console.error("Failed to release worktree after archiving thread", { threadId, error });
+    });
+  }, 8_000);
 }
 
 async function setThreadPinned(threadId: ThreadId, isPinned: boolean) {
@@ -131,23 +151,47 @@ export function useKanbanCardContextMenu(): KanbanCardContextMenuController {
         [
           ...(isThreadActionCard
             ? [
-                { id: "rename", label: "Rename thread" },
+                { id: "rename", label: "Rename thread", icon: THREAD_CONTEXT_MENU_ICONS.rename },
                 {
                   id: "toggle-pin",
                   label: pinActionLabel("thread", card.thread?.isPinned ?? false),
+                  icon: THREAD_CONTEXT_MENU_ICONS.pin,
                 },
               ]
             : []),
           ...(workspacePath
-            ? [{ id: "copy-path", label: "Copy Path", separatorBefore: true }]
+            ? [
+                {
+                  id: "copy-path",
+                  label: "Copy Path",
+                  icon: THREAD_CONTEXT_MENU_ICONS.copy,
+                  separatorBefore: true,
+                },
+              ]
             : []),
-          ...(isThreadBacked ? [{ id: "copy-thread-id", label: "Copy Thread ID" }] : []),
+          ...(isThreadBacked
+            ? [
+                {
+                  id: "copy-thread-id",
+                  label: "Copy Thread ID",
+                  icon: THREAD_CONTEXT_MENU_ICONS.copy,
+                },
+              ]
+            : []),
           ...(isThreadActionCard
-            ? [{ id: "archive", label: "Archive", separatorBefore: true }]
+            ? [
+                {
+                  id: "archive",
+                  label: "Archive",
+                  icon: THREAD_CONTEXT_MENU_ICONS.archive,
+                  separatorBefore: true,
+                },
+              ]
             : []),
           {
             id: "delete",
             label: deletesOnlyDraft ? "Delete draft" : "Delete",
+            icon: THREAD_CONTEXT_MENU_ICONS.delete,
             destructive: true,
             separatorBefore: !isThreadActionCard,
           },
@@ -189,7 +233,10 @@ export function useKanbanCardContextMenu(): KanbanCardContextMenuController {
           );
           if (!confirmed) return;
         }
-        await archiveCardThread(card.threadId);
+        await archiveCardThread(card.threadId, {
+          enabled: settings.archiveDeletesOrphanedWorktree,
+          removeWorktree: (worktree) => removeWorktreeMutation.mutateAsync(worktree),
+        });
         return;
       }
       if (clicked !== "delete") return;

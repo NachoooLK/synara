@@ -96,6 +96,7 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
       panel.style.width = `${clamped.width}px`;
       panel.style.height = `${clamped.height}px`;
     }
+    requestBrowserPanelBoundsSync();
     return clamped;
   }, []);
 
@@ -125,6 +126,8 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
         clamped.width === panelRectRef.current.width &&
         clamped.height === panelRectRef.current.height
       ) {
+        // A sidebar resize can move the host without changing the panel's local rect.
+        requestBrowserPanelBoundsSync();
         return;
       }
       commitPanelRect(clamped, host);
@@ -213,7 +216,7 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
     activeInteractionCleanupRef.current = finish;
   };
 
-  const startHandleGesture = (event: ReactPointerEvent<HTMLElement>) => {
+  const startHandleGesture = (event: ReactPointerEvent<HTMLElement>, expandOnClick = false) => {
     const host = hostRef.current;
     if (!host || event.button !== 0) return;
 
@@ -241,15 +244,16 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
       removePanelResizeOverlay(resizeOverlay);
       document.body.style.cursor = previousBodyCursor;
       document.body.style.userSelect = previousBodyUserSelect;
-      if (activeInteractionCleanupRef.current === finishWithRelease) {
+      if (activeInteractionCleanupRef.current === finishWithAbort) {
         activeInteractionCleanupRef.current = null;
       }
       if (didDragRef.current) {
         commitPanelRect(panelRectRef.current, host);
         return;
       }
-      if (openMenu && reopenMenuOnRelease) {
-        setControlsOpen(true);
+      if (openMenu && (expandOnClick || reopenMenuOnRelease)) {
+        if (expandOnClick) props.onPopToSidebar();
+        else setControlsOpen(true);
       }
     };
     const finishWithRelease = () => finish(true);
@@ -275,7 +279,7 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
       onRelease: finishWithRelease,
       onAbort: finishWithAbort,
     });
-    activeInteractionCleanupRef.current = finishWithRelease;
+    activeInteractionCleanupRef.current = finishWithAbort;
   };
 
   return (
@@ -290,7 +294,7 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
         data-floating-browser-panel="true"
         role="region"
         aria-label="Floating browser"
-        className="group/floating-browser pointer-events-auto absolute flex flex-col overflow-visible rounded-xl border border-border bg-transparent text-foreground shadow-2xl ring-1 ring-black/10"
+        className="group/floating-browser pointer-events-auto absolute flex flex-col overflow-visible rounded-2xl border border-border bg-popover/95 text-foreground shadow-[0_12px_48px_-12px_rgb(0_0_0/0.25)] backdrop-blur-xl"
         style={{
           left: `${panelRect.left}px`,
           top: `${panelRect.top}px`,
@@ -312,11 +316,21 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
             />
           </Suspense>
         </div>
+        <button
+          type="button"
+          aria-label="Expand browser"
+          data-floating-browser-preview-shield="true"
+          className="absolute inset-0 z-50 cursor-grab rounded-[inherit] active:cursor-grabbing"
+          onPointerDown={(event) => startHandleGesture(event, true)}
+          onClick={(event) => {
+            if (event.detail === 0) props.onPopToSidebar();
+          }}
+        />
         <div
           data-floating-browser-controls="true"
           className="pointer-events-none absolute right-2 top-2 z-[70]"
         >
-          <div className="pointer-events-auto flex items-center gap-0.5 rounded-full border border-border/80 bg-background/90 p-0.5 shadow-sm backdrop-blur-md">
+          <div className="pointer-events-auto flex items-center gap-0.5 rounded-full border border-border bg-popover/95 p-0.5 text-xs text-muted-foreground shadow-sm backdrop-blur-xl">
             <IconButton
               type="button"
               variant="ghost"
@@ -328,7 +342,7 @@ export function FloatingBrowserPanel(props: FloatingBrowserPanelProps) {
               aria-expanded={controlsOpen}
               aria-haspopup="true"
               className="size-6 cursor-grab rounded-full text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing"
-              onPointerDown={startHandleGesture}
+              onPointerDown={(event) => startHandleGesture(event)}
             >
               <EllipsisIcon className="size-3.5" />
             </IconButton>

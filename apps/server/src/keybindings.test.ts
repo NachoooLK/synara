@@ -73,69 +73,6 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
     }),
   );
 
-  it.effect("defaults chat.find to mod+F outside terminal focus", () =>
-    Effect.sync(() => {
-      assert.deepEqual(
-        DEFAULT_KEYBINDINGS.find((rule) => rule.command === "chat.find"),
-        {
-          key: "mod+f",
-          command: "chat.find",
-          when: "!terminalFocus",
-        },
-      );
-    }),
-  );
-
-  it.effect("defaults sidebar.search to Cmd+K on macOS and Ctrl+K elsewhere", () =>
-    Effect.sync(() => {
-      const searchDefaults = DEFAULT_KEYBINDINGS.filter(
-        (rule) => rule.command === "sidebar.search",
-      );
-      assert.deepEqual(searchDefaults, [
-        { key: "cmd+k", command: "sidebar.search" },
-        { key: "ctrl+k", command: "sidebar.search", when: "!isMac" },
-      ]);
-      assert.isUndefined(
-        DEFAULT_KEYBINDINGS.find(
-          (rule) => rule.command === "sidebar.search" && rule.key === "mod+k",
-        ),
-      );
-    }),
-  );
-
-  it.effect("defaults Activity to Cmd+Option+U with terminal-safe cross-platform behavior", () =>
-    Effect.sync(() => {
-      assert.deepEqual(
-        DEFAULT_KEYBINDINGS.find((rule) => rule.command === "sidebar.activity"),
-        {
-          key: "mod+alt+u",
-          command: "sidebar.activity",
-          when: "!terminalFocus || isMac",
-        },
-      );
-    }),
-  );
-
-  it.effect("persists both platform variants of the commit-and-push binding", () =>
-    Effect.sync(() => {
-      assert.deepEqual(
-        DEFAULT_KEYBINDINGS.filter((rule) => rule.command === "git.commitAndPush"),
-        [
-          {
-            key: "meta+ctrl+p",
-            command: "git.commitAndPush",
-            when: "!terminalFocus && isMac",
-          },
-          {
-            key: "ctrl+alt+p",
-            command: "git.commitAndPush",
-            when: "!terminalFocus && !isMac",
-          },
-        ],
-      );
-    }),
-  );
-
   it.effect("compiles valid rule with parsed when AST", () =>
     Effect.sync(() => {
       const compiled = compileResolvedKeybindingRule({
@@ -657,6 +594,69 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
       assert.isTrue(
         persisted.some(
           (entry) => entry.command === "settings.usage" && entry.when === "!terminalFocus",
+        ),
+      );
+    }).pipe(Effect.provide(makeKeybindingsLayer())),
+  );
+
+  it.effect("migrates numbered terminal workspace defaults without changing custom rules", () =>
+    Effect.gen(function* () {
+      const { keybindingsConfigPath } = yield* ServerConfig;
+      yield* writeKeybindingsConfig(keybindingsConfigPath, [
+        {
+          key: "mod+1",
+          command: "terminal.workspace.terminal",
+          when: "terminalWorkspaceOpen",
+        },
+        { key: "mod+2", command: "terminal.workspace.chat", when: "terminalWorkspaceOpen" },
+        {
+          key: "mod+1",
+          command: "thread.jump.1",
+          when: "!terminalFocus && !terminalWorkspaceOpen",
+        },
+        {
+          key: "mod+shift+3",
+          command: "thread.jump.3",
+          when: "!terminalFocus && !terminalWorkspaceOpen",
+        },
+      ]);
+
+      yield* Effect.gen(function* () {
+        const keybindings = yield* Keybindings;
+        yield* keybindings.syncDefaultKeybindingsOnStartup;
+      });
+
+      const persisted = yield* readKeybindingsConfig(keybindingsConfigPath);
+      assert.isTrue(
+        persisted.some(
+          (entry) =>
+            entry.key === "ctrl+1" &&
+            entry.command === "terminal.workspace.terminal" &&
+            entry.when === "terminalWorkspaceOpen",
+        ),
+      );
+      assert.isTrue(
+        persisted.some(
+          (entry) =>
+            entry.key === "ctrl+2" &&
+            entry.command === "terminal.workspace.chat" &&
+            entry.when === "terminalWorkspaceOpen",
+        ),
+      );
+      assert.isTrue(
+        persisted.some(
+          (entry) =>
+            entry.key === "mod+1" &&
+            entry.command === "thread.jump.1" &&
+            entry.when === "(!terminalFocus && !terminalWorkspaceOpen) || isMac",
+        ),
+      );
+      assert.isTrue(
+        persisted.some(
+          (entry) =>
+            entry.key === "mod+shift+3" &&
+            entry.command === "thread.jump.3" &&
+            entry.when === "!terminalFocus && !terminalWorkspaceOpen",
         ),
       );
     }).pipe(Effect.provide(makeKeybindingsLayer())),

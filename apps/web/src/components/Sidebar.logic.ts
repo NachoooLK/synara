@@ -2,13 +2,7 @@
 // Purpose: Shared sidebar sorting and status helpers used by the thread list UI.
 // Exports: Sidebar row state derivation, add-project error helpers, sort utilities, and visibility helpers.
 
-import {
-  MAX_PINNED_PROJECTS,
-  type KeybindingCommand,
-  type ProjectId,
-  type PullRequestReviewRequestCountResult,
-  type ThreadId,
-} from "@synara/contracts";
+import { MAX_PINNED_PROJECTS, type ProjectId, type ThreadId } from "@synara/contracts";
 import { pluralize } from "@synara/shared/text";
 import { resolveThreadEnvironmentMode } from "@synara/shared/threadEnvironment";
 import { isWorkspaceRootWithin, workspaceRootsEqual } from "@synara/shared/threadWorkspace";
@@ -16,6 +10,7 @@ import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "../appSett
 import { resolveRestorableThreadRoute, type LastThreadRoute } from "../chatRouteRestore";
 import type { ChatMessage, Project, SidebarThreadSummary, Thread } from "../types";
 import { cn } from "../lib/utils";
+import type { GitHubReviewRequestBadgeCount } from "../lib/githubInboxQueryOptions";
 import {
   derivePinnedIds,
   getPinnedItems,
@@ -47,7 +42,14 @@ export const THREAD_SELECTION_SAFE_SELECTOR = "[data-thread-item], [data-thread-
 export const SIDEBAR_THREAD_PREWARM_LIMIT = 10;
 export const DEBUG_FEATURE_FLAGS_MENU_STORAGE_KEY = "synara:show-debug-feature-flags-menu";
 export type SidebarNewThreadEnvMode = "local" | "worktree";
-export type SidebarView = "threads" | "studio";
+export type SidebarView = "threads" | "groups";
+
+// Values persisted before the Groups rename still say "studio"; fold them into the
+// Groups view instead of dropping the user on an unknown surface.
+export function normalizeSidebarView(value: unknown): SidebarView {
+  return value === "groups" || value === "studio" ? "groups" : "threads";
+}
+
 export type SidebarActionBadge = {
   readonly text: string;
   readonly accessibleLabel: string;
@@ -55,14 +57,14 @@ export type SidebarActionBadge = {
 
 export function isProjectsSidebarSurface(input: {
   readonly isOnSettings: boolean;
-  readonly isOnStudio: boolean;
+  readonly isOnGroups: boolean;
 }): boolean {
-  return !input.isOnSettings && !input.isOnStudio;
+  return !input.isOnSettings && !input.isOnGroups;
 }
 
 /** Keep partial review counts visible without presenting them as exact. */
 export function resolvePullRequestReviewBadge(
-  result: PullRequestReviewRequestCountResult | undefined,
+  result: GitHubReviewRequestBadgeCount | undefined,
 ): SidebarActionBadge | null {
   if (!result) return null;
   if (result.incomplete) {
@@ -103,11 +105,10 @@ export function pullRequestRepositoryConfigFingerprint(
 }
 
 /**
- * Shared project roots can serve several threads, so their live Git status only belongs to a
- * thread when the checked-out branch matches the persisted thread branch. A materialized
- * worktree is thread-scoped, though, and coding agents may checkout or create a new branch
- * without going through Synara's branch picker. In that case the worktree's checked-out branch
- * is authoritative even when the persisted branch metadata is stale.
+ * Shared project roots can serve several threads, so their live Git status is environment state,
+ * not thread ownership. Only a materialized worktree is thread-scoped: coding agents may checkout
+ * or create a new branch there without going through Synara's branch picker, so its checked-out
+ * branch is authoritative even when the persisted branch metadata is stale.
  */
 export function shouldUseLivePullRequestForSidebarThread(input: {
   readonly threadBranch: string | null;
@@ -117,10 +118,7 @@ export function shouldUseLivePullRequestForSidebarThread(input: {
   if (input.liveBranch === null) {
     return false;
   }
-  if (input.hasDedicatedWorktree) {
-    return true;
-  }
-  return input.threadBranch !== null && input.threadBranch === input.liveBranch;
+  return input.hasDedicatedWorktree;
 }
 
 export function resolveSidebarThreadPullRequest<
@@ -133,6 +131,12 @@ export function resolveSidebarThreadPullRequest<
   readonly livePullRequest: T | null;
   readonly persistedPullRequest: T | null;
 }): T | null {
+  // A shared local checkout can move because another thread is working in the same project root.
+  // Its live PR must never overwrite the durable PR explicitly associated with this thread.
+  if (!input.hasDedicatedWorktree) {
+    return input.persistedPullRequest;
+  }
+
   // A settled (merged/closed) PR is the thread's outcome, not a claim about the current
   // checkout, so it stays visible after the checkout moves on — e.g. switching back to
   // main after merging must flip the badge to "merged", not drop it and let stale
@@ -216,6 +220,33 @@ export function resolveThreadProjectLabel(
     return "Synara";
   }
   return nonEmptyDisplayValue(project.name) ?? project.folderName;
+}
+
+/**
+ * Primary label for a project row in the Threads sidebar.
+ *
+ * Always prefer the configured display name (`project.name`, which already
+ * reflects `localName` when set). Do not render the underlying folder name as a
+ * competing sibling: a previous shrink-0 muted suffix could crowd the display
+ * name out of a narrow row and leave only a greyed-out folder label visible,
+ * while the hover card correctly showed the configured name (#1000). Folder
+ * identity stays in the project hover card path row.
+ */
+export function resolveSidebarProjectRowLabel(
+  project: Pick<Project, "name" | "folderName">,
+): string {
+  return nonEmptyDisplayValue(project.name) ?? project.folderName;
+}
+
+/**
+ * Accessible name for a sidebar thread row. The row renders a `role="button"`
+ * div whose only other label comes from the truncated title span — an explicit
+ * name keeps the control identifiable to assistive tech and automation even
+ * when the visible text is clipped or carries status glyphs.
+ */
+export function resolveThreadRowAriaLabel(thread: Pick<SidebarThreadSummary, "title">): string {
+  const title = nonEmptyDisplayValue(thread.title);
+  return title === null ? "Open thread" : `Open ${title}`;
 }
 
 export type SidebarThreadHoverMetadata = {
@@ -322,18 +353,6 @@ export type SidebarDerivedProjectData = {
   projectStatus: ReturnType<typeof resolveProjectStatusIndicator>;
 };
 
-const THREAD_JUMP_COMMANDS = [
-  "thread.jump.1",
-  "thread.jump.2",
-  "thread.jump.3",
-  "thread.jump.4",
-  "thread.jump.5",
-  "thread.jump.6",
-  "thread.jump.7",
-  "thread.jump.8",
-  "thread.jump.9",
-] as const satisfies readonly KeybindingCommand[];
-
 export interface ThreadStatusPill {
   label:
     | "Working"
@@ -347,15 +366,6 @@ export interface ThreadStatusPill {
   pulse: boolean;
   dismissible?: boolean;
   dismissalKey?: string;
-}
-
-/**
- * A status that still asks something of the user or is producing output right
- * now. Surfaces that dim finished work (the Activity Done section) keep showing
- * these pills, so a thread that restarts or asks for approval stays visible.
- */
-export function isUrgentThreadStatusPill(pill: ThreadStatusPill): boolean {
-  return pill.label !== "Completed";
 }
 
 /**
@@ -865,48 +875,6 @@ export function resolveSidebarThreadListPaging(input: {
   };
 }
 
-export function getVisibleThreadsForProject<T extends Pick<SidebarThreadSummary, "id">>(input: {
-  threads: readonly T[];
-  activeThreadId: Thread["id"] | undefined;
-  previewLimit: number;
-}): {
-  hasHiddenThreads: boolean;
-  visibleThreads: T[];
-} {
-  const { activeThreadId, previewLimit, threads } = input;
-  const hasHiddenThreads = threads.length > previewLimit;
-
-  if (!hasHiddenThreads) {
-    return {
-      hasHiddenThreads,
-      visibleThreads: [...threads],
-    };
-  }
-
-  const previewThreads = threads.slice(0, previewLimit);
-  if (!activeThreadId || previewThreads.some((thread) => thread.id === activeThreadId)) {
-    return {
-      hasHiddenThreads: true,
-      visibleThreads: previewThreads,
-    };
-  }
-
-  const activeThread = threads.find((thread) => thread.id === activeThreadId);
-  if (!activeThread) {
-    return {
-      hasHiddenThreads: true,
-      visibleThreads: previewThreads,
-    };
-  }
-
-  const visibleThreadIds = new Set([...previewThreads, activeThread].map((thread) => thread.id));
-
-  return {
-    hasHiddenThreads: true,
-    visibleThreads: threads.filter((thread) => visibleThreadIds.has(thread.id)),
-  };
-}
-
 export interface SidebarThreadTreeRow<
   T extends Pick<SidebarThreadSummary, "id" | "parentThreadId">,
 > {
@@ -1168,109 +1136,6 @@ export function resolveProjectEmptyState(input: {
   return input.threadsHydrated ? "empty" : "loading";
 }
 
-// Match the exact rows the sidebar renders for one project, including folded previews.
-export function getRenderedThreadsForSidebarProject<
-  T extends Pick<SidebarThreadSummary, "id"> & SidebarThreadSortInput,
->(input: {
-  project: Pick<Project, "expanded">;
-  threads: readonly T[];
-  activeThreadId: Thread["id"] | undefined;
-  previewLimit: number;
-}): {
-  hasHiddenThreads: boolean;
-  renderedThreads: T[];
-} {
-  const { activeThreadId, previewLimit, project, threads } = input;
-  const pinnedCollapsedThread =
-    !project.expanded && activeThreadId
-      ? (threads.find((thread) => thread.id === activeThreadId) ?? null)
-      : null;
-  const { hasHiddenThreads, visibleThreads } = getVisibleThreadsForProject({
-    threads,
-    activeThreadId,
-    previewLimit,
-  });
-
-  return {
-    hasHiddenThreads,
-    renderedThreads: pinnedCollapsedThread ? [pinnedCollapsedThread] : visibleThreads,
-  };
-}
-
-// Flatten the sidebar's current project/thread visibility into the same order the user sees.
-export function getVisibleSidebarThreadIds(input: {
-  projects: readonly Pick<Project, "id" | "expanded">[];
-  threads: readonly (Pick<SidebarThreadSummary, "id" | "projectId" | "parentThreadId"> &
-    SidebarThreadSortInput)[];
-  activeThreadId: Thread["id"] | undefined;
-  threadListExtraPagesByProjectId: ReadonlyMap<Project["id"], number>;
-  previewLimit: number;
-  previewPageSize: number;
-  threadSortOrder: SidebarThreadSortOrder;
-}): Thread["id"][] {
-  const {
-    activeThreadId,
-    previewLimit,
-    previewPageSize,
-    projects,
-    threadListExtraPagesByProjectId,
-    threadSortOrder,
-    threads,
-  } = input;
-  const visibleThreadIds: Thread["id"][] = [];
-  const threadsByProjectId = new Map<ProjectId, (typeof threads)[number][]>();
-
-  for (const thread of threads) {
-    const projectThreads = threadsByProjectId.get(thread.projectId);
-    if (projectThreads) {
-      projectThreads.push(thread);
-    } else {
-      threadsByProjectId.set(thread.projectId, [thread]);
-    }
-  }
-
-  for (const project of projects) {
-    const projectThreads = sortThreadsForSidebar(
-      threadsByProjectId.get(project.id) ?? [],
-      threadSortOrder,
-    );
-    const projectThreadTree = buildProjectThreadTree({
-      threads: projectThreads,
-      forceVisibleThreadId: activeThreadId,
-    });
-    const paging = resolveSidebarThreadListPaging({
-      totalCount: projectThreadTree.length,
-      baseLimit: previewLimit,
-      pageSize: previewPageSize,
-      requestedExtraPages: threadListExtraPagesByProjectId.get(project.id) ?? 0,
-    });
-    const { visibleEntries } = getVisibleSidebarEntriesForPreview({
-      entries: projectThreadTree.map((row) => ({
-        rowId: row.thread.id,
-        rootRowId: row.rootThreadId,
-        threadId: row.thread.id,
-      })),
-      activeEntryId: activeThreadId,
-      previewLimit: paging.previewLimit,
-    });
-    const pinnedCollapsedThread =
-      !project.expanded && activeThreadId
-        ? (projectThreads.find((thread) => thread.id === activeThreadId) ?? null)
-        : null;
-
-    if (pinnedCollapsedThread) {
-      visibleThreadIds.push(pinnedCollapsedThread.id);
-      continue;
-    }
-
-    for (const entry of visibleEntries) {
-      visibleThreadIds.push(entry.threadId);
-    }
-  }
-
-  return visibleThreadIds;
-}
-
 // Resolve the next sidebar-visible thread for keyboard cycling with wraparound.
 export function getNextVisibleSidebarThreadId(input: {
   visibleThreadIds: readonly Thread["id"][];
@@ -1301,24 +1166,6 @@ export function getNextVisibleSidebarThreadId(input: {
       : (activeIndex - 1 + visibleThreadIds.length) % visibleThreadIds.length;
 
   return visibleThreadIds[nextIndex] ?? null;
-}
-
-export function getSidebarThreadIdForJumpCommand(input: {
-  visibleThreadIds: readonly Thread["id"][];
-  command: string | null;
-}): Thread["id"] | null {
-  if (!input.command) {
-    return null;
-  }
-
-  const jumpIndex = THREAD_JUMP_COMMANDS.indexOf(
-    input.command as (typeof THREAD_JUMP_COMMANDS)[number],
-  );
-  if (jumpIndex === -1) {
-    return null;
-  }
-
-  return input.visibleThreadIds[jumpIndex] ?? null;
 }
 
 export function getSidebarThreadIdsToPrewarm(input: {
@@ -1436,8 +1283,10 @@ export function sortThreadsForSidebar<T extends { id: Thread["id"] } & SidebarTh
   sortOrder: SidebarThreadSortOrder,
 ): T[] {
   return threads.toSorted((left, right) => {
-    const byAttentionRank = threadSortAttentionRank(right) - threadSortAttentionRank(left);
-    if (byAttentionRank !== 0) return byAttentionRank;
+    if (sortOrder !== "created_at") {
+      const byAttentionRank = threadSortAttentionRank(right) - threadSortAttentionRank(left);
+      if (byAttentionRank !== 0) return byAttentionRank;
+    }
     const rightTimestamp = getThreadSortTimestamp(right, sortOrder);
     const leftTimestamp = getThreadSortTimestamp(left, sortOrder);
     const byTimestamp =
@@ -1511,22 +1360,46 @@ export function sortProjectsForSidebar<
     threadsByProjectId.set(thread.projectId, existing);
   }
 
+  // Resolve each project's recency once; the comparator otherwise rescanned
+  // that project's threads on every comparison (O(P log P × threads)).
+  const timestampByProjectId = new Map(
+    projects.map(
+      (project) =>
+        [
+          project.id,
+          getProjectSortTimestamp(project, threadsByProjectId.get(project.id) ?? [], sortOrder),
+        ] as const,
+    ),
+  );
   return [...projects].toSorted((left, right) => {
-    const rightTimestamp = getProjectSortTimestamp(
-      right,
-      threadsByProjectId.get(right.id) ?? [],
-      sortOrder,
-    );
-    const leftTimestamp = getProjectSortTimestamp(
-      left,
-      threadsByProjectId.get(left.id) ?? [],
-      sortOrder,
-    );
+    const rightTimestamp = timestampByProjectId.get(right.id) ?? Number.NEGATIVE_INFINITY;
+    const leftTimestamp = timestampByProjectId.get(left.id) ?? Number.NEGATIVE_INFINITY;
     const byTimestamp =
       rightTimestamp === leftTimestamp ? 0 : rightTimestamp > leftTimestamp ? 1 : -1;
     if (byTimestamp !== 0) return byTimestamp;
     return left.name.localeCompare(right.name) || left.id.localeCompare(right.id);
   });
+}
+
+export function isHiddenProjectAgentCoordinatorThread(
+  threadId: string,
+  coordinatorThreadIds: ReadonlySet<string>,
+): boolean {
+  return coordinatorThreadIds.has(threadId);
+}
+
+export function excludeHiddenProjectAgentCoordinatorThreads<T extends { readonly id: string }>(
+  threads: readonly T[],
+  coordinatorThreadIds: ReadonlySet<string>,
+): readonly T[] {
+  if (coordinatorThreadIds.size === 0) {
+    // The input array is already the answer — copying it gave every caller a new
+    // reference each render, churning downstream memo deps in dev.
+    return threads;
+  }
+  return threads.filter(
+    (thread) => !isHiddenProjectAgentCoordinatorThread(thread.id, coordinatorThreadIds),
+  );
 }
 
 // Groups thread summaries once so project-specific sidebar derivations can reuse the same slices.
@@ -1549,21 +1422,57 @@ export function partitionSidebarThreadsByProjectIds<
   T extends Pick<SidebarThreadSummary, "projectId">,
 >(
   threads: readonly T[],
-  studioProjectIds: ReadonlySet<ProjectId>,
+  groupProjectIds: ReadonlySet<ProjectId>,
 ): {
-  readonly studioThreads: T[];
-  readonly nonStudioThreads: T[];
+  readonly groupThreads: T[];
+  readonly nonGroupThreads: T[];
 } {
-  const studioThreads: T[] = [];
-  const nonStudioThreads: T[] = [];
+  const groupThreads: T[] = [];
+  const nonGroupThreads: T[] = [];
   for (const thread of threads) {
-    if (studioProjectIds.has(thread.projectId)) {
-      studioThreads.push(thread);
+    if (groupProjectIds.has(thread.projectId)) {
+      groupThreads.push(thread);
     } else {
-      nonStudioThreads.push(thread);
+      nonGroupThreads.push(thread);
     }
   }
-  return { studioThreads, nonStudioThreads };
+  return { groupThreads, nonGroupThreads };
+}
+
+// A thread's projectId says where it runs; a group's member set says who it
+// belongs to. Threads the coordinator dispatches into a linked repo carry the
+// repo's projectId, so the projectId-keyed buckets alone would never surface
+// them under the group. Union each group's member ids into its bucket.
+export function mergeGroupMemberThreadsIntoProjectBuckets(input: {
+  readonly sortedSidebarThreadsByProjectId: ReadonlyMap<ProjectId, SidebarThreadSummary[]>;
+  readonly threads: readonly SidebarThreadSummary[];
+  readonly memberThreadIdsByProjectId: ReadonlyMap<ProjectId, ReadonlySet<ThreadId>>;
+  readonly sortThreads: (
+    threads: readonly SidebarThreadSummary[],
+  ) => readonly SidebarThreadSummary[];
+}): ReadonlyMap<ProjectId, SidebarThreadSummary[]> {
+  if (input.memberThreadIdsByProjectId.size === 0) {
+    return input.sortedSidebarThreadsByProjectId;
+  }
+  const threadById = new Map<ThreadId, SidebarThreadSummary>();
+  for (const thread of input.threads) {
+    threadById.set(thread.id, thread);
+  }
+  let merged: Map<ProjectId, SidebarThreadSummary[]> | null = null;
+  for (const [projectId, memberIds] of input.memberThreadIdsByProjectId) {
+    const bucket = input.sortedSidebarThreadsByProjectId.get(projectId) ?? [];
+    const knownIds = new Set(bucket.map((thread) => thread.id));
+    const extras: SidebarThreadSummary[] = [];
+    for (const threadId of memberIds) {
+      if (knownIds.has(threadId)) continue;
+      const thread = threadById.get(threadId);
+      if (thread) extras.push(thread);
+    }
+    if (extras.length === 0) continue;
+    merged ??= new Map(input.sortedSidebarThreadsByProjectId);
+    merged.set(projectId, [...input.sortThreads([...bucket, ...extras])]);
+  }
+  return merged ?? input.sortedSidebarThreadsByProjectId;
 }
 
 // Centralizes the expensive per-project row derivation so Sidebar.tsx can mostly orchestrate UI state.

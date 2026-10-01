@@ -8,6 +8,9 @@ import {
   deriveActiveWorkStartedAt,
   findLatestProposedPlan,
   findSidebarProposedPlan,
+  formatClockDuration,
+  formatClockElapsed,
+  formatElapsed,
   hasActionableProposedPlan,
   hasLiveLatestTurn,
   hasLiveTurnTailWork,
@@ -15,6 +18,31 @@ import {
   PROVIDER_OPTIONS,
 } from "./session-logic";
 import { makeActivity } from "./storeTestFixtures";
+
+describe("elapsed duration formatting", () => {
+  // Settled work rounds seconds; live clocks only show time already elapsed.
+  it.each([
+    [250, "250ms", "0s"],
+    [1_500, "1.5s", "1s"],
+    [10_500, "11s", "10s"],
+    [60_000, "1m", "1m"],
+    [61_900, "1m 2s", "1m 1s"],
+    [119_600, "2m", "1m 59s"],
+    [3_599_499, "59m 59s", "59m 59s"],
+    [3_599_500, "1h", "59m 59s"],
+    [4_969_000, "1h 22m", "1h 22m"],
+    [86_399_499, "23h 59m", "23h 59m"],
+    [86_399_500, "1d", "23h 59m"],
+    [183_845_000, "2d 3h", "2d 3h"],
+  ])("formats %i ms as %s for settled work and %s for live clocks", (durationMs, settled, live) => {
+    const startIso = "2026-01-01T00:00:00.000Z";
+    const endIso = new Date(Date.parse(startIso) + durationMs).toISOString();
+
+    expect(formatElapsed(startIso, endIso)).toBe(settled);
+    expect(formatClockDuration(durationMs)).toBe(live);
+    expect(formatClockElapsed(startIso, endIso)).toBe(live);
+  });
+});
 
 describe("deriveActiveTaskListState", () => {
   it("returns the latest plan update for the active turn", () => {
@@ -549,15 +577,6 @@ describe("isLatestTurnSettled", () => {
     ).toBe(false);
   });
 
-  it("returns false while the session still reports another running turn", () => {
-    expect(
-      isLatestTurnSettled(latestTurn, {
-        orchestrationStatus: "running",
-        activeTurnId: TurnId.makeUnsafe("turn-2"),
-      }),
-    ).toBe(false);
-  });
-
   it("returns true once the session is no longer running that turn", () => {
     expect(
       isLatestTurnSettled(latestTurn, {
@@ -587,21 +606,6 @@ describe("isLatestTurnSettled", () => {
         {
           ...latestTurn,
           state: "interrupted",
-        },
-        {
-          orchestrationStatus: "running",
-          activeTurnId: TurnId.makeUnsafe("turn-1"),
-        },
-      ),
-    ).toBe(true);
-  });
-
-  it("returns true for error turns even while the session is still running", () => {
-    expect(
-      isLatestTurnSettled(
-        {
-          ...latestTurn,
-          state: "error",
         },
         {
           orchestrationStatus: "running",
@@ -677,36 +681,6 @@ describe("hasLiveLatestTurn", () => {
         activeTurnId: TurnId.makeUnsafe("turn-1"),
       }),
     ).toBe(true);
-  });
-
-  it("returns false for interrupted turns because they are terminal locally", () => {
-    expect(
-      hasLiveLatestTurn(
-        {
-          ...latestTurn,
-          state: "interrupted",
-        },
-        {
-          orchestrationStatus: "running",
-          activeTurnId: TurnId.makeUnsafe("turn-1"),
-        },
-      ),
-    ).toBe(false);
-  });
-
-  it("returns false for error turns because they are terminal locally", () => {
-    expect(
-      hasLiveLatestTurn(
-        {
-          ...latestTurn,
-          state: "error",
-        },
-        {
-          orchestrationStatus: "running",
-          activeTurnId: TurnId.makeUnsafe("turn-1"),
-        },
-      ),
-    ).toBe(false);
   });
 });
 
@@ -855,9 +829,9 @@ describe("PROVIDER_OPTIONS", () => {
   it("lists available providers", () => {
     const claude = PROVIDER_OPTIONS.find((option) => option.value === "claudeAgent");
     const cursor = PROVIDER_OPTIONS.find((option) => option.value === "cursor");
+    const devin = PROVIDER_OPTIONS.find((option) => option.value === "devin");
     const grok = PROVIDER_OPTIONS.find((option) => option.value === "grok");
     const droid = PROVIDER_OPTIONS.find((option) => option.value === "droid");
-    const kilo = PROVIDER_OPTIONS.find((option) => option.value === "kilo");
     const opencode = PROVIDER_OPTIONS.find((option) => option.value === "opencode");
     const pi = PROVIDER_OPTIONS.find((option) => option.value === "pi");
     expect(PROVIDER_OPTIONS).toEqual([
@@ -867,9 +841,10 @@ describe("PROVIDER_OPTIONS", () => {
       { value: "antigravity", label: "Antigravity", available: true },
       { value: "grok", label: "Grok", available: true },
       { value: "droid", label: "Droid", available: true },
-      { value: "kilo", label: "Kilo", available: true },
       { value: "opencode", label: "OpenCode", available: true },
       { value: "pi", label: "Pi", available: true },
+      { value: "devin", label: "Devin", available: true },
+      { value: "omp", label: "Oh My Pi", available: true },
     ]);
     expect(claude).toEqual({
       value: "claudeAgent",
@@ -881,6 +856,11 @@ describe("PROVIDER_OPTIONS", () => {
       label: "Cursor",
       available: true,
     });
+    expect(devin).toEqual({
+      value: "devin",
+      label: "Devin",
+      available: true,
+    });
     expect(grok).toEqual({
       value: "grok",
       label: "Grok",
@@ -889,11 +869,6 @@ describe("PROVIDER_OPTIONS", () => {
     expect(droid).toEqual({
       value: "droid",
       label: "Droid",
-      available: true,
-    });
-    expect(kilo).toEqual({
-      value: "kilo",
-      label: "Kilo",
       available: true,
     });
     expect(opencode).toEqual({

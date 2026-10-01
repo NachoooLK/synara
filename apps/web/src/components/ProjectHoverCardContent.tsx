@@ -8,10 +8,12 @@
 //      pin and "Edit project" rows are real controls. Spacing/type mirror the
 //      app's menu rows (12px UI font, compact padding) so it reads as native.
 
-import { MessageCircleIcon, SettingsIcon } from "~/lib/icons";
+import { BotIcon, MessageCircleIcon, SettingsIcon } from "~/lib/icons";
 import { PinStatusIcon, pinActionLabel } from "~/lib/pin";
+import type { ProjectAppearance } from "~/lib/projectAppearance";
 import { cn } from "~/lib/utils";
-import { FolderClosed, FolderOpen } from "./FolderClosed";
+import { FolderClosed } from "./FolderClosed";
+import { ProjectSidebarIcon } from "./ProjectSidebarIcon";
 import {
   SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME,
   SIDEBAR_HOVER_CARD_ROW_CLASS_NAME,
@@ -19,12 +21,15 @@ import {
 
 export type ProjectHoverCardContentProps = {
   name: string;
+  cwd: string;
+  appearance: ProjectAppearance | null;
   isPinned: boolean;
   chatCount: number;
   /** Display path (already home-abbreviated, e.g. ~/Developer/synara). */
   path: string;
   onTogglePin: () => void;
   onEditProject: () => void;
+  onEditProjectAgent?: (() => void) | undefined;
 };
 
 // One shared row rhythm for every line. No dividers: the card separates rows
@@ -43,18 +48,28 @@ function formatChatCount(count: number): string {
 
 export function ProjectHoverCardContent({
   name,
+  cwd,
+  appearance,
   isPinned,
   chatCount,
   path,
   onTogglePin,
   onEditProject,
+  onEditProjectAgent,
 }: ProjectHoverCardContentProps) {
   return (
     <div
       className={cn("flex w-full flex-col gap-0", SIDEBAR_HOVER_CARD_CONTAINER_PADDING_CLASS_NAME)}
     >
       <div className={cn(ROW_CLASS_NAME, "gap-2.5")}>
-        <FolderOpen className={ICON_CLASS_NAME} aria-hidden />
+        <span className="relative inline-flex size-3.5 shrink-0 items-center justify-center text-muted-foreground">
+          <ProjectSidebarIcon
+            cwd={cwd}
+            expanded
+            appearance={appearance}
+            glyphClassName="size-3.5"
+          />
+        </span>
         <span className="min-w-0 flex-1 truncate font-medium text-foreground">{name}</span>
         <button
           type="button"
@@ -90,6 +105,19 @@ export function ProjectHoverCardContent({
         <SettingsIcon className={ICON_CLASS_NAME} aria-hidden />
         <span className="min-w-0 truncate">Edit project</span>
       </button>
+      {onEditProjectAgent ? (
+        <button
+          type="button"
+          onClick={onEditProjectAgent}
+          className={cn(
+            ROW_CLASS_NAME,
+            "cursor-pointer text-left text-foreground/80 transition-colors hover:bg-[var(--color-background-button-secondary-hover)] hover:text-foreground",
+          )}
+        >
+          <BotIcon className={ICON_CLASS_NAME} aria-hidden />
+          <span className="min-w-0 truncate">Edit coordinator</span>
+        </button>
+      ) : null}
     </div>
   );
 }

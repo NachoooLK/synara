@@ -52,6 +52,7 @@ import { formatClockDuration } from "~/session-logic";
 import { Button } from "~/components/ui/button";
 import {
   ChatHeaderButton,
+  ChatHeaderIconButton,
   ChatHeaderSplitDivider,
   ChatHeaderSplitGroup,
   CHAT_HEADER_CONTROL_CLASS_NAME,
@@ -102,7 +103,7 @@ import {
 import { cn, newCommandId, randomUUID } from "~/lib/utils";
 import { resolvePathLinkTarget } from "~/terminal-links";
 import { readNativeApi } from "~/nativeApi";
-import { createThreadSelector } from "~/storeSelectors";
+import { createThreadGitActionsMetadataSelector } from "~/storeSelectors";
 import { useStore } from "~/store";
 
 interface GitActionsControlProps {
@@ -256,16 +257,31 @@ export default function GitActionsControl({
   const createBranchNameFieldId = useId();
   const { settings } = useAppSettings();
   // Manual memoization kept: this file does not compile under React Compiler (see compile-report).
-  const providerOptions = useMemo(() => getProviderStartOptions(settings), [settings]);
+  const providerOptions = useMemo(
+    () =>
+      getProviderStartOptions(
+        settings,
+        settings.textGenerationProviderInstanceId ?? settings.textGenerationProvider ?? "codex",
+      ),
+    [settings],
+  );
   const gitTextGenerationModelSelection = useMemo(
     (): ModelSelection => ({
       provider: settings.textGenerationProvider ?? "codex",
+      instanceId:
+        settings.textGenerationProviderInstanceId ?? settings.textGenerationProvider ?? "codex",
       model: settings.textGenerationModel ?? DEFAULT_GIT_TEXT_GENERATION_MODEL,
     }),
-    [settings.textGenerationModel, settings.textGenerationProvider],
+    [
+      settings.textGenerationModel,
+      settings.textGenerationProvider,
+      settings.textGenerationProviderInstanceId,
+    ],
   );
+  // Shell-only slice: the full derived Thread gets a new reference on every
+  // streamed delta, which re-rendered this always-mounted control per token.
   const activeThread = useStore(
-    useMemo(() => createThreadSelector(activeThreadId), [activeThreadId]),
+    useMemo(() => createThreadGitActionsMetadataSelector(activeThreadId), [activeThreadId]),
   );
   const setThreadWorkspaceAction = useStore((store) => store.setThreadWorkspace);
   const threadToastData = useMemo(
@@ -1450,6 +1466,20 @@ export default function GitActionsControl({
     if (!promotedPull) return null;
     // Pull-only chrome: Environment already owns commit/push/PR dialogs, so this
     // instance must not mount a second copy of them beside the panel control.
+    if (hideQuickActionLabel) {
+      return (
+        <ChatHeaderIconButton
+          type="button"
+          tone="surface"
+          label={promotedPull.label}
+          title={promotedPull.label}
+          disabled={isGitActionRunning}
+          onClick={runSyncWithRemote}
+        >
+          <GitActionGlyph name="sync" />
+        </ChatHeaderIconButton>
+      );
+    }
     return (
       <ChatHeaderButton
         type="button"
@@ -1506,7 +1536,7 @@ export default function GitActionsControl({
         isGitStatusOutOfSync ||
         gitStatusError) && <MenuSeparator className="mx-3 mt-2" />}
       {gitStatusForActions?.branch === null && (
-        <p className="px-3 py-1.5 text-xs text-warning">
+        <p className="px-3 py-1.5 text-ui leading-snug text-warning">
           Detached HEAD: create and checkout a branch to enable push and PR actions.
         </p>
       )}
@@ -1515,18 +1545,22 @@ export default function GitActionsControl({
         !gitStatusForActions.hasWorkingTreeChanges &&
         gitStatusForActions.behindCount > 0 &&
         gitStatusForActions.aheadCount === 0 && (
-          <p className="px-3 py-1.5 text-xs text-warning">Behind upstream. Pull/rebase first.</p>
+          <p className="px-3 py-1.5 text-ui leading-snug text-warning">
+            Behind upstream. Pull/rebase first.
+          </p>
         )}
       {isGitStatusOutOfSync && (
-        <p className="px-3 py-1.5 text-xs text-muted-foreground">Refreshing git status...</p>
+        <p className="px-3 py-1.5 text-ui leading-snug text-muted-foreground">
+          Refreshing git status...
+        </p>
       )}
       {isGitStatusRefreshDelayed && !isGitStatusOutOfSync && (
-        <p className="px-3 py-1.5 text-xs text-muted-foreground">
+        <p className="px-3 py-1.5 text-ui leading-snug text-muted-foreground">
           {isGitStatusFetching ? "Refreshing git status..." : "Git status refresh delayed."}
         </p>
       )}
       {gitStatusError && !isGitStatusRefreshDelayed && (
-        <p className="px-3 py-1.5 text-xs text-destructive">
+        <p className="px-3 py-1.5 text-ui leading-snug text-destructive">
           {gitStatusError instanceof Error ? gitStatusError.message : "Git status refresh failed."}
         </p>
       )}
@@ -1635,7 +1669,10 @@ export default function GitActionsControl({
               }}
             >
               <div className="space-y-1.5">
-                <label className="block font-medium text-sm" htmlFor={createBranchNameFieldId}>
+                <label
+                  className="block font-medium text-ui leading-snug"
+                  htmlFor={createBranchNameFieldId}
+                >
                   Branch name
                 </label>
                 <Input
@@ -1647,7 +1684,9 @@ export default function GitActionsControl({
                 />
               </div>
               {createBranchNameConflicts ? (
-                <p className="text-destructive text-sm">A branch with this name already exists.</p>
+                <p className="text-destructive text-ui leading-snug">
+                  A branch with this name already exists.
+                </p>
               ) : null}
               <DialogFooter variant="bare">
                 <Button

@@ -1,8 +1,14 @@
-import { EventId, ThreadId, TurnId } from "@synara/contracts";
-import { describe, expect, it } from "vitest";
+import { Effect, Option } from "effect";
+import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import { ProjectionPendingInteractionRepository } from "../persistence/Services/ProjectionPendingInteractions.ts";
+import { ApprovalRequestId, EventId, ThreadId, TurnId } from "@synara/contracts";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   planRestartTurnReconciliation,
+  reconcileRestartStuckTurns,
+  type ReconcilablePendingInteraction,
   type ReconcilableThread,
 } from "./startupTurnReconciliation.ts";
 
@@ -46,6 +52,18 @@ const makeActivity = (
   createdAt: `2026-06-13T09:00:0${sequence}.000Z`,
 });
 
+const makePendingInteraction = (
+  threadId: string,
+  interactionKind: ReconcilablePendingInteraction["interactionKind"],
+  requestId: string,
+  status: ReconcilablePendingInteraction["status"],
+): ReconcilablePendingInteraction => ({
+  threadId: ThreadId.makeUnsafe(threadId),
+  interactionKind,
+  requestId: ApprovalRequestId.makeUnsafe(requestId),
+  status,
+});
+
 const expectSessionCommands = (commands: ReturnType<typeof planRestartTurnReconciliation>) =>
   commands.map((command) => {
     expect(command.type).toBe("thread.session.set");
@@ -56,10 +74,6 @@ const expectSessionCommands = (commands: ReturnType<typeof planRestartTurnReconc
   });
 
 describe("planRestartTurnReconciliation", () => {
-  it("returns nothing for an empty thread set", () => {
-    expect(planRestartTurnReconciliation({ threads: [], now: NOW })).toEqual([]);
-  });
-
   it("leaves clean threads untouched (no active turn, no in-flight session, no open turn)", () => {
     const threads = [
       makeThread("idle-no-session"),
@@ -84,38 +98,185 @@ describe("planRestartTurnReconciliation", () => {
     expect(planRestartTurnReconciliation({ threads, now: NOW })).toEqual([]);
   });
 
-  it("clears a dangling active turn id while preserving the terminal error session", () => {
-    const threads = [
-      makeThread("errored", {
-        session: makeSession("errored", {
-          status: "error",
-          activeTurnId: TurnId.makeUnsafe("failed-turn"),
-          lastError: "runtime exploded",
-        }),
-        latestTurn: { state: "error" },
+  it("does not reconcile an approval again when its settlement row is non-actionable", () => {
+    const thread = makeThread("settled-mixed-sequence", {
+      session: makeSession("settled-mixed-sequence", {
+        status: "ready",
+        activeTurnId: null,
       }),
-    ];
-
-    // The turn is already settled, but the retained `activeTurnId` keeps every
-    // "is this thread busy?" check true - so the pointer is cleared without
-    // rewriting the terminal status or dropping the error banner.
-    expect(planRestartTurnReconciliation({ threads, now: NOW })).toEqual([
-      {
-        type: "thread.session.set",
-        commandId: `restart-reconcile-active-turn:errored:${NOW}`,
-        threadId: "errored",
-        createdAt: NOW,
-        session: {
-          threadId: "errored",
-          status: "error",
-          providerName: "grok",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: "runtime exploded",
-          updatedAt: NOW,
+      latestTurn: { state: "completed" },
+      activities: [
+        {
+          ...makeActivity(
+            "approval-requested-high-sequence",
+            "approval.requested",
+            { requestId: "approval-mixed", requestKind: "command" },
+            1_695_339,
+          ),
+          createdAt: "2026-06-13T09:00:01.000Z",
         },
-      },
-    ]);
+        {
+          ...makeActivity(
+            "approval-stale-low-sequence",
+            "provider.approval.respond.failed",
+            {
+              requestId: "approval-mixed",
+              detail:
+                "Stale pending approval request: approval-mixed. Provider callback state does not survive app restarts.",
+            },
+            667_085,
+          ),
+          createdAt: "2026-06-13T09:00:02.000Z",
+        },
+      ],
+      pendingInteractions: [
+        {
+          interactionKind: "approval",
+          requestId: ApprovalRequestId.makeUnsafe("approval-mixed"),
+          lifecycleGeneration: null,
+          status: "uncertain",
+          createdAt: "2026-06-13T09:00:01.000Z",
+        },
+      ],
+    });
+
+    expect(planRestartTurnReconciliation({ threads: [thread], now: NOW })).toEqual([]);
+  });
+
+  it.each([
+    ["pending", true],
+    ["confirmed", false],
+    ["uncertain", false],
+  ] as const)(
+    "treats a %s projected approval according to restart callback state",
+    (status, stale) => {
+      const thread = makeThread(`projected-${status}`, {
+        session: makeSession(`projected-${status}`, { status: "ready", activeTurnId: null }),
+        latestTurn: { state: "completed" },
+        pendingInteractions: [
+          {
+            interactionKind: "approval",
+            requestId: ApprovalRequestId.makeUnsafe(`approval-${status}`),
+            lifecycleGeneration: "generation-a",
+            status,
+            createdAt: "2026-06-13T09:00:01.000Z",
+          },
+        ],
+      });
+
+      const commands = planRestartTurnReconciliation({ threads: [thread], now: NOW });
+      if (!stale) {
+        expect(commands).toEqual([]);
+        return;
+      }
+      expect(commands).toEqual([
+        expect.objectContaining({
+          type: "thread.activity.append",
+          activity: expect.objectContaining({
+            payload: expect.objectContaining({
+              requestId: `approval-${status}`,
+              lifecycleGeneration: "generation-a",
+            }),
+          }),
+        }),
+      ]);
+    },
+  );
+
+  it("does not replay stale activities when a present projection is empty", () => {
+    const thread = makeThread("projected-empty", {
+      session: makeSession("projected-empty", { status: "ready", activeTurnId: null }),
+      latestTurn: { state: "completed" },
+      activities: [
+        makeActivity(
+          "legacy-looking-approval",
+          "approval.requested",
+          { requestId: "approval-absent-from-projection", requestKind: "command" },
+          1,
+        ),
+      ],
+      pendingInteractions: [],
+    });
+
+    expect(planRestartTurnReconciliation({ threads: [thread], now: NOW })).toEqual([]);
+  });
+
+  it.each([
+    { name: "no terminal failure", generation: "generation-a", staleAt: null, expected: 1 },
+    {
+      name: "already stale current generation",
+      generation: "generation-a",
+      staleAt: "2026-06-13T09:00:02.000Z",
+      expected: 0,
+    },
+    {
+      name: "stale previous generation",
+      generation: "generation-old",
+      staleAt: "2026-06-13T09:00:02.000Z",
+      expected: 1,
+    },
+    {
+      name: "old legacy failure before request-ID reuse",
+      generation: undefined,
+      staleAt: "2026-06-13T08:00:00.000Z",
+      expected: 1,
+    },
+    {
+      name: "legacy failure after this request",
+      generation: undefined,
+      staleAt: "2026-06-13T09:00:02.000Z",
+      expected: 0,
+    },
+  ])("reconciles uncertain user input with $name", ({ generation, staleAt, expected }) => {
+    const requestId = ApprovalRequestId.makeUnsafe("uncertain-input");
+    const thread = makeThread("uncertain-input-thread", {
+      activities:
+        staleAt === null
+          ? []
+          : [
+              {
+                ...makeActivity(
+                  "input-already-stale",
+                  "provider.user-input.respond.failed",
+                  {
+                    requestId,
+                    ...(generation === undefined ? {} : { lifecycleGeneration: generation }),
+                    detail: "Stale pending user-input request: uncertain-input.",
+                  },
+                  1,
+                ),
+                createdAt: staleAt,
+              },
+            ],
+      pendingInteractions: [
+        {
+          interactionKind: "userInput",
+          requestId,
+          lifecycleGeneration: "generation-a",
+          status: "uncertain",
+          createdAt: "2026-06-13T09:00:01.000Z",
+        },
+      ],
+    });
+
+    const commands = planRestartTurnReconciliation({ threads: [thread], now: NOW });
+    expect(commands).toHaveLength(expected);
+    for (const command of commands) {
+      expect(command).toMatchObject({
+        type: "thread.activity.append",
+        activity: {
+          kind: "provider.user-input.respond.failed",
+          payload: { requestId, lifecycleGeneration: "generation-a" },
+        },
+      });
+      if (command.type !== "thread.activity.append") throw new Error("Expected stale cleanup");
+      expect(
+        planRestartTurnReconciliation({
+          threads: [{ ...thread, activities: [...(thread.activities ?? []), command.activity] }],
+          now: "2026-06-15T10:00:00.000Z",
+        }),
+      ).toEqual([]);
+    }
   });
 
   it("marks an unfinished checkpoint revert as failed after restart", () => {
@@ -429,36 +590,75 @@ describe("planRestartTurnReconciliation", () => {
     });
   });
 
-  it("selects only the stuck threads from a mixed set, preserving order", () => {
-    const threads = [
-      makeThread("clean-a", {
-        session: makeSession("clean-a", { status: "ready", activeTurnId: null }),
-        latestTurn: { state: "completed" },
-      }),
-      makeThread("stuck-a", {
-        session: makeSession("stuck-a", {
-          status: "running",
-          activeTurnId: TurnId.makeUnsafe("stuck-a-turn"),
+  it("ignores resolved rows and rows belonging to other threads", () => {
+    const thread = makeThread("clean-thread", {
+      session: makeSession("clean-thread", { status: "ready", activeTurnId: null }),
+      latestTurn: { state: "completed" },
+    });
+    const pendingInteractions: ReadonlyArray<ReconcilablePendingInteraction> = [
+      makePendingInteraction("clean-thread", "userInput", "answered", "confirmed"),
+      // Already reported as unanswerable: re-reporting would duplicate the row's
+      // failure activity on every boot.
+      makePendingInteraction("clean-thread", "approval", "already-reported", "uncertain"),
+      makePendingInteraction("other-thread", "userInput", "elsewhere", "pending"),
+    ];
+
+    expect(
+      planRestartTurnReconciliation({ threads: [thread], pendingInteractions, now: NOW }),
+    ).toEqual([]);
+  });
+});
+
+describe("reconcileRestartStuckTurns selection", () => {
+  it.each(["uncertain"] as const)(
+    "finds %s callbacks on completed threads even with false summary flags",
+    async (status) => {
+      const thread = {
+        ...makeThread("orphan", {
+          session: makeSession("orphan", { status: "ready", activeTurnId: null }),
+          latestTurn: { state: "completed" },
         }),
-      }),
-      makeThread("clean-b"),
-      makeThread("stuck-b", { latestTurn: { state: "running" } }),
-    ];
-
-    const commands = planRestartTurnReconciliation({ threads, now: NOW });
-    expect(commands.map((command) => command.threadId)).toEqual(["stuck-a", "stuck-b"]);
-  });
-
-  it("produces deterministic command ids for identical inputs", () => {
-    const threads = [
-      makeThread("stuck", {
-        session: makeSession("stuck", { status: "running" }),
-      }),
-    ];
-
-    const first = planRestartTurnReconciliation({ threads, now: NOW });
-    const second = planRestartTurnReconciliation({ threads, now: NOW });
-    expect(first[0]?.commandId).toBe(second[0]?.commandId);
-    expect(first[0]?.commandId).toBe(`restart-reconcile:stuck:${NOW}`);
-  });
+        activities: [],
+        hasPendingApprovals: false,
+        hasPendingUserInput: false,
+      };
+      const row = {
+        interactionKind: "userInput" as const,
+        requestId: ApprovalRequestId.makeUnsafe("orphaned-question"),
+        threadId: thread.id,
+        lifecycleGeneration: "lost-runtime",
+        status,
+        createdAt: NOW,
+      };
+      const dispatch = vi.fn(() => Effect.void);
+      const getThreadDetailById = vi.fn(() =>
+        Effect.succeed(Option.some({ ...thread, pendingInteractions: [row] })),
+      );
+      await Effect.runPromise(
+        reconcileRestartStuckTurns.pipe(
+          Effect.provideService(OrchestrationEngineService, {
+            getReadModel: () =>
+              Effect.succeed({ threads: [thread, makeThread("untouched", { activities: [] })] }),
+            dispatch,
+          } as never),
+          Effect.provideService(ProjectionSnapshotQuery, { getThreadDetailById } as never),
+          Effect.provideService(ProjectionPendingInteractionRepository, {
+            listUnsettled: () => Effect.succeed([row]),
+          } as never),
+        ),
+      );
+      expect(getThreadDetailById).toHaveBeenCalledExactlyOnceWith(thread.id);
+      expect(dispatch).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          type: "thread.activity.append",
+          activity: expect.objectContaining({
+            payload: expect.objectContaining({
+              requestId: row.requestId,
+              lifecycleGeneration: "lost-runtime",
+            }),
+          }),
+        }),
+      );
+    },
+  );
 });

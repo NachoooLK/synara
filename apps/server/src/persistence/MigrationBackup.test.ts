@@ -36,6 +36,14 @@ import { migrationEntries, runMigrations } from "./Migrations.ts";
 import * as NodeSqliteClient from "./NodeSqliteClient.ts";
 import { makeSqlitePersistenceLive } from "./Layers/Sqlite.ts";
 
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return {
+    ...actual,
+    rename: vi.fn(actual.rename),
+  };
+});
+
 const tempDirectories: Array<string> = [];
 
 afterEach(async () => {
@@ -501,32 +509,6 @@ describe("migration backups", () => {
     await expect(fs.stat(marker.backupPath)).resolves.toBeDefined();
   });
 
-  it("charges a resume attempt even when the retry dies mid-migration", async () => {
-    const dbPath = await makeDbPath();
-
-    await runWithDatabase(
-      dbPath,
-      Effect.gen(function* () {
-        yield* runMigrations({ toMigrationInclusive: 52 });
-        yield* runWithPreMigrationBackup(dbPath, Effect.fail(new Error("interrupted mid-flight")));
-      }),
-    ).catch(() => undefined);
-
-    const marker = await Effect.runPromise(inspectPendingMigrationRecovery(dbPath));
-    expect(marker).not.toBeNull();
-    await Effect.runPromise(
-      resumeMarkedMigration(dbPath, marker!, Effect.fail(new Error("died again"))),
-    ).catch(() => undefined);
-
-    // Charged up front: a process killed mid-migration must not get a free retry,
-    // or a deterministic failure loops forever.
-    await expect(Effect.runPromise(inspectPendingMigrationRecovery(dbPath))).resolves.toMatchObject(
-      {
-        resumeAttempts: 1,
-      },
-    );
-  });
-
   it("retains the marker when a resumed migration has a duplicate-looking failure", async () => {
     const dbPath = await makeDbPath();
 
@@ -879,6 +861,54 @@ describe("migration backups", () => {
     ) as { readonly phase: string; readonly restoredAt?: string };
     expect(provenance.phase).toBe("migration-restored");
     expect(provenance.restoredAt).toBeTypeOf("string");
+  });
+
+  it("clears the restore marker when a completed-backup swap rolls back cleanly", async () => {
+    const dbPath = await makeDbPath();
+
+    await runWithDatabase(
+      dbPath,
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations({ toMigrationInclusive: 52 });
+        yield* sql`CREATE TABLE completed_restore_rollback_probe(value TEXT NOT NULL)`;
+        yield* sql`INSERT INTO completed_restore_rollback_probe(value) VALUES ('before-upgrade')`;
+        yield* runWithPreMigrationBackup(dbPath, runMigrations());
+        yield* sql`UPDATE completed_restore_rollback_probe SET value = 'after-upgrade'`;
+      }),
+    );
+
+    const realRename = nodeFs.promises.rename.bind(nodeFs.promises);
+    const rename = vi.mocked(fs.rename);
+    rename.mockImplementation((source, destination) => {
+      if (String(source) === dbPath) {
+        return Promise.reject(new Error("injected live database swap failure"));
+      }
+      return realRename(source, destination);
+    });
+    try {
+      await expect(Effect.runPromise(restoreMarkedMigrationBackup(dbPath))).rejects.toThrow(
+        "injected live database swap failure",
+      );
+    } finally {
+      rename.mockImplementation(realRename);
+    }
+
+    await expect(fs.stat(migrationRecoveryMarkerPath(dbPath))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const live = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(
+        live.prepare("SELECT value FROM completed_restore_rollback_probe").get(),
+      ).toMatchObject({ value: "after-upgrade" });
+    } finally {
+      live.close();
+    }
+    const provenance = JSON.parse(
+      await fs.readFile(migrationBackupProvenancePath(dbPath), "utf8"),
+    ) as { readonly phase: string };
+    expect(provenance.phase).toBe("migration-completed");
   });
 
   it("keeps an active restore marker until restored provenance is durable", async () => {

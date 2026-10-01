@@ -20,7 +20,21 @@ using separate worktrees also have separate working directories and branches.
 
 ## The main surfaces
 
-- **Sidebar** — projects, spaces, tasks, and activity requiring attention
+- **Sidebar** — projects, spaces, tasks, and activity requiring attention. The default rail layout
+  is a fixed column of icon tabs for Home, Spaces, Kanban (Tasks in Beta), Code review, Automations, Hubs (Beta), and
+  Settings, with the thread panel beside it and the route shown as a card inset from the window.
+  Open threads appear as tabs across the top of the chat. The classic single-column sidebar remains
+  available in Settings → General → Sidebar layout.
+- **Code review** — pull requests and issues from the GitHub repositories of your projects, with a
+  detail pane and three actions on every item (see [Code review](#code-review))
+- **Tasks** (Beta; Stable keeps Kanban) — a to-do list for anything you need to do, with or without
+  a project. Select a to-do to open its floating card, then hand it to an agent with **Start**: pick the
+  provider, model, and effort, the project or folder it works in, and a new or existing chat. The
+  agent receives the to-do's current title and note. The to-do then follows the chat's status — Running, Needs you, Review when the agent finishes, or
+  Failed — and its details show the agent's recent activity, let you approve a pending request
+  without opening the chat, and show the agent's latest reply for review before you mark it done. A
+  List / Kanban switch in the header opens the Kanban board instead, and the Tasks entry remembers
+  the view you picked.
 - **Conversation** — user messages, agent responses, plans, tools, approvals, and subagent activity
 - **Composer** — objectives, attachments, provider selection, model selection, and task controls
 - **Terminal** — a real shell opened in the task's working directory
@@ -73,6 +87,36 @@ the conversation or split from one exact turn. Use a
 [handoff](https://www.trysynara.com/docs/workflows/handoffs) when another provider should continue
 the same task and ownership boundary.
 
+Sidechats inherit the source chat's selected permissions, including Full access. Approve for me
+is preserved when the selected provider and model support it; otherwise the sidechat uses Ask for
+approval. You can change a sidechat's permissions independently after creating it.
+
+A sidechat can also stand alone, with no source chat: **Ask** on a Code review item opens one about
+that pull request or issue. It has no transcript to import and no permissions to inherit, so it
+starts in Ask for approval, runs in the project's own checkout without switching branches, and
+is told to treat the item's text as untrusted reference data. Like any sidechat it stays out of
+the thread list and expires after an hour of inactivity.
+
+## Code review
+
+Code review lists the open or closed pull requests and issues of the GitHub repositories behind
+your projects: each project contributes the repository of its current branch remote (or
+`remote.pushDefault`, then `origin`), and **Include fork upstreams** in Settings adds its other
+GitHub remotes. Two projects on one repository share one list. Filters (kind, projects, state,
+involvement, labels) stay local and are remembered; GitHub is refreshed about every five minutes
+while the page is visible, on window focus, and with the refresh button.
+
+Every item offers three actions:
+
+- **Send to agent** opens a new draft thread in the item's project with the item attached as a
+  card. For a pull request, Synara first checks out its branch (worktree or local, following
+  **Settings → General → New threads**). You write the instructions and send; nothing starts
+  on its own. When the repository belongs to several projects, you pick the project.
+- **Ask** opens a standalone sidechat about the item in a dock beside it, so you never leave
+  Code review. Asking again reopens the item's live sidechat; `mod+alt+s` toggles it and Escape closes
+  it. In a chat thread's pull request panel, Ask uses that thread's own sidechat instead.
+- **Open on GitHub**.
+
 ## Environments
 
 A task runs in one of two common environments.
@@ -87,6 +131,21 @@ history while keeping files and branch state separate.
 
 Read the [Git worktrees guide](https://www.trysynara.com/docs/workflows/worktrees) before starting
 several tasks in the same repository.
+
+### Cleaning up worktrees
+
+Deleting a task offers to delete its worktree when no other task uses it. Turn on **Delete worktree
+on archive** in **Settings → General** to remove a finished task's clean checkout after its Undo
+period ends. If another task still refers to the checkout, the session has not stopped, or Git finds
+uncommitted changes, the checkout stays. Automatic archive cleanup preserves its branch so commits
+remain recoverable. Restoring an archived task later restores its conversation, but a removed
+checkout must be recreated from that branch before work resumes. **Settings → Managed worktrees**
+lists managed worktrees for explicit removal. Those removals also delete the temporary `synara/*`
+branch, its empty managed folder, and recovery
+snapshots cached for that path. Automatic retention keeps the 15 most recently archived worktrees
+and snapshots older ones before removing them; those snapshots expire after 30 days.
+
+![Delete worktree on archive setting](assets/worktree-cleanup/1-setting-delete-worktree-on-archive.png)
 
 ## Providers, models, and sessions
 
@@ -142,6 +201,14 @@ The intended loop is:
 Synara's checkpoint and revert controls can help recover task work, but committed Git history remains
 the strongest boundary for important changes.
 
+## Hubs
+
+A hub is a coordinated home for related work. You talk to one coordinator conversation, and it
+answers directly or starts threads (tasks) that run in parallel — in the hub's own folder or in
+linked repositories. Every thread in the hub receives the hub's instructions and memory, and
+files the threads deliver collect in a Git-versioned Library. A hub needs no repository, so it
+also suits non-code work. Read the [Hubs guide](./hubs.md) to set one up.
+
 ## Parallel work
 
 Parallelism is useful only when ownership is clear.
@@ -178,3 +245,29 @@ complete current list.
 
 > **The rule that matters most:** a task is complete only after you understand and verify its result
 > — not when the provider reports that it is finished.
+
+## File previews
+
+File and explorer panels can expand across the chat area. Restore returns to the
+split layout; closing the last maximized panel returns to the chat. Closing the
+last panel in the ordinary split layout keeps the panel launcher open.
+
+Editable workspace files autosave after a 400 ms pause in typing. Save or
+Cmd/Ctrl+S saves immediately. The file editor, diff editor, and explorer share
+the same buffer and writer for an open file. Successful saves update Unstaged
+changes; they do not stage the file. Switching files, navigating to another
+page, and sending a prompt wait for pending editor saves.
+
+If a write fails or the file has changed on disk, autosave stops and keeps the
+draft. Save errors stay visible until resolved. Retry Save after fixing the cause,
+or use Reload from disk and confirm discarding the draft before leaving or sending. Reload
+discards the draft; an explicit Overwrite action in the full editor bypasses the
+version check. Drafts retained after a panel closes live only in the current app
+session, so they are not crash recovery backups.
+
+Markdown previews support basic workspace Wiki links: `[[notes/design]]` opens
+`notes/design.md` from the workspace root, and `[[notes/design|Design notes]]`
+uses an alias. Include the extension for other files, such as `[[guide.pdf]]`.
+Regular Markdown links remain relative to the document directory. Code, escaped
+Wiki syntax, embeds, and heading/block links are left literal; this is basic file
+navigation rather than full Obsidian support.

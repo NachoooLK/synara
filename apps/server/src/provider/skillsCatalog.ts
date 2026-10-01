@@ -342,6 +342,8 @@ export interface SkillsCatalogDiscoveryInput {
   readonly includeDuplicateOrigins?: boolean;
   /** Bypass the short-lived discovery cache. */
   readonly forceReload?: boolean;
+  /** Provider-configured agent dir (pi/omp) — overrides the default profile root. */
+  readonly agentDir?: string | null;
 }
 
 export interface SkillsCatalogRootInput extends SkillsCatalogDiscoveryInput {
@@ -356,9 +358,10 @@ const HOME_ORIGIN_ORDER = [
   "cursor",
   "grok",
   "factory",
-  "kilo",
   "opencode",
   "pi",
+  "devin",
+  "omp",
   "agents",
 ] as const;
 export type SkillsCatalogOrigin = (typeof HOME_ORIGIN_ORDER)[number] | "project";
@@ -439,17 +442,39 @@ const SKILL_ORIGIN_ROOTS = {
     homeRoots: (input) => [nodePath.join(input.homeDir, ".factory", "skills")],
     projectRootNames: [".factory"],
   },
-  kilo: {
-    homeRoots: (input) => [nodePath.join(input.homeDir, ".kilo", "skills")],
-    projectRootNames: [".kilo"],
-  },
   opencode: {
     homeRoots: (input) => [nodePath.join(input.homeDir, ".config", "opencode", "skills")],
     projectRootNames: [".opencode"],
   },
   pi: {
-    homeRoots: (input) => [nodePath.join(input.homeDir, ".pi", "agent", "skills")],
+    homeRoots: (input) => [
+      nodePath.join(input.agentDir ?? nodePath.join(input.homeDir, ".pi", "agent"), "skills"),
+    ],
     projectRootNames: [".pi"],
+  },
+  devin: {
+    homeRoots: (input) => [
+      ...(process.platform === "win32"
+        ? [
+            nodePath.join(input.homeDir, "AppData", "Roaming", "devin", "skills"),
+            nodePath.join(input.homeDir, "AppData", "Roaming", "cognition", "skills"),
+          ]
+        : []),
+      nodePath.join(input.homeDir, ".config", "devin", "skills"),
+      nodePath.join(input.homeDir, ".config", "cognition", "skills"),
+      nodePath.join(input.homeDir, ".codeium", "windsurf", "skills"),
+      nodePath.join(input.homeDir, ".codeium", "windsurf-next", "skills"),
+      nodePath.join(input.homeDir, ".codeium", "windsurf-insiders", "skills"),
+      // Keep the original path as a compatibility fallback for early Devin CLI builds.
+      nodePath.join(input.homeDir, ".devin", "skills"),
+    ],
+    projectRootNames: [".devin", ".cognition", ".windsurf"],
+  },
+  omp: {
+    homeRoots: (input) => [
+      nodePath.join(input.agentDir ?? nodePath.join(input.homeDir, ".omp", "agent"), "skills"),
+    ],
+    projectRootNames: [".omp"],
   },
   agents: {
     homeRoots: (input) => [nodePath.join(input.homeDir, ".agents", "skills")],
@@ -464,9 +489,10 @@ const PROVIDER_SKILL_ORIGIN_PREFERENCES = {
   antigravity: ["agents"],
   grok: ["grok", "claude", "agents"],
   droid: ["factory", "agents", "claude", "codex"],
-  kilo: ["kilo", "agents", "claude"],
   opencode: ["opencode", "claude", "agents"],
   pi: ["pi", "agents"],
+  devin: ["devin", "claude", "agents"],
+  omp: ["omp", "agents"],
 } as const satisfies Partial<Record<ProviderKind, readonly SkillsHomeOrigin[]>>;
 
 function homeRootsForOrigin(
@@ -517,11 +543,11 @@ function rootsForOrderedOrigins(
   orderedOrigins: ReadonlyArray<SkillsHomeOrigin>,
 ): SkillRoot[] {
   const homeRoots = orderedOrigins.flatMap((origin) =>
-    homeRootsForOrigin(origin, input).map((path) => ({
-      path,
-      scope: origin,
-      ...(origin === "pi" ? { includeMarkdownFiles: true } : {}),
-    })),
+    homeRootsForOrigin(origin, input).map((path) =>
+      origin === "pi" || origin === "omp"
+        ? { path, scope: origin, includeMarkdownFiles: true }
+        : { path, scope: origin },
+    ),
   );
   const homeRootPaths = new Set(homeRoots.map((root) => nodePath.resolve(root.path)));
 
@@ -544,11 +570,11 @@ function rootsForOrderedOrigins(
           if (homeRootPaths.has(nodePath.resolve(rootPath))) {
             continue;
           }
-          projectRoots.push({
-            path: rootPath,
-            scope: "project",
-            ...(origin === "pi" ? { includeMarkdownFiles: true } : {}),
-          });
+          projectRoots.push(
+            origin === "pi" || origin === "omp"
+              ? { path: rootPath, scope: "project", includeMarkdownFiles: true }
+              : { path: rootPath, scope: "project" },
+          );
         }
       }
     }
@@ -576,6 +602,7 @@ export async function discoverSkillsCatalog(
     input.provider ?? "",
     input.homeDir,
     input.synaraBaseDir,
+    input.agentDir?.trim() ?? "",
     input.includeDuplicateOrigins ? "all-origins" : "deduped",
   ].join("\u0000");
 

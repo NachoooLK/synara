@@ -1,10 +1,20 @@
-import { type ModelSlug, type ProviderKind, type ServerProviderStatus } from "@synara/contracts";
-import { page } from "vitest/browser";
+import {
+  type ModelSlug,
+  type ProviderInstanceId,
+  type ProviderKind,
+  type ServerProviderStatus,
+} from "@synara/contracts";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
 
-import { ProviderModelPicker } from "./ProviderModelPicker";
-import type { ProviderModelOption } from "../../providerModelOptions";
+import {
+  ProviderModelPicker,
+  type ProviderModelOptionsByProviderInstance,
+  type ProviderModelPickerInstance,
+} from "./ProviderModelPicker";
+import { mergeDynamicModelOptions, type ProviderModelOption } from "../../providerModelOptions";
 import { FAVORITE_MODEL_STORAGE_KEYS } from "../../lib/modelFavorites";
 
 const MODEL_OPTIONS_BY_PROVIDER = {
@@ -33,14 +43,6 @@ const MODEL_OPTIONS_BY_PROVIDER = {
     },
     { slug: "custom:GPT-5.6-Luna-0", name: "Custom GPT-5.6 Luna" },
   ],
-  kilo: [
-    {
-      slug: "kilo/kilo-auto/free",
-      name: "Kilo Auto Free",
-      upstreamProviderId: "kilo",
-      upstreamProviderName: "Kilo",
-    },
-  ],
   opencode: [
     {
       slug: "opencode/nemotron-3-super-free",
@@ -55,6 +57,14 @@ const MODEL_OPTIONS_BY_PROVIDER = {
       upstreamProviderName: "OpenAI",
     },
   ],
+  devin: [
+    {
+      slug: "devin/swe-1.7",
+      name: "SWE 1.7",
+      upstreamProviderId: "devin",
+      upstreamProviderName: "Devin",
+    },
+  ],
   pi: [
     {
       slug: "anthropic/claude-sonnet-4-5",
@@ -63,6 +73,7 @@ const MODEL_OPTIONS_BY_PROVIDER = {
       upstreamProviderName: "Anthropic",
     },
   ],
+  omp: [],
   antigravity: [
     {
       slug: "Gemini 3.5 Flash",
@@ -108,50 +119,53 @@ const OPENCODE_DUPLICATE_NAME_MODELS = [
   },
 ] satisfies ReadonlyArray<ProviderModelOption & { slug: ModelSlug }>;
 
-const MANY_CURSOR_MODELS = Array.from({ length: 16 }, (_, index) => ({
-  slug: `cursor-model-${index + 1}` as ModelSlug,
-  name: `${index % 2 === 0 ? "GPT" : "Claude"} Cursor ${index + 1}`,
-  upstreamProviderId: index % 2 === 0 ? "openai" : "anthropic",
-  upstreamProviderName: index % 2 === 0 ? "OpenAI" : "Anthropic",
-})) satisfies ReadonlyArray<ProviderModelOption & { slug: ModelSlug }>;
+const PI_BRANDED_MODELS = mergeDynamicModelOptions({
+  provider: "pi",
+  staticOptions: [],
+  dynamicModels: [
+    {
+      slug: "zai/glm-5.3-flash",
+      name: "GLM-5.3-Flash",
+      upstreamProviderId: "zai",
+      upstreamProviderName: "Z.AI",
+    },
+    {
+      slug: "deepseek/deepseek-v4-flash",
+      name: "Deepseek V4 Flash",
+      upstreamProviderId: "deepseek",
+      upstreamProviderName: "DeepSeek",
+    },
+  ],
+}) satisfies ReadonlyArray<ProviderModelOption & { slug: ModelSlug }>;
 
-const CURSOR_FAVORITE_SORT_MODELS = [
-  {
-    slug: "cursor-claude-favorite-sort" as ModelSlug,
-    name: "Claude Cursor Favorite Sort",
-    upstreamProviderId: "anthropic",
-    upstreamProviderName: "Anthropic",
-  },
-  {
-    slug: "cursor-gpt-favorite-sort" as ModelSlug,
-    name: "GPT Cursor Favorite Sort",
-    upstreamProviderId: "openai",
-    upstreamProviderName: "OpenAI",
-  },
-] satisfies ReadonlyArray<ProviderModelOption & { slug: ModelSlug }>;
-
-const PI_FAVORITE_SORT_MODELS = [
-  {
-    slug: "anthropic/claude-pi-favorite-sort" as ModelSlug,
-    name: "Claude Pi Favorite Sort",
-    upstreamProviderId: "anthropic",
-    upstreamProviderName: "Anthropic",
-  },
-  {
-    slug: "openai/gpt-pi-favorite-sort" as ModelSlug,
-    name: "GPT Pi Favorite Sort",
-    upstreamProviderId: "openai",
-    upstreamProviderName: "OpenAI",
-  },
-] satisfies ReadonlyArray<ProviderModelOption & { slug: ModelSlug }>;
+function providerStatus(
+  provider: ProviderKind,
+  overrides: Partial<ServerProviderStatus> = {},
+): ServerProviderStatus {
+  return {
+    provider,
+    instanceId: provider,
+    driver: provider,
+    status: "ready",
+    available: true,
+    authStatus: "authenticated",
+    checkedAt: "2026-04-10T10:00:00.000Z",
+    ...overrides,
+  };
+}
 
 async function mountPicker(props: {
   provider: ProviderKind;
   model: ModelSlug;
   lockedProvider: ProviderKind | null;
   providers?: ReadonlyArray<ServerProviderStatus>;
+  providerInstances?: ReadonlyArray<ProviderModelPickerInstance>;
+  selectedProviderInstanceId?: ProviderInstanceId;
+  showProviderInstanceChoices?: boolean;
+  modelOptionsByProviderInstance?: ProviderModelOptionsByProviderInstance;
   loadingModelProviders?: Partial<Record<ProviderKind, boolean>>;
   onSelectionCommitted?: () => void;
+  withRoleSelect?: boolean;
   modelOptionsByProvider?: Record<
     ProviderKind,
     ReadonlyArray<ProviderModelOption & { slug: ModelSlug }>
@@ -160,17 +174,29 @@ async function mountPicker(props: {
   const host = document.createElement("div");
   document.body.append(host);
   const onProviderModelChange = vi.fn();
+  const onProviderModelRoleSelect = vi.fn();
   const screen = await render(
     <ProviderModelPicker
       provider={props.provider}
       model={props.model}
       lockedProvider={props.lockedProvider}
       modelOptionsByProvider={props.modelOptionsByProvider ?? MODEL_OPTIONS_BY_PROVIDER}
+      {...(props.providerInstances ? { providerInstances: props.providerInstances } : {})}
+      {...(props.selectedProviderInstanceId
+        ? { selectedProviderInstanceId: props.selectedProviderInstanceId }
+        : {})}
+      {...(props.showProviderInstanceChoices !== undefined
+        ? { showProviderInstanceChoices: props.showProviderInstanceChoices }
+        : {})}
+      {...(props.modelOptionsByProviderInstance
+        ? { modelOptionsByProviderInstance: props.modelOptionsByProviderInstance }
+        : {})}
       {...(props.loadingModelProviders
         ? { loadingModelProviders: props.loadingModelProviders }
         : {})}
       {...(props.providers ? { providers: props.providers } : {})}
       {...(props.onSelectionCommitted ? { onSelectionCommitted: props.onSelectionCommitted } : {})}
+      {...(props.withRoleSelect ? { onProviderModelRoleSelect } : undefined)}
       onProviderModelChange={onProviderModelChange}
     />,
     { container: host },
@@ -178,6 +204,7 @@ async function mountPicker(props: {
 
   return {
     onProviderModelChange,
+    onProviderModelRoleSelect,
     cleanup: async () => {
       await screen.unmount();
       host.remove();
@@ -196,22 +223,7 @@ describe("ProviderModelPicker", () => {
       provider: "claudeAgent",
       model: "claude-opus-4-6",
       lockedProvider: null,
-      providers: [
-        {
-          provider: "codex",
-          status: "ready",
-          available: true,
-          authStatus: "authenticated",
-          checkedAt: "2026-04-10T10:00:00.000Z",
-        },
-        {
-          provider: "claudeAgent",
-          status: "ready",
-          available: true,
-          authStatus: "authenticated",
-          checkedAt: "2026-04-10T10:00:00.000Z",
-        },
-      ],
+      providers: [providerStatus("codex"), providerStatus("claudeAgent")],
     });
 
     try {
@@ -223,6 +235,231 @@ describe("ProviderModelPicker", () => {
         expect(text).toContain("Claude");
         expect(text).not.toContain("Claude Sonnet 4.6");
       });
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("selects an enabled provider instance when switching providers", async () => {
+    const mounted = await mountPicker({
+      provider: "codex",
+      model: "gpt-5-codex",
+      lockedProvider: null,
+      providerInstances: [
+        {
+          instanceId: "opencode",
+          provider: "opencode",
+          label: "Default OpenCode",
+          enabled: false,
+          isDefault: true,
+        },
+        {
+          instanceId: "opencode_work",
+          provider: "opencode",
+          label: "Work OpenCode",
+          enabled: true,
+          isDefault: false,
+        },
+      ],
+      providers: [
+        {
+          provider: "opencode",
+          instanceId: "opencode_work",
+          driver: "opencode",
+          status: "ready",
+          available: true,
+          authStatus: "authenticated",
+          checkedAt: "2026-04-10T10:00:00.000Z",
+        },
+      ],
+      modelOptionsByProviderInstance: {
+        opencode_work: [{ slug: "work/opencode-model", name: "Work OpenCode Model" }],
+      },
+    });
+
+    try {
+      await page.getByRole("button").click();
+      await page.getByText("OpenCode").click();
+      await page.getByRole("menuitemradio", { name: "Work OpenCode Model" }).click();
+
+      expect(mounted.onProviderModelChange).toHaveBeenCalledWith(
+        "opencode",
+        "work/opencode-model",
+        "opencode_work",
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("keeps account choices out of the model picker", async () => {
+    const mounted = await mountPicker({
+      provider: "codex",
+      model: "gpt-5-codex",
+      lockedProvider: "codex",
+      showProviderInstanceChoices: false,
+      selectedProviderInstanceId: "codex",
+      providerInstances: [
+        {
+          instanceId: "codex",
+          provider: "codex",
+          label: "Personal",
+          enabled: true,
+          isDefault: true,
+        },
+        {
+          instanceId: "codex_work",
+          provider: "codex",
+          label: "Work",
+          enabled: true,
+          isDefault: false,
+        },
+      ],
+      providers: [
+        providerStatus("codex"),
+        providerStatus("codex", { instanceId: "codex_work", displayName: "Work" }),
+      ],
+    });
+
+    try {
+      await page.getByRole("button").click();
+      await vi.waitFor(() => {
+        expect(document.body.textContent ?? "").not.toContain("Work");
+        expect(document.body.textContent ?? "").toContain("GPT-5 Codex");
+      });
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("keeps embedded account choices for standalone picker callers", async () => {
+    const mounted = await mountPicker({
+      provider: "codex",
+      model: "gpt-5-codex",
+      lockedProvider: "codex",
+      selectedProviderInstanceId: "codex",
+      providerInstances: [
+        {
+          instanceId: "codex",
+          provider: "codex",
+          label: "Personal",
+          enabled: true,
+          isDefault: true,
+        },
+        {
+          instanceId: "codex_work",
+          provider: "codex",
+          label: "Work",
+          enabled: true,
+          isDefault: false,
+        },
+      ],
+      providers: [
+        providerStatus("codex"),
+        providerStatus("codex", { instanceId: "codex_work", displayName: "Work" }),
+      ],
+      modelOptionsByProviderInstance: {
+        codex_work: [{ slug: "gpt-5-work-codex", name: "GPT-5 Work Codex" }],
+      },
+    });
+
+    try {
+      await page.getByRole("button").click();
+      await page.getByRole("menuitemradio", { name: "Work" }).click();
+
+      expect(mounted.onProviderModelChange).toHaveBeenCalledWith(
+        "codex",
+        "gpt-5-work-codex",
+        "codex_work",
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("shows a removed active account and commits a valid replacement account", async () => {
+    const mounted = await mountPicker({
+      provider: "codex",
+      model: "gpt-5-codex",
+      lockedProvider: null,
+      selectedProviderInstanceId: "codex_removed",
+      providerInstances: [
+        {
+          instanceId: "codex",
+          provider: "codex",
+          label: "Personal",
+          enabled: true,
+          isDefault: true,
+        },
+      ],
+      providers: [providerStatus("codex")],
+    });
+
+    try {
+      await expect
+        .element(page.getByRole("button", { name: /Missing account · GPT-5 Codex/ }))
+        .toBeInTheDocument();
+      await page.getByRole("button", { name: /Missing account · GPT-5 Codex/ }).click();
+      await page.getByText("Codex", { exact: true }).click();
+
+      const missingAccount = page.getByRole("menuitemradio", { name: /Missing account/ });
+      await expect.element(missingAccount).toBeDisabled();
+      await page.getByRole("menuitemradio", { name: "Personal" }).click();
+
+      expect(mounted.onProviderModelChange).toHaveBeenCalledWith("codex", "gpt-5-codex", "codex");
+      expect(mounted.onProviderModelChange).not.toHaveBeenCalledWith(
+        "codex",
+        "gpt-5-codex",
+        "codex_removed",
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("preserves the selected same-provider instance when selecting one of its models", async () => {
+    const mounted = await mountPicker({
+      provider: "codex",
+      model: "gpt-5-work-codex",
+      lockedProvider: "codex",
+      selectedProviderInstanceId: "codex_work",
+      providerInstances: [
+        {
+          instanceId: "codex",
+          provider: "codex",
+          label: "Personal",
+          enabled: true,
+          isDefault: true,
+        },
+        {
+          instanceId: "codex_work",
+          provider: "codex",
+          label: "Work",
+          enabled: true,
+          isDefault: false,
+        },
+      ],
+      providers: [
+        providerStatus("codex"),
+        providerStatus("codex", { instanceId: "codex_work", displayName: "Work" }),
+      ],
+      modelOptionsByProviderInstance: {
+        codex_work: [
+          { slug: "gpt-5-work-codex", name: "GPT-5 Work Codex" },
+          { slug: "gpt-5-work-fast", name: "GPT-5 Work Fast" },
+        ],
+      },
+    });
+
+    try {
+      await page.getByRole("button").click();
+      await page.getByRole("menuitemradio", { name: "GPT-5 Work Fast" }).click();
+
+      expect(mounted.onProviderModelChange).toHaveBeenCalledWith(
+        "codex",
+        "gpt-5-work-fast",
+        "codex_work",
+      );
     } finally {
       await mounted.cleanup();
     }
@@ -263,9 +500,130 @@ describe("ProviderModelPicker", () => {
       expect(mounted.onProviderModelChange).toHaveBeenCalledWith(
         "claudeAgent",
         "claude-sonnet-4-6",
+        "claudeAgent",
       );
     } finally {
       await mounted.cleanup();
+    }
+  });
+
+  it("dispatches the role model and thinking level through onProviderModelRoleSelect", async () => {
+    const mounted = await mountPicker({
+      provider: "omp",
+      model: "deepseek/deepseek-v4-flash",
+      lockedProvider: "omp",
+      withRoleSelect: true,
+      modelOptionsByProvider: {
+        ...MODEL_OPTIONS_BY_PROVIDER,
+        omp: [
+          {
+            slug: "role:dreaming-proposer",
+            name: "Dreaming Proposer",
+            upstreamProviderId: "roles",
+            upstreamProviderName: "Roles",
+            role: {
+              name: "Dreaming Proposer",
+              model: "anthropic/claude-opus-4-6",
+              thinkingLevel: "high",
+            },
+          },
+          {
+            slug: "deepseek/deepseek-v4-flash",
+            name: "DeepSeek V4 Flash",
+            upstreamProviderId: "deepseek",
+            upstreamProviderName: "DeepSeek",
+          },
+        ],
+      },
+    });
+
+    try {
+      await page.getByRole("button").click();
+      await page.getByRole("menuitemradio", { name: "Dreaming Proposer" }).click();
+
+      expect(mounted.onProviderModelRoleSelect).toHaveBeenCalledWith("anthropic/claude-opus-4-6", {
+        thinkingLevel: "high",
+      });
+      expect(mounted.onProviderModelChange).not.toHaveBeenCalled();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("commits the role's model via onProviderModelChange when no role callback exists", async () => {
+    const mounted = await mountPicker({
+      provider: "omp",
+      model: "deepseek/deepseek-v4-flash",
+      lockedProvider: "omp",
+      modelOptionsByProvider: {
+        ...MODEL_OPTIONS_BY_PROVIDER,
+        omp: [
+          {
+            slug: "role:dreaming-proposer",
+            name: "Dreaming Proposer",
+            upstreamProviderId: "roles",
+            upstreamProviderName: "Roles",
+            role: {
+              name: "Dreaming Proposer",
+              model: "anthropic/claude-opus-4-6",
+              thinkingLevel: "high",
+            },
+          },
+          {
+            slug: "deepseek/deepseek-v4-flash",
+            name: "DeepSeek V4 Flash",
+            upstreamProviderId: "deepseek",
+            upstreamProviderName: "DeepSeek",
+          },
+        ],
+      },
+    });
+
+    try {
+      await page.getByRole("button").click();
+      await page.getByRole("menuitemradio", { name: "Dreaming Proposer" }).click();
+
+      expect(mounted.onProviderModelChange).toHaveBeenCalledWith(
+        "omp",
+        "anthropic/claude-opus-4-6",
+        "omp",
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("keeps branded Pi model labels stable after selection", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+
+    function ControlledPiPicker() {
+      const [model, setModel] = useState<ModelSlug>("deepseek/deepseek-v4-flash");
+      return (
+        <ProviderModelPicker
+          provider="pi"
+          model={model}
+          lockedProvider="pi"
+          modelOptionsByProvider={{
+            ...MODEL_OPTIONS_BY_PROVIDER,
+            pi: PI_BRANDED_MODELS,
+          }}
+          onProviderModelChange={(_provider, nextModel) => setModel(nextModel)}
+        />
+      );
+    }
+
+    const screen = await render(<ControlledPiPicker />, { container: host });
+    try {
+      await expect.element(page.getByRole("button", { name: /DeepSeek V4 Flash/u })).toBeVisible();
+      await page.getByRole("button", { name: /DeepSeek V4 Flash/u }).click();
+      await page.getByRole("menuitemradio", { name: "GLM 5.3 Flash" }).click();
+
+      await expect.element(page.getByRole("button", { name: /GLM 5.3 Flash/u })).toBeVisible();
+      expect(document.body.textContent ?? "").not.toContain("Glm 5.3 Flash");
+    } finally {
+      await screen.unmount();
+      host.remove();
     }
   });
 
@@ -314,48 +672,6 @@ describe("ProviderModelPicker", () => {
       await vi.waitFor(() => {
         expect(onSelectionCommitted).toHaveBeenCalledTimes(1);
       });
-    } finally {
-      await mounted.cleanup();
-    }
-  });
-
-  it("groups upstream OpenCode models by provider label", async () => {
-    const mounted = await mountPicker({
-      provider: "opencode",
-      model: "openai/gpt-5",
-      lockedProvider: "opencode",
-    });
-
-    try {
-      await page.getByRole("button").click();
-
-      await vi.waitFor(() => {
-        const text = document.body.textContent ?? "";
-        expect(text).toContain("OpenCode");
-        expect(text).toContain("Nemotron 3 Super Free");
-        expect(text).toContain("OpenAI");
-        expect(text).toContain("GPT-5");
-      });
-    } finally {
-      await mounted.cleanup();
-    }
-  });
-
-  it("shows OpenCode search when the provider has at least fifteen models", async () => {
-    const mounted = await mountPicker({
-      provider: "opencode",
-      model: MANY_OPENCODE_MODELS[0]!.slug,
-      lockedProvider: "opencode",
-      modelOptionsByProvider: {
-        ...MODEL_OPTIONS_BY_PROVIDER,
-        opencode: MANY_OPENCODE_MODELS,
-      },
-    });
-
-    try {
-      await page.getByRole("button").click();
-
-      await expect.element(page.getByPlaceholder("Search models or providers")).toBeInTheDocument();
     } finally {
       await mounted.cleanup();
     }
@@ -479,120 +795,6 @@ describe("ProviderModelPicker", () => {
     }
   });
 
-  it("filters Cursor models by upstream provider name", async () => {
-    const mounted = await mountPicker({
-      provider: "cursor",
-      model: MANY_CURSOR_MODELS[0]!.slug,
-      lockedProvider: "cursor",
-      modelOptionsByProvider: {
-        ...MODEL_OPTIONS_BY_PROVIDER,
-        cursor: MANY_CURSOR_MODELS,
-      },
-    });
-
-    try {
-      await page.getByRole("button").click();
-      await page.getByPlaceholder("Search models or providers").fill("Anthropic");
-
-      await vi.waitFor(() => {
-        expect(document.body.textContent ?? "").toContain("Claude Cursor 2");
-      });
-
-      await expect
-        .element(page.getByRole("menuitemradio", { name: "Claude Cursor 2" }))
-        .toBeInTheDocument();
-      await expect
-        .element(page.getByRole("menuitemradio", { name: "GPT Cursor 1" }))
-        .not.toBeInTheDocument();
-    } finally {
-      await mounted.cleanup();
-    }
-  });
-
-  it("shows favourited Cursor models in their own top category", async () => {
-    const mounted = await mountPicker({
-      provider: "cursor",
-      model: "cursor-claude-favorite-sort",
-      lockedProvider: "cursor",
-      modelOptionsByProvider: {
-        ...MODEL_OPTIONS_BY_PROVIDER,
-        cursor: CURSOR_FAVORITE_SORT_MODELS,
-      },
-    });
-
-    try {
-      await page.getByRole("button").click();
-
-      await vi.waitFor(() => {
-        const text = document.body.textContent ?? "";
-        expect(text.indexOf("Anthropic")).toBeLessThan(text.indexOf("OpenAI"));
-      });
-
-      await page
-        .getByRole("button", { name: "Add GPT Cursor Favorite Sort to favourites" })
-        .click();
-
-      await vi.waitFor(() => {
-        const text = document.body.textContent ?? "";
-        expect(text.indexOf("Favourites")).toBeLessThan(text.indexOf("Anthropic"));
-        expect(text.indexOf("GPT Cursor Favorite Sort")).toBeGreaterThan(
-          text.indexOf("Favourites"),
-        );
-        expect(text.indexOf("GPT Cursor Favorite Sort")).toBeLessThan(text.indexOf("Anthropic"));
-      });
-      await expect
-        .element(page.getByRole("menuitemradio", { name: "GPT Cursor Favorite Sort — OpenAI" }))
-        .toBeInTheDocument();
-      expect(
-        Array.from(document.querySelectorAll('[role="menuitemradio"]')).filter((element) =>
-          element.textContent?.includes("GPT Cursor Favorite Sort"),
-        ),
-      ).toHaveLength(1);
-    } finally {
-      await mounted.cleanup();
-    }
-  });
-
-  it("shows favourited Pi models in their own top category", async () => {
-    const mounted = await mountPicker({
-      provider: "pi",
-      model: "anthropic/claude-pi-favorite-sort",
-      lockedProvider: "pi",
-      modelOptionsByProvider: {
-        ...MODEL_OPTIONS_BY_PROVIDER,
-        pi: PI_FAVORITE_SORT_MODELS,
-      },
-    });
-
-    try {
-      await page.getByRole("button").click();
-
-      await vi.waitFor(() => {
-        const text = document.body.textContent ?? "";
-        expect(text.indexOf("Anthropic")).toBeLessThan(text.indexOf("OpenAI"));
-      });
-
-      await page.getByRole("button", { name: "Add GPT Pi Favorite Sort to favourites" }).click();
-
-      await vi.waitFor(() => {
-        const text = document.body.textContent ?? "";
-        expect(text.indexOf("Favourites")).toBeLessThan(text.indexOf("Anthropic"));
-        expect(text.indexOf("GPT Pi Favorite Sort")).toBeGreaterThan(text.indexOf("Favourites"));
-        expect(text.indexOf("GPT Pi Favorite Sort")).toBeLessThan(text.indexOf("Anthropic"));
-      });
-      await expect
-        .element(page.getByRole("menuitemradio", { name: "GPT Pi Favorite Sort — OpenAI" }))
-        .toBeInTheDocument();
-      expect(
-        Array.from(document.querySelectorAll('[role="menuitemradio"]')).filter((element) =>
-          element.textContent?.includes("GPT Pi Favorite Sort"),
-        ),
-      ).toHaveLength(1);
-    } finally {
-      await mounted.cleanup();
-    }
-  });
-
   it("shows a loading skeleton instead of fallback models for loading providers", async () => {
     const mounted = await mountPicker({
       provider: "cursor",
@@ -622,20 +824,12 @@ describe("ProviderModelPicker", () => {
       model: "gpt-5-codex",
       lockedProvider: null,
       providers: [
-        {
-          provider: "codex",
-          status: "ready",
-          available: true,
-          authStatus: "authenticated",
-          checkedAt: "2026-04-10T10:00:00.000Z",
-        },
-        {
-          provider: "claudeAgent",
+        providerStatus("codex"),
+        providerStatus("claudeAgent", {
           status: "error",
           available: false,
           authStatus: "unauthenticated",
-          checkedAt: "2026-04-10T10:00:00.000Z",
-        },
+        }),
       ],
     });
 
@@ -659,15 +853,7 @@ describe("ProviderModelPicker", () => {
       provider: "codex",
       model: "gpt-5-codex",
       lockedProvider: null,
-      providers: [
-        {
-          provider: "codex",
-          status: "ready",
-          available: true,
-          authStatus: "authenticated",
-          checkedAt: "2026-04-10T10:00:00.000Z",
-        },
-      ],
+      providers: [providerStatus("codex")],
     });
 
     try {
@@ -690,21 +876,13 @@ describe("ProviderModelPicker", () => {
       model: "gpt-5-codex",
       lockedProvider: null,
       providers: [
-        {
-          provider: "codex",
-          status: "ready",
-          available: true,
-          authStatus: "authenticated",
-          checkedAt: "2026-04-10T10:00:00.000Z",
-        },
-        {
-          provider: "claudeAgent",
+        providerStatus("codex"),
+        providerStatus("claudeAgent", {
           status: "warning",
           available: true,
           authStatus: "unknown",
-          checkedAt: "2026-04-10T10:00:00.000Z",
           message: "Could not verify auth status.",
-        },
+        }),
       ],
     });
 

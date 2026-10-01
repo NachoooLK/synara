@@ -1,3 +1,4 @@
+import { snapshotProviderTurns } from "../snapshotProviderTurns.ts";
 /**
  * CursorAdapterLive — Cursor CLI (`cursor-agent acp`) via ACP.
  *
@@ -22,7 +23,6 @@ import {
   type ThreadId,
   TurnId,
 } from "@synara/contracts";
-import { prepareWindowsSafeProcess } from "@synara/shared/windowsProcess";
 import {
   DateTime,
   Deferred,
@@ -37,7 +37,8 @@ import {
   Scope,
   Stream,
 } from "effect";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { makeEffectProcessCommand } from "../../platform/effectProcessRuntime.ts";
 import type * as Acp from "@agentclientprotocol/sdk";
 
 import { buildAcpSynaraMcpServers } from "../../agentGateway/mcpInjection.ts";
@@ -46,7 +47,10 @@ import {
   takeSynaraHarnessPolicyTextPartForProviderSession,
 } from "../../agentGateway/harnessPolicy.ts";
 import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
-import { PROVIDER_ADAPTER_RUNTIME_EVENT_BUFFER_CAPACITY } from "../Services/ProviderAdapter.ts";
+import {
+  PROVIDER_ADAPTER_RUNTIME_EVENT_BUFFER_CAPACITY,
+  resolveProviderSessionInstanceId,
+} from "../Services/ProviderAdapter.ts";
 import {
   acquireAgentGatewaySessionLease,
   cancelAgentGatewayTurn,
@@ -128,8 +132,19 @@ import {
 import { CursorAdapter, type CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { discoverCursorSkills } from "../cursorSkillsDiscovery.ts";
+import { buildProviderProcessEnv } from "../providerProcessEnv.ts";
 
 const PROVIDER = "cursor" as const;
+export const resolveCursorStartInstanceId = resolveProviderSessionInstanceId;
+
+export function stampCursorTerminalEventInstance(
+  event: ProviderRuntimeEvent,
+  providerInstanceId: ProviderSession["providerInstanceId"],
+): ProviderRuntimeEvent {
+  return providerInstanceId && event.providerInstanceId !== providerInstanceId
+    ? { ...event, providerInstanceId }
+    : event;
+}
 
 export const takeCursorSynaraHarnessPolicyTextPart = (
   state: SynaraHarnessPolicyDeliveryState,
@@ -199,6 +214,7 @@ interface PendingUserInput {
 
 interface CursorSessionContext {
   harnessPolicyDelivered?: boolean;
+  readonly enableComputerControl?: boolean;
   readonly gatewaySessionLease?: AgentGatewaySessionLease;
   readonly threadId: ThreadId;
   readonly lifecycleGeneration?: string;
@@ -462,13 +478,20 @@ export function makeCursorAdapter(
     const nextEventId = Effect.map(Random.nextUUIDv4, (id) => EventId.makeUnsafe(id));
     const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
 
+    const stampRuntimeEventForInstance = (event: ProviderRuntimeEvent): ProviderRuntimeEvent => {
+      const providerInstanceId = sessions.get(event.threadId)?.session.providerInstanceId;
+      return stampCursorTerminalEventInstance(event, providerInstanceId);
+    };
+
     const offerRuntimeEvent = (
       lifecycleGeneration: string | undefined,
       event: ProviderRuntimeEvent,
     ) =>
       PubSub.publish(
         runtimeEventPubSub,
-        stampAcpRuntimeEventLifecycleGeneration(event, lifecycleGeneration),
+        stampRuntimeEventForInstance(
+          stampAcpRuntimeEventLifecycleGeneration(event, lifecycleGeneration),
+        ),
       ).pipe(Effect.asVoid);
 
     const logNative = (
@@ -675,13 +698,19 @@ export function makeCursorAdapter(
         if (sessions.get(ctx.threadId) === ctx) {
           sessions.delete(ctx.threadId);
         }
-        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
-          type: "session.exited",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
-        });
+        yield* offerRuntimeEvent(
+          ctx.lifecycleGeneration,
+          stampCursorTerminalEventInstance(
+            {
+              type: "session.exited",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              payload: { exitKind: "graceful" },
+            },
+            ctx.session.providerInstanceId,
+          ),
+        );
       });
 
     const startSession: CursorAdapterShape["startSession"] = (input) => {
@@ -707,6 +736,7 @@ export function makeCursorAdapter(
 
           const cursorModelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
+          const resolvedProviderInstanceId = resolveCursorStartInstanceId(input);
           const existing = sessions.get(input.threadId);
           if (existing && !existing.stopped) {
             yield* stopSessionInternal(existing);
@@ -720,6 +750,7 @@ export function makeCursorAdapter(
             agentGatewayCredentials,
             input.threadId,
             PROVIDER,
+            input,
           );
           yield* Effect.addFinalizer(() =>
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
@@ -739,6 +770,11 @@ export function makeCursorAdapter(
           });
           const providerCursorOptions = input.providerOptions?.cursor;
           const effectiveCursorSettings: CursorAcpRuntimeCursorSettings = {
+            homeDir: serverConfig.homeDir,
+            isolationRootDir: serverConfig.stateDir,
+            ...(resolvedProviderInstanceId !== undefined
+              ? { instanceId: resolvedProviderInstanceId }
+              : {}),
             ...(cursorSettings.binaryPath !== undefined
               ? { binaryPath: cursorSettings.binaryPath }
               : {}),
@@ -750,6 +786,9 @@ export function makeCursorAdapter(
               : {}),
             ...(providerCursorOptions?.apiEndpoint !== undefined
               ? { apiEndpoint: providerCursorOptions.apiEndpoint }
+              : {}),
+            ...(providerCursorOptions?.environment !== undefined
+              ? { environment: providerCursorOptions.environment }
               : {}),
           };
 
@@ -901,6 +940,9 @@ export function makeCursorAdapter(
                   runtimeMode: input.runtimeMode,
                   interactionMode: ctx?.activeInteractionMode,
                   options: params.options,
+                  computerControlEnabled: ctx?.enableComputerControl === true,
+                  activeTurn: ctx?.activeTurnId !== undefined,
+                  toolCall: params.toolCall,
                 });
                 if (policyOutcome !== undefined) {
                   return { outcome: policyOutcome };
@@ -982,6 +1024,9 @@ export function makeCursorAdapter(
           const now = yield* nowIso;
           const session: ProviderSession = {
             provider: PROVIDER,
+            ...(resolvedProviderInstanceId
+              ? { providerInstanceId: resolvedProviderInstanceId }
+              : {}),
             status: "ready",
             runtimeMode: input.runtimeMode,
             cwd,
@@ -996,6 +1041,7 @@ export function makeCursorAdapter(
           };
 
           ctx = {
+            enableComputerControl: input.enableComputerControl === true,
             threadId: input.threadId,
             ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
             ...(input.lifecycleGeneration !== undefined
@@ -1551,7 +1597,7 @@ export function makeCursorAdapter(
     const readThread: CursorAdapterShape["readThread"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
-        return { threadId, turns: ctx.turns };
+        return { threadId, turns: snapshotProviderTurns(ctx.turns) };
       });
 
     const rollbackThread: CursorAdapterShape["rollbackThread"] = (threadId, numTurns) =>
@@ -1566,7 +1612,7 @@ export function makeCursorAdapter(
         }
         const nextLength = Math.max(0, ctx.turns.length - numTurns);
         ctx.turns.splice(nextLength);
-        return { threadId, turns: ctx.turns };
+        return { threadId, turns: snapshotProviderTurns(ctx.turns) };
       });
 
     const stopSession: CursorAdapterShape["stopSession"] = (threadId) =>
@@ -1605,15 +1651,23 @@ export function makeCursorAdapter(
 
     const listSkills: NonNullable<CursorAdapterShape["listSkills"]> = (input) =>
       Effect.tryPromise({
-        try: async () =>
-          ({
+        try: async () => {
+          const accountEnv = buildProviderProcessEnv({
+            driver: PROVIDER,
+            homeDir: serverConfig.homeDir,
+            isolationRootDir: serverConfig.stateDir,
+            ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
+            ...(input.environment !== undefined ? { environment: input.environment } : {}),
+          });
+          return {
             skills: await discoverCursorSkills({
               cwd: input.cwd,
-              homeDir: serverConfig.homeDir,
+              homeDir: accountEnv.HOME ?? accountEnv.USERPROFILE ?? serverConfig.homeDir,
             }),
             source: "cursor.filesystem",
             cached: false,
-          }) satisfies ProviderListSkillsResult,
+          } satisfies ProviderListSkillsResult;
+        },
         catch: (cause) =>
           new ProviderAdapterRequestError({
             provider: PROVIDER,
@@ -1626,6 +1680,25 @@ export function makeCursorAdapter(
     const listModels: NonNullable<CursorAdapterShape["listModels"]> = (input) => {
       const binaryPath = input.binaryPath?.trim();
       const apiEndpoint = input.apiEndpoint?.trim();
+      let childEnv: NodeJS.ProcessEnv;
+      try {
+        childEnv = buildProviderProcessEnv({
+          driver: PROVIDER,
+          homeDir: serverConfig.homeDir,
+          isolationRootDir: serverConfig.stateDir,
+          ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
+          ...(input.environment !== undefined ? { environment: input.environment } : {}),
+        });
+      } catch (cause) {
+        return Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "model/list",
+            detail: "Failed to prepare the private Cursor account home.",
+            cause,
+          }),
+        );
+      }
       const effectiveBinaryPath = resolveCursorAgentBinaryPath(
         binaryPath || cursorSettings.binaryPath,
       );
@@ -1635,14 +1708,9 @@ export function makeCursorAdapter(
           binaryPath: effectiveBinaryPath,
           ...(effectiveApiEndpoint ? { apiEndpoint: effectiveApiEndpoint } : {}),
         });
-        const env = buildCursorAgentHeadlessEnv();
-        const prepared = prepareWindowsSafeProcess(command.command, command.args, {
-          env,
-        });
+        const env = buildCursorAgentHeadlessEnv(childEnv);
         const child = yield* childProcessSpawner.spawn(
-          ChildProcess.make(prepared.command, prepared.args, {
-            shell: prepared.shell,
-            ...(prepared.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+          makeEffectProcessCommand(command.command, command.args, {
             env,
           }),
         );
@@ -1694,7 +1762,11 @@ export function makeCursorAdapter(
       // fast) — data the flat `cursor-agent models` CLI list cannot provide.
       const effectiveAcpSettings: CursorAcpRuntimeCursorSettings = {
         binaryPath: effectiveBinaryPath,
+        homeDir: serverConfig.homeDir,
+        isolationRootDir: serverConfig.stateDir,
         ...(effectiveApiEndpoint ? { apiEndpoint: effectiveApiEndpoint } : {}),
+        ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
+        ...(input.environment !== undefined ? { environment: input.environment } : {}),
       };
       const runCursorAcpModelDiscovery = Effect.gen(function* () {
         const runtime = yield* makeCursorAcpRuntime({
@@ -1833,6 +1905,9 @@ export function makeCursorAdapter(
                     : {}),
                   ...(providerCursorOptions?.apiEndpoint !== undefined
                     ? { apiEndpoint: providerCursorOptions.apiEndpoint }
+                    : {}),
+                  ...(providerCursorOptions?.environment !== undefined
+                    ? { environment: providerCursorOptions.environment }
                     : {}),
                 },
                 childProcessSpawner,

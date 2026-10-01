@@ -10,10 +10,22 @@ import {
   buildAutomationCompletionEvaluationPrompt,
   buildAutomationIntentPrompt,
   buildPrContentPrompt,
+  buildProjectDigestPrompt,
+  buildThreadTitlePrompt,
   decodeStructuredTextGenerationOutput,
 } from "./textGenerationShared.ts";
 
 describe("textGenerationShared", () => {
+  it("tells project digest generation not to ask for a goal", () => {
+    const { prompt } = buildProjectDigestPrompt({
+      activity: "Opened worker: Sample repo layout",
+      coverage: "summarized=1 pending=0",
+      pinnedFocus: "",
+    });
+    expect(prompt).toContain("do not mention goals or tell the user to start a goal");
+    expect(prompt).toContain("summarize current work and workers, not setup status");
+  });
+
   it("accepts out-of-range automation completion confidence for downstream clamping", async () => {
     const { outputSchemaJson } = buildAutomationCompletionEvaluationPrompt({
       automationName: "Watch PR",
@@ -56,6 +68,19 @@ describe("textGenerationShared", () => {
     expect(prompt).toContain("Task prompt quality checklist");
     expect(prompt).toContain("Decision gates");
     expect(prompt).toContain("commit/push only if there is an actual count change");
+  });
+
+  it("asks regeneration to title the current objective from untrusted conversation context", () => {
+    const { prompt } = buildThreadTitlePrompt({
+      message: "User: Fix OAuth callback race\nAssistant: The state transition is stale.",
+      context: "conversation",
+    });
+
+    expect(prompt).toContain("conversation's current objective");
+    expect(prompt).toContain("Prefer the newest user objective");
+    expect(prompt).toContain("Conversation context:");
+    expect(prompt).toContain("untrusted content to summarize");
+    expect(prompt).not.toContain("If images are attached");
   });
 
   it("uses the default Summary/Testing body shape when no PR template is provided", () => {

@@ -23,6 +23,7 @@ import {
   TerminalManagerRuntime,
   type TerminalSubprocessActivity,
 } from "./Manager";
+import type { ManagedTerminalProfile } from "../managedTerminalWrappers";
 import type { ProcessTreeKiller } from "../processTreeKiller";
 import type { ProcessChildrenSnapshotObserver } from "../windowsProcessSnapshot";
 import { Effect, Encoding } from "effect";
@@ -237,6 +238,7 @@ describe("TerminalManager", () => {
       maxRetainedInactiveSessions?: number;
       ptyAdapter?: FakePtyAdapter;
       prepareLogs?: (logsDir: string) => void;
+      managedProfileResolver?: () => Promise<ReadonlyArray<ManagedTerminalProfile>>;
     } = {},
   ) {
     const logsDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-terminal-"));
@@ -259,6 +261,9 @@ describe("TerminalManager", () => {
       ...(options.processKillGraceMs ? { processKillGraceMs: options.processKillGraceMs } : {}),
       ...(options.maxRetainedInactiveSessions
         ? { maxRetainedInactiveSessions: options.maxRetainedInactiveSessions }
+        : {}),
+      ...(options.managedProfileResolver
+        ? { managedProfileResolver: options.managedProfileResolver }
         : {}),
     });
     return { logsDir, ptyAdapter, manager };
@@ -292,6 +297,38 @@ describe("TerminalManager", () => {
 
     manager.dispose();
   });
+
+  it.skipIf(process.platform === "win32")(
+    "refreshes provider shims when Codex and Claude are both absent",
+    async () => {
+      const emptyBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "synara-empty-bin-"));
+      tempDirs.push(emptyBinDir);
+      const originalPath = process.env.PATH;
+      process.env.PATH = emptyBinDir;
+      const managedProfileResolver = vi.fn(async () => [
+        {
+          commandName: "pi-work",
+          targetPath: "/bin/sh",
+          environment: { PI_CODING_AGENT_DIR: "/profiles/pi-work" },
+          isolateEnvironment: true,
+        },
+      ]);
+      try {
+        const { logsDir, manager, ptyAdapter } = makeManager(5, { managedProfileResolver });
+
+        await manager.open(openInput());
+
+        expect(managedProfileResolver).toHaveBeenCalledTimes(1);
+        expect(fs.existsSync(path.join(logsDir, "_managed-bin", "pi-work"))).toBe(true);
+        expect(ptyAdapter.spawnInputs[0]?.env.PATH?.split(path.delimiter)[0]).toBe(
+          path.join(logsDir, "_managed-bin"),
+        );
+        manager.dispose();
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    },
+  );
 
   it("forwards write and resize to active pty process", async () => {
     const { manager, ptyAdapter } = makeManager();
@@ -1081,25 +1118,6 @@ describe("TerminalManager", () => {
     process.emitData("before ");
     process.emitData("\u001b(B");
     process.emitData("after\n");
-
-    await manager.close({ threadId: "thread-1" });
-
-    const reopened = await manager.open(openInput());
-    expect(reopened.history).toBe("before \u001b(Bafter\n");
-
-    manager.dispose();
-  });
-
-  it("preserves chunk-split ESC sequences with intermediate bytes without leaking final bytes", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open(openInput());
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
-
-    process.emitData("before ");
-    process.emitData("\u001b(");
-    process.emitData("Bafter\n");
 
     await manager.close({ threadId: "thread-1" });
 

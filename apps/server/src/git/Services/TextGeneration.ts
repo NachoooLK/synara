@@ -99,6 +99,8 @@ export interface BranchNameGenerationResult {
 export interface ThreadTitleGenerationInput {
   cwd: string;
   message: string;
+  /** Regenerate from durable conversation context instead of a single first-turn prompt. */
+  context?: "conversation";
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
   /** Model to use for generation. Uses the Git writing default if not specified. */
   model?: string;
@@ -169,6 +171,27 @@ export interface AutomationCompletionEvaluationResult {
   reason: string;
 }
 
+export interface ProjectDigestGenerationInput {
+  cwd: string;
+  previousSummary?: string | undefined;
+  activity: string;
+  coverage: string;
+  pinnedFocus: string;
+  codexHomePath?: string;
+  model?: string;
+  modelSelection?: ModelSelection;
+  providerOptions?: ProviderStartOptions;
+}
+
+export interface ProjectDigestGenerationResult {
+  summary: string;
+  focusItems: ReadonlyArray<{
+    title: string;
+    kind: "task" | "message" | "artifact" | "blocker";
+    source: string;
+  }>;
+}
+
 export type TextGenerationOperation =
   | "generateCommitMessage"
   | "generatePrContent"
@@ -176,6 +199,7 @@ export type TextGenerationOperation =
   | "generateBranchName"
   | "generateThreadTitle"
   | "generateThreadRecap"
+  | "generateProjectDigest"
   | "generateAutomationIntent"
   | "evaluateAutomationCompletion";
 
@@ -224,6 +248,9 @@ export interface TextGenerationShape {
   readonly generateThreadRecap: (
     input: ThreadRecapGenerationInput,
   ) => Effect.Effect<ThreadRecapGenerationResult, TextGenerationError>;
+  readonly generateProjectDigest: (
+    input: ProjectDigestGenerationInput,
+  ) => Effect.Effect<ProjectDigestGenerationResult, TextGenerationError>;
 
   /**
    * Convert a composer automation invocation into a structured creation intent.
@@ -249,6 +276,14 @@ export class CodexTextGeneration extends ServiceMap.Service<
 >()("synara/git/Services/TextGeneration/CodexTextGeneration") {}
 
 /**
+ * ClaudeTextGeneration - Provider-specific Claude implementation for git text generation.
+ */
+export class ClaudeTextGeneration extends ServiceMap.Service<
+  ClaudeTextGeneration,
+  TextGenerationShape
+>()("synara/git/Services/TextGeneration/ClaudeTextGeneration") {}
+
+/**
  * OpenCodeTextGeneration - Provider-specific OpenCode implementation for git text generation.
  */
 export class OpenCodeTextGeneration extends ServiceMap.Service<
@@ -257,20 +292,20 @@ export class OpenCodeTextGeneration extends ServiceMap.Service<
 >()("synara/git/Services/TextGeneration/OpenCodeTextGeneration") {}
 
 /**
- * KiloTextGeneration - Provider-specific Kilo implementation for git text generation.
- */
-export class KiloTextGeneration extends ServiceMap.Service<
-  KiloTextGeneration,
-  TextGenerationShape
->()("synara/git/Services/TextGeneration/KiloTextGeneration") {}
-
-/**
  * CursorTextGeneration - Provider-specific Cursor implementation for git text generation.
  */
 export class CursorTextGeneration extends ServiceMap.Service<
   CursorTextGeneration,
   TextGenerationShape
 >()("synara/git/Services/TextGeneration/CursorTextGeneration") {}
+
+/**
+ * DroidTextGeneration - Provider-specific Droid implementation for git text generation.
+ */
+export class DroidTextGeneration extends ServiceMap.Service<
+  DroidTextGeneration,
+  TextGenerationShape
+>()("synara/git/Services/TextGeneration/DroidTextGeneration") {}
 
 /**
  * TextGeneration - Service tag for commit and PR text generation.

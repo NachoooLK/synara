@@ -9,6 +9,7 @@ import {
   type ProjectId,
   SpaceId,
 } from "@synara/contracts";
+import { getDefaultModel } from "@synara/shared/model";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useSpacesUiStore } from "../spacesUiStore";
@@ -111,6 +112,58 @@ describe("createOrRecoverProjectFromPath", () => {
       project: existingProject,
       created: false,
     });
+  });
+
+  it("seeds the new project's default model selection from the persisted default provider (Devin)", async () => {
+    let createdProjectId: ProjectId | null = null;
+    const dispatchCommand = vi.fn(async (command: { projectId?: ProjectId }) => {
+      createdProjectId = command.projectId ?? null;
+      return { sequence: 2 };
+    });
+
+    await createOrRecoverProjectFromPath({
+      api: makeApi(dispatchCommand),
+      workspaceRoot: WORKSPACE_ROOT,
+      defaultProvider: "devin",
+      loadSnapshot: async () =>
+        makeSnapshot(createdProjectId ? [makeProject(createdProjectId)] : []),
+    });
+
+    expect(dispatchCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "project.create",
+        defaultModelSelection: {
+          provider: "devin",
+          model: "adaptive",
+        },
+      }),
+    );
+  });
+
+  it("falls back to the Codex default model when the persisted default provider is OMP", async () => {
+    let createdProjectId: ProjectId | null = null;
+    const dispatchCommand = vi.fn(async (command: { projectId?: ProjectId }) => {
+      createdProjectId = command.projectId ?? null;
+      return { sequence: 2 };
+    });
+
+    await createOrRecoverProjectFromPath({
+      api: makeApi(dispatchCommand),
+      workspaceRoot: WORKSPACE_ROOT,
+      defaultProvider: "omp",
+      loadSnapshot: async () =>
+        makeSnapshot(createdProjectId ? [makeProject(createdProjectId)] : []),
+    });
+
+    expect(dispatchCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "project.create",
+        defaultModelSelection: {
+          provider: "codex",
+          model: getDefaultModel("codex"),
+        },
+      }),
+    );
   });
 
   it("preserves an optimistically selected space before the shell snapshot catches up", async () => {

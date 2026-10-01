@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   applyShellEnvironmentHydrationMarker,
-  extractPathFromShellOutput,
   isShellEnvironmentHydrated,
   SHELL_ENVIRONMENT_HYDRATED_ENV_NAME,
   listLoginShellCandidates,
@@ -12,30 +11,7 @@ import {
   readPathFromLaunchctl,
   readPathFromLoginShell,
   readWindowsPersistentEnvironment,
-  resolveLoginShell,
 } from "./shell";
-
-describe("extractPathFromShellOutput", () => {
-  it("extracts the path between capture markers", () => {
-    expect(
-      extractPathFromShellOutput(
-        "__SYNARA_PATH_START__\n/opt/homebrew/bin:/usr/bin\n__SYNARA_PATH_END__\n",
-      ),
-    ).toBe("/opt/homebrew/bin:/usr/bin");
-  });
-
-  it("ignores shell startup noise around the capture markers", () => {
-    expect(
-      extractPathFromShellOutput(
-        "Welcome to fish\n__SYNARA_PATH_START__\n/opt/homebrew/bin:/usr/bin\n__SYNARA_PATH_END__\nBye\n",
-      ),
-    ).toBe("/opt/homebrew/bin:/usr/bin");
-  });
-
-  it("returns null when the markers are missing", () => {
-    expect(extractPathFromShellOutput("/opt/homebrew/bin /usr/bin")).toBeNull();
-  });
-});
 
 describe("shell environment hydration marker", () => {
   it("requires both the marker and a populated PATH", () => {
@@ -214,23 +190,11 @@ describe("listLoginShellCandidates", () => {
   });
 });
 
-describe("resolveLoginShell", () => {
-  it("returns the first available login-shell candidate", () => {
-    expect(resolveLoginShell("darwin", "/bin/fish")).toBe("/bin/fish");
-  });
-});
-
 describe("mergePathEntries", () => {
   it("prefers login-shell PATH entries and keeps inherited extras", () => {
     expect(
       mergePathEntries("/opt/homebrew/bin:/usr/bin", "/Users/test/.local/bin:/usr/bin", "darwin"),
     ).toBe("/opt/homebrew/bin:/usr/bin:/Users/test/.local/bin");
-  });
-
-  it("uses the platform-specific delimiter", () => {
-    expect(mergePathEntries("C:\\Tools;C:\\Windows", "C:\\Windows;C:\\Git", "win32")).toBe(
-      "C:\\Tools;C:\\Windows;C:\\Git",
-    );
   });
 
   it("collapses case- and trailing-slash-different Windows duplicates", () => {

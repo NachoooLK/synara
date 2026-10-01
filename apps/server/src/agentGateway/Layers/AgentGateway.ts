@@ -13,28 +13,42 @@
  *
  * @module agentGateway/Layers/AgentGateway
  */
+import { computerSpaceDesignationForMessages } from "../../computer/computerSpaceDesignation.ts";
 import { randomUUID } from "node:crypto";
 
 import {
+  COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND,
+  COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
   CommandId,
+  EventId,
   SYNARA_GATEWAY_MAX_THREADS_PER_OPERATION,
   MessageId,
   THREAD_GOAL_MAX_CHARS,
   ThreadId,
+  TurnId,
+  type ComputerBuildSignature,
+  type ComputerPermission,
+  type ComputerSetupRequiredPayload,
+  type ModelSelection,
+  type ProjectId,
+  type ProviderApprovalDecision,
   type ProviderKind,
   type RuntimeMode,
   type ServerProviderStatus,
   type TurnDispatchMode,
 } from "@synara/contracts";
 import { runtimeModeEscalatesPrivilege } from "@synara/shared/runtimeMode";
+import { isProviderKind } from "@synara/shared/providerInstances";
 import { Effect, Layer, Option } from "effect";
 
 import { GitCore } from "../../git/Services/GitCore.ts";
+import { GitManager } from "../../git/Services/GitManager.ts";
 import { ServerConfig } from "../../config.ts";
 import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { AutomationService } from "../../automation/Services/AutomationService.ts";
 import { buildAutomationProposalActivity } from "../../automation/proposalActivity.ts";
+import { ProjectAgentService } from "../../projectAgent/Services/ProjectAgentService.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationEventDeliveryRepository } from "../../persistence/Services/OrchestrationEventDeliveries.ts";
@@ -48,10 +62,11 @@ import { ProviderHealth } from "../../provider/Services/ProviderHealth.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   AGENT_GATEWAY_TARGET_OPTIONS_DESCRIPTION,
+  resolveAgentGatewayTarget,
   type AgentGatewayProviderAvailability,
 } from "../targetResolver.ts";
 import { mcpToolResultError, mcpToolResultJson } from "../protocol.ts";
-import { gatewayIsoNow as isoNow } from "../creationUtils.ts";
+import { gatewayIsoNow as isoNow, stableGatewayDigest } from "../creationUtils.ts";
 import {
   MODEL_SELECTION_INPUT_SCHEMA,
   PROVIDER_KINDS,
@@ -64,16 +79,30 @@ import {
   readRecordArg,
   readStringArg,
 } from "../toolInput.ts";
-import { WRITE_TOOL_ANNOTATIONS, type ToolEntry } from "../toolRuntime.ts";
+import { WRITE_TOOL_ANNOTATIONS, type ToolContext, type ToolEntry } from "../toolRuntime.ts";
 import { makeAgentGatewayMcpTransport } from "../mcpTransport.ts";
+import { deliverGatewayCompletions } from "../completionDelivery.ts";
 import { recoverInterruptedAgentGatewayOperations } from "../startupRecovery.ts";
 import { makeCreateThreadsHandler } from "../creationCoordinator.ts";
 import { makeAgentGatewayAutomationTools } from "../automationTools.ts";
 import { makeAgentGatewayBrowserTools } from "../browserTools.ts";
+import { makeAgentGatewayComputerBrowserTools } from "../computerBrowserTools.ts";
+import { computerApprovalDisplayArgs } from "../computerApprovalDisplay.ts";
 import { makeAgentGatewayDeviceTools } from "../deviceTools.ts";
 import { DeviceService } from "../../device/Services/DeviceService.ts";
+import {
+  COMPUTER_CONTROL_CAPABILITY,
+  makeAgentGatewayComputerTools,
+  type AgentGatewayComputerToolsOptions,
+} from "../computerTools.ts";
+import { isSynaraComputerToolFamilyName } from "../computerToolPermission.ts";
+import { ComputerService } from "../../computer/Services/ComputerService.ts";
+import { computerApprovalGate } from "../../computer/ComputerApprovalGate.ts";
+import { makeComputerForegroundConsent } from "../computerForegroundConsent.ts";
 import { BrowserAutomationHost } from "../../browserAutomation/Services/BrowserAutomationHost.ts";
 import { makeBrowserAutomationHost } from "../../browserAutomation/Layers/BrowserAutomationHost.ts";
+import { makeProjectAgentTools } from "../projectAgentTools.ts";
+import { isServerGroupsEnabled } from "../../projectAgent/groupsBetaGate.ts";
 import { makeThreadReadTools } from "../threadReadTools.ts";
 import { makeThreadDiagnosticTools } from "../threadDiagnosticTools.ts";
 import { pruneProjectedArchivedManagedWorktrees } from "../../managedWorktrees.ts";
@@ -111,7 +140,9 @@ export const makeAgentGateway = Effect.gen(function* () {
   const snapshotQuery = yield* ProjectionSnapshotQuery;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const automationService = yield* AutomationService;
+  const projectAgentService = yield* ProjectAgentService;
   const git = yield* GitCore;
+  const gitManager = yield* GitManager;
   const providerDiscovery = yield* ProviderDiscoveryService;
   const providerHealth = yield* ProviderHealth;
   const serverSettings = yield* ServerSettingsService;
@@ -130,14 +161,18 @@ export const makeAgentGateway = Effect.gen(function* () {
   // it) the agent never sees the device_* tools at all, rather than being
   // offered eleven tools that can only report an unsupported platform.
   const deviceService = Option.getOrUndefined(yield* Effect.serviceOption(DeviceService));
+  const computerService = Option.getOrUndefined(yield* Effect.serviceOption(ComputerService));
   const loadProviderAvailabilities = Effect.gen(function* () {
     const [settings, statuses] = yield* Effect.all([
       serverSettings.getSettings,
       providerHealth.getStatuses,
     ]);
-    const statusByProvider = new Map<ProviderKind, ServerProviderStatus>(
-      statuses.map((status) => [status.provider, status]),
-    );
+    const statusByProvider = new Map<ProviderKind, ServerProviderStatus>();
+    for (const status of statuses) {
+      if (isProviderKind(status.driver)) {
+        statusByProvider.set(status.driver, status);
+      }
+    }
     return new Map<ProviderKind, AgentGatewayProviderAvailability>(
       PROVIDER_KINDS.map((provider) => {
         const status = statusByProvider.get(provider);
@@ -165,6 +200,20 @@ export const makeAgentGateway = Effect.gen(function* () {
     git,
   });
 
+  yield* Effect.forkScoped(
+    Effect.forever(
+      deliverGatewayCompletions({
+        repository: operationRepository.completions,
+        snapshotQuery,
+        projectionTurns,
+        orchestrationEngine,
+      }).pipe(
+        Effect.catch((error) => Effect.logWarning("gateway completion scan failed", { error })),
+        Effect.andThen(Effect.sleep(1000)),
+      ),
+    ),
+  );
+
   const requireThreadShell = (threadId: string) =>
     snapshotQuery.getThreadShellById(ThreadId.makeUnsafe(threadId)).pipe(
       Effect.mapError((error) => new ToolInputError(errorText(error))),
@@ -176,12 +225,43 @@ export const makeAgentGateway = Effect.gen(function* () {
       ),
     );
 
+  // Automation targets resolve like thread-creation targets: live provider availability
+  // and model discovery, against the workspace of the project the automation belongs to.
+  const resolveAutomationTarget = (input: {
+    readonly target: ModelSelection;
+    readonly projectId: ProjectId;
+  }): Effect.Effect<ModelSelection, unknown> =>
+    Effect.gen(function* () {
+      const project = yield* snapshotQuery.getProjectShellById(input.projectId).pipe(
+        Effect.mapError((error) => new ToolInputError(errorText(error))),
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(new ToolInputError(`Project "${input.projectId}" was not found.`)),
+            onSome: Effect.succeed,
+          }),
+        ),
+      );
+      const providerAvailabilities = yield* loadProviderAvailabilities;
+      const availability = providerAvailabilities.get(input.target.provider);
+      return yield* resolveAgentGatewayTarget({
+        target: input.target,
+        discovery: providerDiscovery,
+        ...(availability !== undefined ? { availability } : {}),
+        cwd: project.workspaceRoot,
+      });
+    });
+
   // Privilege boundary shared by every tool that makes another thread execute
   // work or mutates another thread's state: a caller must not drive a thread
   // that runs with more privileges than the user granted the caller itself —
   // otherwise an approval-required or worktree-isolated agent escalates by proxy.
   const assertCallerMayDriveThread = (
-    caller: { readonly runtimeMode: RuntimeMode; readonly envMode?: string | null | undefined },
+    caller: {
+      readonly id: string;
+      readonly runtimeMode: RuntimeMode;
+      readonly envMode?: string | null | undefined;
+    },
     target: {
       readonly id: string;
       readonly runtimeMode: RuntimeMode;
@@ -203,6 +283,12 @@ export const makeAgentGateway = Effect.gen(function* () {
           ),
         );
       }
+      yield* projectAgentService
+        .assertCallerMayDriveManagedThread({
+          callerThreadId: ThreadId.makeUnsafe(caller.id),
+          targetThreadId: ThreadId.makeUnsafe(target.id),
+        })
+        .pipe(Effect.mapError((error) => new ToolInputError(error.message)));
     });
 
   const readTools = makeThreadReadTools({
@@ -236,6 +322,21 @@ export const makeAgentGateway = Effect.gen(function* () {
     serverConfig,
     loadProviderAvailabilities,
     requireThreadShell,
+    authorizeManagedGoalCreation: (input) =>
+      projectAgentService
+        .authorizeManagedGoalCreation(input)
+        .pipe(Effect.mapError((error) => new ToolInputError(error.message))),
+    recordManagedWorkerThreads: (input) =>
+      projectAgentService
+        .recordManagedWorkerThreads(input)
+        .pipe(Effect.mapError((error) => new ToolInputError(error.message))),
+    assertCreateTargetProject: (input) =>
+      projectAgentService
+        .assertCallerMayCreateThreadInProject({
+          callerThreadId: ThreadId.makeUnsafe(input.callerThreadId),
+          targetProjectId: input.targetProjectId,
+        })
+        .pipe(Effect.mapError((error) => new ToolInputError(error.message))),
   });
 
   const createThreads: ToolEntry = {
@@ -244,7 +345,7 @@ export const makeAgentGateway = Effect.gen(function* () {
     definition: {
       name: "synara_create_threads",
       description:
-        "Create an exact batch of 1–20 standalone Synara threads. Worktree threads start on a Synara-managed temporary branch pinned at baseRef (or the selected checkout's HEAD) and copy local checkout changes plus .worktreeinclude files when the ref is that checkout's HEAD; on the first turn Synara may rename the branch after the prompt and publish it. Validation/preflight failures create nothing and may be corrected with the same requestId; durable retries replay the exact operation.",
+        "Create an exact batch of 1–20 standalone Synara threads. Worktree threads start on a Synara-managed temporary branch pinned at baseRef (or the selected checkout's HEAD) and copy local checkout changes plus .worktreeinclude files when the ref is that checkout's HEAD; on the first turn Synara may rename the branch after the prompt and publish it. Validation/preflight failures create nothing and may be corrected with the same requestId; durable retries replay the exact operation. Each created thread's result includes a ready-to-use link (`thread://<threadId>`); when you mention a thread in a message to the user, write it as a markdown link like [title](thread://<threadId>).",
       inputSchema: {
         type: "object",
         properties: {
@@ -260,6 +361,11 @@ export const makeAgentGateway = Effect.gen(function* () {
             items: {
               type: "object",
               properties: {
+                notifyCreatorOnComplete: {
+                  type: "boolean",
+                  description:
+                    "Passively return the initial run result to this creating thread. Does not wake the creator; goal runs are unsupported.",
+                },
                 prompt: { type: "string" },
                 title: { type: "string" },
                 target: {
@@ -308,11 +414,16 @@ export const makeAgentGateway = Effect.gen(function* () {
     definition: {
       name: "synara_create_thread",
       description:
-        "Create exactly one standalone Synara thread. Worktree threads start on a Synara-managed temporary branch pinned at baseRef; on the first turn Synara may rename the branch after the prompt and publish it. For two or more threads use one synara_create_threads call instead.",
+        "Create exactly one standalone Synara thread. Worktree threads start on a Synara-managed temporary branch pinned at baseRef; on the first turn Synara may rename the branch after the prompt and publish it. For two or more threads use one synara_create_threads call instead. The result includes a ready-to-use link (`thread://<threadId>`); when you mention the thread in a message to the user, write it as a markdown link like [title](thread://<threadId>).",
       inputSchema: {
         type: "object",
         properties: {
           requestId: { type: "string", maxLength: 256 },
+          notifyCreatorOnComplete: {
+            type: "boolean",
+            description:
+              "Passively return the initial run result to this creating thread. Does not wake the creator; goal runs are unsupported.",
+          },
           prompt: { type: "string" },
           title: { type: "string" },
           target: {
@@ -371,6 +482,7 @@ export const makeAgentGateway = Effect.gen(function* () {
           "baseBranch",
           "branchName",
           "runtimeMode",
+          "notifyCreatorOnComplete",
         ]) {
           const value = args[key];
           if (value !== undefined) spec[key] = value;
@@ -544,6 +656,70 @@ export const makeAgentGateway = Effect.gen(function* () {
       }).pipe(Effect.catch((error) => Effect.succeed(mcpToolResultError(errorText(error))))),
   };
 
+  const setThreadPullRequest: ToolEntry = {
+    requiredCapability: "thread:write",
+    requiresActiveTurn: true,
+    definition: {
+      name: "synara_set_thread_pull_request",
+      description:
+        "Associate a pull request with a Synara thread. Use this after successfully creating the pull request that represents that thread's own deliverable. Do not associate pull requests that the thread only reviews, references, or discusses. Defaults to your own thread when threadId is omitted.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: {
+            type: "string",
+            description: "Thread that owns the pull request. Defaults to your own thread.",
+          },
+          reference: {
+            type: "string",
+            description: "GitHub pull request URL or number resolvable from the thread repository.",
+          },
+        },
+        required: ["reference"],
+        additionalProperties: false,
+      },
+      annotations: { title: "Associate a pull request", ...WRITE_TOOL_ANNOTATIONS },
+    },
+    handler: (args, context) =>
+      Effect.gen(function* () {
+        const threadId = readStringArg(args, "threadId") ?? context.callerThreadId;
+        const reference = readStringArg(args, "reference", { required: true })!;
+        const caller = yield* requireThreadShell(context.callerThreadId);
+        const target = yield* requireThreadShell(threadId);
+        yield* assertCallerMayDriveThread(caller, target);
+
+        const project = Option.getOrUndefined(
+          yield* snapshotQuery
+            .getProjectShellById(target.projectId)
+            .pipe(Effect.mapError((error) => new ToolInputError(errorText(error)))),
+        );
+        if (!project) {
+          return yield* Effect.fail(
+            new ToolInputError(`Project for thread "${threadId}" was not found.`),
+          );
+        }
+        const cwd = resolveThreadWorkspaceCwd({ thread: target, projects: [project] });
+        if (!cwd) {
+          return yield* Effect.fail(
+            new ToolInputError(`Git workspace for thread "${threadId}" is unavailable.`),
+          );
+        }
+
+        const { pullRequest } = yield* gitManager
+          .resolvePullRequest({ cwd, reference })
+          .pipe(Effect.mapError((error) => new ToolInputError(errorText(error))));
+        yield* orchestrationEngine
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.makeUnsafe(`agent:${randomUUID()}:pull-request`),
+            threadId: target.id,
+            lastKnownPr: pullRequest,
+          })
+          .pipe(Effect.mapError((error) => new ToolInputError(errorText(error))));
+        return mcpToolResultJson({ threadId: target.id, pullRequest });
+      }).pipe(Effect.catch((error) => Effect.succeed(mcpToolResultError(errorText(error))))),
+  };
+
   const setThreadArchived: ToolEntry = {
     requiredCapability: "thread:write",
     requiresActiveTurn: true,
@@ -684,6 +860,7 @@ export const makeAgentGateway = Effect.gen(function* () {
     automationService,
     requireThreadShell,
     assertCallerMayDriveThread,
+    resolveAutomationTarget,
     surfaceAutomationProposal: ({ callerThreadId, definition }) => {
       const createdAt = isoNow();
       return orchestrationEngine
@@ -700,22 +877,365 @@ export const makeAgentGateway = Effect.gen(function* () {
         .pipe(Effect.asVoid);
     },
   });
+  /**
+   * The caller thread's canonical workspace root. Shared by the integrated
+   * browser surface and the driver-backed `computer_browser_*` file-transfer
+   * tools — both bound model-supplied paths to it.
+   */
+  const resolveWorkspaceRoot = (context: ToolContext) =>
+    Effect.gen(function* () {
+      const thread = yield* requireThreadShell(context.callerThreadId);
+      const project = yield* snapshotQuery
+        .getProjectShellById(thread.projectId)
+        .pipe(Effect.map(Option.getOrNull));
+      if (!project) return null;
+      return (
+        resolveThreadWorkspaceCwd({
+          thread,
+          projects: [project],
+        }) ?? null
+      );
+    }).pipe(Effect.orElseSucceed(() => null));
   const browserTools = makeAgentGatewayBrowserTools(browserAutomationHost, {
-    resolveWorkspaceRoot: (context) =>
-      Effect.gen(function* () {
-        const thread = yield* requireThreadShell(context.callerThreadId);
-        const project = yield* snapshotQuery
-          .getProjectShellById(thread.projectId)
-          .pipe(Effect.map(Option.getOrNull));
-        if (!project) return null;
-        return (
-          resolveThreadWorkspaceCwd({
-            thread,
-            projects: [project],
-          }) ?? null
-        );
-      }).pipe(Effect.orElseSucceed(() => null)),
+    resolveWorkspaceRoot,
   });
+  const projectAgentTools = makeProjectAgentTools({
+    projectAgent: projectAgentService,
+  });
+
+  // One denial activity per (thread, turn, tool): agents typically retry the denied
+  // tool several times in a row, and repeated cards would bury the chat — but a
+  // second, different tool denied in the same turn is a different fact and earns
+  // its own card. The decider appends activities verbatim, so the dedupe lives here.
+  const surfacedComputerControlDenials = new Set<string>();
+  const SURFACED_DENIALS_MAX = 512;
+  const surfaceCapabilityDenial: NonNullable<
+    Parameters<typeof makeAgentGatewayMcpTransport>[0]["onCapabilityDenied"]
+  > = (denial) => {
+    // Only computer control has a user-facing switch to point at; other
+    // capability denials stay plain tool errors.
+    if (denial.requiredCapability !== COMPUTER_CONTROL_CAPABILITY) return Effect.void;
+    const dedupeKey = `${denial.callerThreadId}:${denial.callerTurnId ?? "no-turn"}:${denial.toolName}`;
+    if (surfacedComputerControlDenials.has(dedupeKey)) return Effect.void;
+    // FIFO eviction, not a wholesale clear: clearing forgets every live turn's
+    // dedupe key at once and would let each of them surface a duplicate card.
+    while (surfacedComputerControlDenials.size >= SURFACED_DENIALS_MAX) {
+      surfacedComputerControlDenials.delete(surfacedComputerControlDenials.keys().next().value!);
+    }
+    surfacedComputerControlDenials.add(dedupeKey);
+    const marker = stableGatewayDigest({
+      kind: "computer-control-denied",
+      threadId: denial.callerThreadId,
+      turnId: denial.callerTurnId,
+      // Part of the identity for the same reason it is part of the dedupe key:
+      // two cards naming different tools are two different cards, and sharing
+      // one command id would make the second a replay of the first.
+      toolName: denial.toolName,
+    });
+    const createdAt = isoNow();
+    return orchestrationEngine
+      .dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.makeUnsafe(`agent:${marker}:computer-control-denied`),
+        threadId: ThreadId.makeUnsafe(denial.callerThreadId),
+        activity: {
+          id: EventId.makeUnsafe(`gateway:${marker}:computer-control-denied`),
+          tone: "error",
+          kind: COMPUTER_CONTROL_DENIED_ACTIVITY_KIND,
+          summary: "Computer control is off for this chat",
+          payload: { toolName: denial.toolName },
+          turnId: denial.callerTurnId === null ? null : TurnId.makeUnsafe(denial.callerTurnId),
+          createdAt,
+        },
+        createdAt,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("agent gateway could not surface computer-control denial", {
+            callerThreadId: denial.callerThreadId,
+            toolName: denial.toolName,
+            error: errorText(error),
+          }),
+        ),
+        Effect.asVoid,
+      );
+  };
+
+  // First mutation of a turn prepends a transcript line naming the switch.
+  // The disclosure rides as its own activity so the chat says Computer
+  // control is ON from the first input, once per turn.
+  const COMPUTER_CONTROL_ON_DISCLOSURE =
+    "Computer control ON for this turn: the agent is driving the desktop and the user can switch it off in Settings.";
+  const surfacedComputerControlDisclosures = new Set<string>();
+  const SURFACED_CONTROL_DISCLOSURES_MAX = 512;
+  const surfaceComputerControlDisclosure = (
+    threadId: string,
+    turnId: string | null,
+  ): Effect.Effect<void> => {
+    const dedupeKey = `${threadId}:${turnId ?? "no-turn"}`;
+    if (surfacedComputerControlDisclosures.has(dedupeKey)) return Effect.void;
+    while (surfacedComputerControlDisclosures.size >= SURFACED_CONTROL_DISCLOSURES_MAX) {
+      surfacedComputerControlDisclosures.delete(
+        surfacedComputerControlDisclosures.keys().next().value!,
+      );
+    }
+    surfacedComputerControlDisclosures.add(dedupeKey);
+    const marker = stableGatewayDigest({
+      kind: "computer-control-disclosure",
+      threadId,
+      turnId,
+    });
+    const createdAt = isoNow();
+    return orchestrationEngine
+      .dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.makeUnsafe(`agent:${marker}:computer-control-on`),
+        threadId: ThreadId.makeUnsafe(threadId),
+        activity: {
+          id: EventId.makeUnsafe(`gateway:${marker}:computer-control-on`),
+          tone: "info",
+          kind: "computer.control-disclosure",
+          summary: COMPUTER_CONTROL_ON_DISCLOSURE,
+          payload: { disclosure: COMPUTER_CONTROL_ON_DISCLOSURE },
+          turnId: turnId === null ? null : TurnId.makeUnsafe(turnId),
+          createdAt,
+        },
+        createdAt,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("agent gateway could not surface computer-control disclosure", {
+            callerThreadId: threadId,
+            error: errorText(error),
+          }),
+        ),
+        Effect.asVoid,
+      );
+  };
+
+  // One setup card per (thread, turn): an agent that hits a missing grant
+  // typically retries the same tool several times in a row, and repeated cards
+  // would bury the chat. The decider appends activities verbatim, so the dedupe
+  // lives here.
+  const surfacedComputerSetupPrompts = new Set<string>();
+  const SURFACED_SETUP_PROMPTS_MAX = 512;
+  const surfaceComputerSetupRequired = (input: {
+    readonly toolName: string;
+    readonly missing: readonly ComputerPermission[];
+    readonly buildSignature?: ComputerBuildSignature;
+    /** The app macOS holds responsible for the grants, when the desktop shell reported one. */
+    readonly bundleId?: string;
+    readonly context: ToolContext;
+  }): Effect.Effect<void> => {
+    const callerThreadId = input.context.callerThreadId;
+    const callerTurnId = input.context.callerTurnId;
+    // Keyed by which grants are missing as well as by the turn. One card per
+    // turn is right for the same gap reported by ten calls; it was wrong for a
+    // second, different gap discovered in the same turn — a run that lost
+    // Accessibility after already reporting Screen Recording showed the user
+    // one card naming the wrong permission and nothing about the other.
+    const missingKey = [...input.missing].sort().join(",");
+    const dedupeKey = `${callerThreadId}:${callerTurnId ?? "no-turn"}:${missingKey}`;
+    if (surfacedComputerSetupPrompts.has(dedupeKey)) return Effect.void;
+    // FIFO eviction, not a wholesale clear: clearing forgets every live turn's
+    // dedupe key at once and would let each of them surface a duplicate card.
+    while (surfacedComputerSetupPrompts.size >= SURFACED_SETUP_PROMPTS_MAX) {
+      surfacedComputerSetupPrompts.delete(surfacedComputerSetupPrompts.keys().next().value!);
+    }
+    surfacedComputerSetupPrompts.add(dedupeKey);
+    const marker = stableGatewayDigest({
+      kind: "computer-setup-required",
+      threadId: callerThreadId,
+      turnId: callerTurnId,
+      // Part of the identity for the same reason it is part of the dedupe key:
+      // two cards naming different grants are two different cards, and sharing
+      // one command id would make the second a replay of the first.
+      missing: missingKey,
+    });
+    const createdAt = isoNow();
+    return orchestrationEngine
+      .dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.makeUnsafe(`agent:${marker}:computer-setup-required`),
+        threadId: ThreadId.makeUnsafe(callerThreadId),
+        activity: {
+          id: EventId.makeUnsafe(`gateway:${marker}:computer-setup-required`),
+          tone: "error",
+          kind: COMPUTER_SETUP_REQUIRED_ACTIVITY_KIND,
+          summary: "Computer control needs setup",
+          // The grant names ride along so the card can say which permission is
+          // missing rather than "a permission Synara needs"; an empty list is a
+          // backend that refused without naming one, and the card falls back.
+          // The build signature rides with them because on a locally built copy
+          // the switch in System Settings can already be on — its grant pinned
+          // to a binary a rebuild replaced — and the card has to say so.
+          payload: {
+            toolName: input.toolName,
+            missing: [...input.missing],
+            ...(input.buildSignature === undefined ? {} : { buildSignature: input.buildSignature }),
+            ...(input.bundleId === undefined ? {} : { bundleId: input.bundleId }),
+          } satisfies ComputerSetupRequiredPayload,
+          turnId: callerTurnId === null ? null : TurnId.makeUnsafe(callerTurnId),
+          createdAt,
+        },
+        createdAt,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("agent gateway could not surface a computer setup prompt", {
+            callerThreadId,
+            toolName: input.toolName,
+            error: errorText(error),
+          }),
+        ),
+        Effect.asVoid,
+      );
+  };
+
+  /**
+   * The approval card for one Computer or Device consent prompt: routine task
+   * consent, visible-use consent, or a single-call approval (clipboard reads).
+   * Device names share this path because provider-native permission bridges
+   * cannot see MCP calls and would otherwise let a mutating device action run
+   * unasked.
+   */
+  const publishComputerApproval =
+    (
+      name: string,
+      args: Record<string, unknown>,
+      context: Parameters<NonNullable<AgentGatewayComputerToolsOptions["authorizeAction"]>>[2],
+      approvalScope: "computer-task" | "computer-foreground" | "device-task" | undefined,
+    ) =>
+    async (requestId: string, decision?: ProviderApprovalDecision): Promise<void> => {
+      const deviceTool = name.startsWith("device_");
+      const createdAt = isoNow();
+      const eventKey = `${requestId}:${decision === undefined ? "open" : "resolved"}`;
+      await Effect.runPromise(
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.makeUnsafe(eventKey),
+          threadId: ThreadId.makeUnsafe(context.callerThreadId),
+          activity: {
+            id: EventId.makeUnsafe(eventKey),
+            tone: "info",
+            kind: decision === undefined ? "approval.requested" : "approval.resolved",
+            summary:
+              decision !== undefined
+                ? `${deviceTool ? "Device" : "Computer"} approval resolved`
+                : approvalScope === "computer-foreground"
+                  ? "Show Computer on screen for this task"
+                  : approvalScope === "device-task"
+                    ? "Allow Device for this task"
+                    : approvalScope === "computer-task"
+                      ? "Allow Computer for this task"
+                      : `${deviceTool ? "Device" : "Computer"} action needs approval`,
+            payload: {
+              requestId,
+              requestKind: "tool",
+              requestType: "tool",
+              toolName: name,
+              toolParamsDisplay: computerApprovalDisplayArgs(args),
+              sessionApprovalAvailable: false,
+              ...(approvalScope !== undefined ? { approvalScope } : {}),
+              ...(decision === undefined ? {} : { decision }),
+            },
+            turnId: context.callerTurnId ? TurnId.makeUnsafe(context.callerTurnId) : null,
+            createdAt,
+          },
+          createdAt,
+        }),
+      );
+    };
+
+  /**
+   * The Computer approval path, shared by the desktop tools, the
+   * driver-backed `computer_browser_*` family, and the device family — same
+   * capability, same task-scoped consent, same disclosure. Browser and device
+   * names take task consent like every other mutating computer tool.
+   */
+  const authorizeComputerAction: NonNullable<
+    AgentGatewayComputerToolsOptions["authorizeAction"]
+  > = async (name, args, context, signal) => {
+    await Effect.runPromise(context.assertCallerTurnActive(), { signal });
+    const caller = await Effect.runPromise(
+      snapshotQuery.getThreadShellById(ThreadId.makeUnsafe(context.callerThreadId)),
+      { signal },
+    );
+    if (Option.isNone(caller)) return false;
+    const deviceTool = name.startsWith("device_");
+    // Computer capability is issued only after task activation. Full
+    // access already consents to routine desktop actions, including
+    // foreground delivery; focus is not a second approval boundary.
+    if (caller.value.runtimeMode === "full-access") {
+      if (!deviceTool) {
+        await Effect.runPromise(
+          surfaceComputerControlDisclosure(context.callerThreadId, context.callerTurnId),
+          { signal },
+        ).catch(() => undefined);
+      }
+      return true;
+    }
+    const taskConsent = name !== "computer_read_clipboard" && context.callerTurnId !== null;
+    const requestApproval = taskConsent
+      ? computerApprovalGate.requestTask.bind(computerApprovalGate)
+      : computerApprovalGate.request.bind(computerApprovalGate);
+    const approved = await requestApproval({
+      threadId: context.callerThreadId,
+      turnId: context.callerTurnId ?? "",
+      signal,
+      publish: publishComputerApproval(
+        name,
+        args,
+        context,
+        taskConsent ? (deviceTool ? "device-task" : "computer-task") : undefined,
+      ),
+    });
+    if (approved && !deviceTool) {
+      await Effect.runPromise(
+        surfaceComputerControlDisclosure(context.callerThreadId, context.callerTurnId),
+        { signal },
+      ).catch(() => undefined);
+    }
+    return approved;
+  };
+
+  const {
+    resolveForegroundAuthorization: resolveComputerForegroundAuthorization,
+    requestForegroundConsent: requestComputerForegroundConsent,
+  } = makeComputerForegroundConsent({
+    gate: computerApprovalGate,
+    loadMessages: async (threadId) => {
+      const detail = await Effect.runPromise(
+        snapshotQuery.getThreadDetailById(ThreadId.makeUnsafe(threadId)),
+      );
+      return Option.isNone(detail) ? undefined : detail.value.messages;
+    },
+    knownAppNames: () => computerService?.manager.observedAppNames() ?? [],
+    publish: (name, args, context) =>
+      publishComputerApproval(name, args, context, "computer-foreground"),
+  });
+
+  const resolveComputerSpaceDesignation: NonNullable<
+    AgentGatewayComputerToolsOptions["resolveSpaceDesignation"]
+  > = async (context) => {
+    const detail = await Effect.runPromise(
+      snapshotQuery.getThreadDetailById(ThreadId.makeUnsafe(context.callerThreadId)),
+    );
+    return Option.isNone(detail) ? [] : computerSpaceDesignationForMessages(detail.value.messages);
+  };
+
+  // Construct the browser family once so help reads the same conditional
+  // catalog the gateway exposes; a desktop-only backend has no browser entries.
+  const computerBrowserTools =
+    computerService?.supported === true && computerService.manager.supportsBrowser
+      ? makeAgentGatewayComputerBrowserTools({
+          manager: computerService.manager,
+          authorizeAction: authorizeComputerAction,
+          resolveForegroundAuthorization: resolveComputerForegroundAuthorization,
+          requestForegroundConsent: requestComputerForegroundConsent,
+          resolveWorkspaceRoot,
+        })
+      : [];
 
   const tools: ReadonlyArray<ToolEntry> = [
     ...readTools,
@@ -725,19 +1245,57 @@ export const makeAgentGateway = Effect.gen(function* () {
     sendMessage,
     interruptThread,
     setThreadTitle,
+    setThreadPullRequest,
     setThreadArchived,
     setThreadGoal,
     ...automationTools,
     ...browserTools,
     ...(deviceService?.supported === true
-      ? makeAgentGatewayDeviceTools({ manager: deviceService.manager })
+      ? makeAgentGatewayDeviceTools({
+          manager: deviceService.manager,
+          authorizeAction: authorizeComputerAction,
+        })
       : []),
+    ...(computerService?.supported === true
+      ? makeAgentGatewayComputerTools({
+          manager: computerService.manager,
+          onSetupRequired: surfaceComputerSetupRequired,
+          authorizeAction: authorizeComputerAction,
+          resolveForegroundAuthorization: resolveComputerForegroundAuthorization,
+          requestForegroundConsent: requestComputerForegroundConsent,
+          resolveSpaceDesignation: resolveComputerSpaceDesignation,
+          relatedTools: computerBrowserTools,
+        })
+      : []),
+    ...computerBrowserTools,
+    // Group tools are Beta-only: Stable does not offer them to agents at all.
+    ...(isServerGroupsEnabled() ? projectAgentTools : []),
   ];
+
+  // The computer family by name, read off the unfiltered catalog above: a
+  // caller whose session was never granted computer control still gets a
+  // capability_denied (and the denial card) when it calls one of these by
+  // name, even though tools/list never advertised them to it.
+  const computerToolNames = new Set(
+    tools
+      .filter((tool) => tool.requiredCapability === COMPUTER_CONTROL_CAPABILITY)
+      .map((tool) => tool.definition.name),
+  );
+
   return {
     handleMcpPost: makeAgentGatewayMcpTransport({
       credentials,
       snapshotQuery,
       tools,
+      onCapabilityDenied: surfaceCapabilityDenial,
+      // Namespace-insensitive: a session that never saw the catalog reaches
+      // for prefixed spellings (synara_computer_click,
+      // mcp__synara__computer_click). Those must deny with the card, never die
+      // as Unknown-tool. The exact set stays as a backstop for any catalog
+      // computer name outside the static family list.
+      isComputerToolName: (toolName) =>
+        computerToolNames.has(toolName) || isSynaraComputerToolFamilyName(toolName),
+      computerControlCapability: COMPUTER_CONTROL_CAPABILITY,
       instructions: AGENT_GATEWAY_INSTRUCTIONS,
       requireThreadShell,
     }),
