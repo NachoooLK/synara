@@ -1442,7 +1442,11 @@ describe("AppSnap window picker requests", () => {
       await vi.advanceTimersByTimeAsync(20_000);
       await assertion;
       releaseRename();
-      for (let index = 0; index < 6; index += 1) await flushPromises();
+      // Wait for the durable image, metadata and helper capture to be deleted;
+      // a fixed number of event-loop turns does not drain filesystem work.
+      await vi.waitFor(async () => {
+        expect(await FS.promises.readdir(captureDirectory)).toEqual([]);
+      });
 
       expect(onCaptured).not.toHaveBeenCalled();
       expect(await manager.listPendingCaptures()).toHaveLength(0);
@@ -1667,17 +1671,20 @@ describe("AppSnap permission guide", () => {
   });
 
   it("writes close and SIGTERMs the guide when hidden", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const { manager, guideChild, dispose } = await createGuideManager();
     try {
       manager.hidePermissionGuide();
       await flushPromises();
       expect(guideChild.stdin.read()?.toString().trimEnd()).toBe("close");
       expect(guideChild.kill).not.toHaveBeenCalled();
-      // Wait for the 500 ms SIGTERM delay to elapse.
-      await new Promise<void>((resolve) => setTimeout(resolve, 600));
+      await vi.advanceTimersByTimeAsync(499);
+      expect(guideChild.kill).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
       expect(guideChild.kill).toHaveBeenCalledWith("SIGTERM");
     } finally {
       dispose();
+      vi.useRealTimers();
     }
   });
 

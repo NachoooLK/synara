@@ -24,7 +24,7 @@ export function ComposerWorkspaceStatus({
   return (
     <div
       data-testid="composer-workspace-status"
-      className="inline-flex min-w-0 max-w-[min(70%,28rem)] items-center gap-1.5 rounded-full border border-[color:var(--surface-border)] bg-[var(--color-background-elevated-secondary)]/70 px-2 py-1 text-[length:var(--app-font-size-ui-sm,11px)] leading-none font-normal text-[var(--color-text-foreground-secondary)]"
+      className="inline-flex min-w-0 max-w-[min(70%,28rem)] items-center gap-1.5 rounded-full border border-[color:var(--surface-border)] bg-[var(--color-background-elevated-secondary)]/70 px-2 py-1 text-ui-sm leading-none font-normal text-[var(--color-text-foreground-secondary)]"
       title={title}
       aria-label={title}
     >

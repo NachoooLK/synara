@@ -7,6 +7,16 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+// Fixture-backed installs must not discover a developer's real macOS app.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: (path: Parameters<typeof actual.existsSync>[0]) =>
+      String(path) === "/Applications/Synara Beta.app" ? false : actual.existsSync(path),
+  };
+});
+
 const spawnCalls: { command: string; env: NodeJS.ProcessEnv | undefined }[] = [];
 
 vi.mock("node:child_process", async (importOriginal) => {
