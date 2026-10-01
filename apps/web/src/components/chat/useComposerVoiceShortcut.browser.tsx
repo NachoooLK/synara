@@ -25,6 +25,7 @@ function Harness({
   sessionId = "thread-a",
   startup,
   startups,
+  initialState = "idle",
 }: {
   hold?: boolean;
   enabled?: boolean;
@@ -33,9 +34,10 @@ function Harness({
   sessionId?: string;
   startup?: Promise<void>;
   startups?: readonly Promise<void>[];
+  initialState?: string;
 }) {
   const form = useRef<HTMLFormElement>(null);
-  const [state, setState] = useState("idle");
+  const [state, setState] = useState(initialState);
   const [starts, setStarts] = useState(0);
   const keybindings: ResolvedKeybindingsConfig = [
     {
@@ -229,4 +231,55 @@ it("ignores an old startup failure after a new hold begins", async () => {
   resolveSecond();
   await second;
   await state("cancelled:2");
+});
+
+const escape = { key: "Escape", code: "Escape", altKey: false };
+
+it.each([false, true])("Escape cancels dictation instead of submitting (hold=%s)", async (hold) => {
+  screen = await render(<Harness hold={hold} />);
+  key("keydown");
+  await state("recording:1");
+  expect(key("keydown", escape).defaultPrevented).toBe(true);
+  await state("cancelled:1");
+  key("keyup");
+  await state("cancelled:1");
+});
+
+it("Escape cancels pending startup and permits an immediate retry", async () => {
+  let resolve!: () => void;
+  const startup = new Promise<void>((done) => {
+    resolve = done;
+  });
+  screen = await render(<Harness pending startup={startup} />);
+  key("keydown");
+  await state("starting:1");
+  expect(key("keydown", escape).defaultPrevented).toBe(true);
+  await state("cancelled:1");
+  key("keydown");
+  await state("starting:2");
+  resolve();
+  await startup;
+  key("keydown", escape);
+  await state("cancelled:2");
+});
+
+it("Escape cancels dictation started by the microphone button", async () => {
+  screen = await render(<Harness initialState="recording" />);
+  expect(key("keydown", escape).defaultPrevented).toBe(true);
+  await state("cancelled:0");
+});
+
+it("leaves Escape available when idle or targeted at another editor", async () => {
+  screen = await render(<Harness />);
+  expect(key("keydown", escape).defaultPrevented).toBe(false);
+  await screen.rerender(<Harness initialState="recording" />);
+  key("keydown");
+  await state("recording:1");
+  const input = document.createElement("input");
+  document.body.append(input);
+  const event = new KeyboardEvent("keydown", { ...escape, bubbles: true, cancelable: true });
+  input.dispatchEvent(event);
+  expect(event.defaultPrevented).toBe(false);
+  await state("recording:1");
+  input.remove();
 });

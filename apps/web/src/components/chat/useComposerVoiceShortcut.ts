@@ -40,6 +40,19 @@ export function useComposerVoiceShortcut(options: ComposerVoiceShortcutOptions) 
     const down = (event: KeyboardEvent) => {
       const current = latest.current;
       if (event.defaultPrevented || event.isComposing || !current.canHandleEvent(event)) return;
+      if (
+        event.key === "Escape" &&
+        !current.isTranscribing &&
+        (held || starting || current.isStarting || current.isRecording)
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        held = null;
+        generation += 1;
+        starting = false;
+        current.onCancel();
+        return;
+      }
       const command = resolveShortcutCommand(event, current.keybindings, {
         context: current.context,
       });

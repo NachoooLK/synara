@@ -64,6 +64,8 @@ Neither action has a default shortcut. These shortcuts work while Synara is
 focused and voice transcription is available through a ChatGPT-authenticated
 Codex session. They insert text into the draft without sending it. Hold mode
 cancels if the window loses focus or you release before the microphone opens.
+Press Escape to discard the recording, just like the cancel button, including
+while the microphone is starting.
 
 ### 3. Split views and previews
 
