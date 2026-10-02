@@ -231,6 +231,7 @@ import {
 import { useWorkflowRunUiStore } from "../workflowRunUiStore";
 import { useWorkspacePathsStore } from "../workspacePathsStore";
 import BranchToolbar, { RuntimeUsageControls } from "./BranchToolbar";
+import { resolveBranchToolbarValue } from "./BranchToolbar.logic";
 import {
   ACTIVE_TURN_LAYOUT_SETTLE_DELAY_MS,
   DISMISSED_PROVIDER_HEALTH_BANNERS_KEY,
@@ -374,6 +375,7 @@ import {
   CHAT_SURFACE_HEADER_ROW_CLASS_NAME,
 } from "./chat/chatHeaderControls";
 import type { LateComposerSendHandlers } from "./chat/chatSendTypes";
+import { ComposerWorkspaceStatus } from "./chat/ComposerWorkspaceStatus";
 import { composerTranscriptBottomInsetPx, useComposerOverlayHeight } from "./chat/composerOverlay";
 import {
   CHAT_BACKGROUND_CLASS_NAME,
@@ -2184,6 +2186,15 @@ export default function ChatView({
       )?.name ?? null
     );
   }, [activeProject?.cwd, branchesQuery.data?.branches, gitStatusQuery.data]);
+  const composerWorkspaceBranch = resolveBranchToolbarValue({
+    envMode: resolveThreadEnvironmentMode({
+      envMode: resolvedThreadEnvMode,
+      worktreePath: resolvedThreadWorktreePath,
+    }),
+    activeWorktreePath: resolvedThreadWorktreePath,
+    activeThreadBranch: activeThread?.branch ?? null,
+    currentGitBranch: currentActiveGitBranch,
+  });
   const settledThreadBranchMismatch = resolveSettledThreadBranchMismatch({
     isSettled:
       activeThread?.settledAt != null &&
@@ -5931,6 +5942,13 @@ export default function ChatView({
                     )}
                   </div>
                 ) : null}
+                <div className="flex min-h-5 min-w-0 justify-end pb-1">
+                  <ComposerWorkspaceStatus
+                    envMode={resolvedThreadEnvMode}
+                    worktreePath={resolvedThreadWorktreePath}
+                    branch={composerWorkspaceBranch}
+                  />
+                </div>
                 {!isComposerApprovalState &&
                   pendingUserInputs.length === 0 &&
                   isPreparingComposerImages && (

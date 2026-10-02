@@ -2149,6 +2149,12 @@ async function mountChatView(options: {
   ) : (
     <RouterProvider router={router} />
   );
+  // Compile matched lazy route components before the composer readiness deadline.
+  await Promise.all(
+    router
+      .getMatchedRoutes(router.latestLocation.pathname)
+      .matchedRoutes.map((route) => router.loadRouteChunk(route, ["component"])),
+  );
   const screen = await render(content, {
     container: host,
   });
