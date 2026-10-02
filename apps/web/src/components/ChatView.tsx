@@ -5942,13 +5942,15 @@ export default function ChatView({
                     )}
                   </div>
                 ) : null}
-                <div className="flex min-h-5 min-w-0 justify-end pb-1">
-                  <ComposerWorkspaceStatus
-                    envMode={resolvedThreadEnvMode}
-                    worktreePath={resolvedThreadWorktreePath}
-                    branch={composerWorkspaceBranch}
-                  />
-                </div>
+                {!activeThreadIsSidechat && (
+                  <div className="flex min-h-5 min-w-0 justify-end pb-1">
+                    <ComposerWorkspaceStatus
+                      envMode={resolvedThreadEnvMode}
+                      worktreePath={resolvedThreadWorktreePath}
+                      branch={composerWorkspaceBranch}
+                    />
+                  </div>
+                )}
                 {!isComposerApprovalState &&
                   pendingUserInputs.length === 0 &&
                   isPreparingComposerImages && (
