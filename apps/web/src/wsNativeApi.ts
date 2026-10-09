@@ -992,6 +992,8 @@ export function createWsNativeApi(): NativeApi {
       // A handler may await other work before it answers, like a command.
       dispatchUi: (input) =>
         transport.request(MODS_WS_METHODS.dispatchUi, input, { timeoutMs: null }),
+      export: (input) => transport.request(MODS_WS_METHODS.export, input),
+      import: (input) => transport.request(MODS_WS_METHODS.import, input),
       // Subscribed on demand, not at startup: Stable refuses the stream.
       onEvent: (callback) =>
         transport.subscribe(MODS_WS_CHANNELS.event, (message) => callback(message.data)),

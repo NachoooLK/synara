@@ -30,6 +30,17 @@ export async function resolveModSkillSourceDir(): Promise<string | null> {
   return null;
 }
 
+/** The icon names a mod may use, one per line in the skill's `reference/icons.txt`. */
+export async function readModIconNames(sourceDir: string): Promise<ReadonlySet<string>> {
+  const text = await fs.readFile(path.join(sourceDir, "reference", "icons.txt"), "utf8");
+  return new Set(
+    text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0),
+  );
+}
+
 async function listFiles(root: string, relative = ""): Promise<string[]> {
   const entries = await fs.readdir(path.join(root, relative), { withFileTypes: true });
   const files: string[] = [];

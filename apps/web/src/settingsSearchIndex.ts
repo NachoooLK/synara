@@ -4,6 +4,7 @@
 // Layer: Route/UI support
 // Exports: entry type, the index, section label lookup, and the ranking helper
 
+import { MODS_ON } from "~/betaFeatures";
 import { rankProviderDiscoveryItems } from "~/lib/providerDiscovery";
 import {
   settingRowAnchorId,
@@ -583,6 +584,36 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
     keywords:
       "Choose up to two provider accounts for usage rings at the bottom of the sidebar rail. multiple Claude accounts quota",
     target: null,
+  },
+
+  // ── Mods (Beta only) ──────────────────────────────────────────────────────────
+  // The panel's rows depend on the mods snapshot, so every entry opens the section.
+  {
+    id: "mods:mods",
+    section: "mods",
+    title: "Mods",
+    keywords:
+      "Enable, disable and reload mods that add commands, views and hooks to Synara. plugins extensions add-ons installed log",
+    target: null,
+    applies: () => MODS_ON,
+  },
+  {
+    id: "mods:import-export",
+    section: "mods",
+    title: "Import or export a mod",
+    keywords:
+      "Import a mod someone shared, or export one as a .synara-mod.json file. mods plugins extensions install share",
+    target: null,
+    applies: () => MODS_ON,
+  },
+  {
+    id: "mods:folder",
+    section: "mods",
+    title: "Mods folder",
+    keywords:
+      "Where mods live on disk. Reveal the folder to add one by hand. mods plugins extensions location path directory",
+    target: null,
+    applies: () => MODS_ON,
   },
 
   // ── Advanced ──────────────────────────────────────────────────────────────────

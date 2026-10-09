@@ -3,6 +3,7 @@ import { assert, describe, it } from "vitest";
 import {
   areSidebarSearchThreadListsEqual,
   buildSidebarSearchServerThreadMatches,
+  isStrongSidebarSearchActionMatch,
   matchSidebarSearchActions,
   matchSidebarSearchProjects,
   matchSidebarSearchThemes,
@@ -224,6 +225,31 @@ describe("SidebarSearchPalette.logic", () => {
       result.map((theme) => theme.id),
       ["theme-mode-dark", "theme-codex-dark", "theme-linear-dark"],
     );
+  });
+
+  it("lets an action lead the results only when the query matches its label", () => {
+    const withModCommand: SidebarSearchAction[] = [
+      ...actions,
+      {
+        id: "mod-command:kitchen-sink:open",
+        label: "Open kitchen sink",
+        description: "A command from the kitchen-sink mod.",
+        keywords: ["mod", "mods", "kitchen-sink"],
+        requiresQuery: true,
+      },
+    ];
+    const best = (query: string) => matchSidebarSearchActions(withModCommand, query)[0];
+
+    // Typing the command's title (or its start) makes it the highlighted first row.
+    assert.isTrue(isStrongSidebarSearchActionMatch(best("open kitchen sink"), "open kitchen sink"));
+    assert.isTrue(isStrongSidebarSearchActionMatch(best("Open kit"), "Open kit"));
+    // Keyword, description and mid-label hits keep threads first.
+    assert.isFalse(isStrongSidebarSearchActionMatch(best("mods"), "mods"));
+    assert.isFalse(isStrongSidebarSearchActionMatch(best("kitchen"), "kitchen"));
+    assert.isFalse(isStrongSidebarSearchActionMatch(best("remaining"), "remaining"));
+    // The idle palette keeps its own order.
+    assert.isFalse(isStrongSidebarSearchActionMatch(best(""), ""));
+    assert.isFalse(isStrongSidebarSearchActionMatch(undefined, "open"));
   });
 
   it("matches projects by repo name before cwd fragments", () => {

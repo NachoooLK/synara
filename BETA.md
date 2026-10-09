@@ -284,7 +284,8 @@ To put a feature behind the list:
 
 Promote a feature to Stable by deleting its entry; every gate resolves itself.
 
-The list currently contains `groups` (Hubs), gated off in Stable.
+The list currently contains `groups` (Hubs) and `mods` ([Mods](docs/mods.md)), gated off in
+Stable.
 Tasks, Inbox, and Auto-fix CI are available in both apps.
 Oh My Pi, the rail sidebar layout, and message trail
 sound are available in both Stable and Beta.
@@ -297,6 +298,14 @@ creating a hub; the web hides the Hubs tab, route, setting, and
 thread actions, and shows any existing hub folder as an ordinary project so its
 chats stay reachable. The gate lives in
 `apps/server/src/projectAgent/groupsBetaGate.ts` and `GROUPS_ON` in
+`apps/web/src/betaFeatures.ts`.
+
+On the Stable desktop app, mods are inert (like every Beta-only feature, hosts
+without a desktop flavor, such as the CLI, keep them on): the server does not scan the mods folder or start any
+mod, refuses every `mods.*` method and the mod gateway tools, and leaves the
+mods folder, the enabled list and each mod's saved data untouched; the web hides
+Settings → Mods, the mod views and their commands. The gate is `available` in
+`apps/server/src/mods/Layers/ModHost.ts` and `MODS_ON` in
 `apps/web/src/betaFeatures.ts`.
 
 Tasks and its delegation APIs are available in Stable and Beta. Tasks takes

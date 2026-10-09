@@ -60,6 +60,10 @@ import type {
 import type {
   ModsDispatchUiInput,
   ModsDispatchUiResult,
+  ModsExportInput,
+  ModsExportResult,
+  ModsImportInput,
+  ModsImportResult,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
@@ -1503,6 +1507,10 @@ export interface NativeApi {
     runCommand: (input: ModsRunCommandInput) => Promise<ModsRunCommandResult>;
     renderView: (input: ModsRenderViewInput) => Promise<ModsRenderViewResult>;
     dispatchUi: (input: ModsDispatchUiInput) => Promise<ModsDispatchUiResult>;
+    /** One mod's folder as the text of a `<name>.synara-mod.json` file. */
+    export: (input: ModsExportInput) => Promise<ModsExportResult>;
+    /** Installs an exported mod, turned off until the person enables it. */
+    import: (input: ModsImportInput) => Promise<ModsImportResult>;
     /** Opens the mods stream while at least one callback listens. */
     onEvent: (callback: (event: ModsStreamEvent) => void) => () => void;
   };

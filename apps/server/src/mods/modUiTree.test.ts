@@ -42,6 +42,8 @@ describe("normalizeModUiTree", () => {
     });
     expect(normalizeModUiTree(null)).toBeNull();
     expect(normalizeModUiTree(undefined)).toBeNull();
+    expect(normalizeModUiTree([])).toBeNull();
+    expect(normalizeModUiTree([null, false])).toBeNull();
   });
 
   it("rejects elements without a type and trees past the limits", () => {

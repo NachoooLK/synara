@@ -3080,8 +3080,12 @@ const makeWsRpcHandlersLayer = () =>
             : Stream.fail(tasksUnavailableError()),
 
         [MODS_WS_METHODS.list]: () => modHost.list().pipe(Effect.mapError(toModsRpcError)),
+        // Turning a mod on runs code with Synara's access, so only the owner's own
+        // session may do it (or install one); a paired device may still turn one off.
         [MODS_WS_METHODS.setEnabled]: (input) =>
-          modHost.setEnabled(input).pipe(Effect.mapError(toModsRpcError)),
+          (input.enabled ? requireWsOwnerSession : Effect.void).pipe(
+            Effect.andThen(modHost.setEnabled(input).pipe(Effect.mapError(toModsRpcError))),
+          ),
         [MODS_WS_METHODS.reload]: (input) =>
           modHost.reload(input).pipe(Effect.mapError(toModsRpcError)),
         [MODS_WS_METHODS.readLogs]: (input) =>
@@ -3092,11 +3096,21 @@ const makeWsRpcHandlersLayer = () =>
           modHost.renderView(input).pipe(Effect.mapError(toModsRpcError)),
         [MODS_WS_METHODS.dispatchUi]: (input) =>
           modHost.dispatchUi(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.export]: (input) =>
+          requireWsOwnerSession.pipe(
+            Effect.andThen(modHost.export(input).pipe(Effect.mapError(toModsRpcError))),
+          ),
+        [MODS_WS_METHODS.import]: (input) =>
+          requireWsOwnerSession.pipe(
+            Effect.andThen(modHost.import(input).pipe(Effect.mapError(toModsRpcError))),
+          ),
         [MODS_WS_METHODS.subscribeEvents]: (_, { clientId }) =>
           streamAdmission.guard(
             clientId,
             { key: "mods.events" },
-            modHost.streamEvents.pipe(Stream.mapError(toModsRpcError)),
+            bufferLiveUiStream(modHost.streamEvents.pipe(Stream.mapError(toModsRpcError)), {
+              label: "mods.events",
+            }),
           ),
 
         ...makeWsDeviceHandlers(deviceService),

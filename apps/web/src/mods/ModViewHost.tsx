@@ -4,10 +4,13 @@
 //          mod, applying what the handler asked of the window.
 // Layer: Web mods UI
 
-import type { ModUiEffect, ModUiTree, ModViewContext } from "@synara/contracts";
+import type { ModUiEffect, ModUiTree, ModViewContext, ModViewSite } from "@synara/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 
+import { PanelStateMessage } from "~/components/chat/PanelStateMessage";
+import { Button } from "~/components/ui/button";
+import { Spinner } from "~/components/ui/spinner";
 import { toastManager } from "~/components/ui/toast";
 import { openExternalLink } from "~/lib/linkChips";
 import { cn } from "~/lib/utils";
@@ -37,6 +40,8 @@ export function ModViewHost(props: {
   modId: string;
   viewId: string;
   context: ModViewContext;
+  /** Where the view is drawn; elements match that place's own controls. */
+  site?: ModViewSite;
   className?: string;
   /** Hides errors and loading for small sites (band, header) where a notice would not fit. */
   quiet?: boolean;
@@ -51,37 +56,69 @@ export function ModViewHost(props: {
   const modVersion = useModsStore(
     (state) => state.viewVersions[modViewVersionKey(modId, null)] ?? 0,
   );
+  const mod = useModsStore((state) => state.snapshot?.mods.find((entry) => entry.id === modId));
   // A reload replaces the mod's handlers, so the view draws again after one.
-  const loadedAt = useModsStore(
-    (state) => state.snapshot?.mods.find((mod) => mod.id === modId)?.loadedAt ?? null,
-  );
+  const loadedAt = mod?.loadedAt ?? null;
+  const status = mod?.status ?? null;
+  const modError = mod?.error ?? null;
   const [state, setState] = useState<ViewState>({ tree: null, error: null, loaded: false });
   const [retry, setRetry] = useState(0);
+  // One render in flight per view; requests that arrive meanwhile collapse into
+  // one more, with the newest inputs, so a burst of redraws costs two renders.
+  const inFlight = useRef(false);
+  const queued = useRef(false);
+  const renderLatest = useRef<() => void>(() => undefined);
+  const lastTreeJson = useRef<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-    void ensureNativeApi()
-      .mods.renderView({
-        modId,
-        viewId,
-        context: { threadId: context.threadId, projectId: context.projectId },
-      })
-      .then(
-        (result) => {
-          if (!cancelled) setState({ tree: result.tree, error: null, loaded: true });
-        },
-        (error: unknown) => {
-          if (cancelled) return;
-          // Keep the last tree on screen; the error shows above it.
-          setState((previous) => ({
-            ...previous,
-            error: error instanceof Error ? error.message : "The mod could not draw this view.",
-            loaded: true,
-          }));
-        },
-      );
+    if (status !== "running") return;
+    let current = true;
+    renderLatest.current = () => {
+      inFlight.current = true;
+      void ensureNativeApi()
+        .mods.renderView({
+          modId,
+          viewId,
+          context: { threadId: context.threadId, projectId: context.projectId },
+        })
+        .then(
+          (result) => {
+            if (!current) return;
+            // Most redraws during a turn return the same tree; skip drawing it again.
+            const json = JSON.stringify(result.tree);
+            if (json === lastTreeJson.current) {
+              setState((previous) =>
+                previous.error === null && previous.loaded
+                  ? previous
+                  : { ...previous, error: null, loaded: true },
+              );
+              return;
+            }
+            lastTreeJson.current = json;
+            setState({ tree: result.tree, error: null, loaded: true });
+          },
+          (error: unknown) => {
+            if (!current) return;
+            // Keep the last tree on screen; the error shows above it.
+            setState((previous) => ({
+              ...previous,
+              error: error instanceof Error ? error.message : "The mod could not draw this view.",
+              loaded: true,
+            }));
+          },
+        )
+        .finally(() => {
+          inFlight.current = false;
+          if (queued.current) {
+            queued.current = false;
+            renderLatest.current();
+          }
+        });
+    };
+    if (inFlight.current) queued.current = true;
+    else renderLatest.current();
     return () => {
-      cancelled = true;
+      current = false;
     };
   }, [
     modId,
@@ -91,6 +128,7 @@ export function ModViewHost(props: {
     viewVersion,
     modVersion,
     loadedAt,
+    status,
     retry,
   ]);
 
@@ -110,55 +148,88 @@ export function ModViewHost(props: {
 
   const dispatch: ModUiDispatch = (handler, payload) => {
     const handlerId = (handler as { readonly $handler: string }).$handler;
-    void ensureNativeApi()
+    return ensureNativeApi()
       .mods.dispatchUi({ modId, handlerId, payload: (payload ?? null) as never })
       .then(
         (result) => {
           for (const effect of result.effects) applyEffect(effect);
+          return true;
         },
         (error: unknown) => {
           const message = error instanceof Error ? error.message : "The mod did not answer.";
           if (message.includes(STALE_HANDLER_MESSAGE)) {
             setRetry((count) => count + 1);
-            return;
+            return false;
           }
           toastManager.add({
             type: "error",
-            title: `The ${modId} mod failed`,
-            description: message,
+            title: "Could not finish that action",
+            description: `${message} (from the ${modId} mod)`,
           });
+          return false;
         },
       );
   };
 
+  const openModsSettings = () => void navigate({ to: "/settings", search: { section: "mods" } });
+
   if (quiet) {
-    if (state.tree === null) return null;
+    if (status !== "running" || state.tree === null) return null;
     const content = (
       <div className={props.className}>
-        <ModUiRenderer tree={state.tree} dispatch={dispatch} />
+        <ModUiRenderer tree={state.tree} dispatch={dispatch} site={props.site} />
       </div>
     );
     return props.frame ? props.frame(content) : content;
   }
 
+  if (status !== "running") {
+    return (
+      <div className={cn("flex min-h-0 min-w-0 flex-col", props.className)}>
+        <PanelStateMessage className="flex-col gap-3">
+          <span>
+            {status === "starting"
+              ? `The ${modId} mod is starting…`
+              : status === "error"
+                ? `The ${modId} mod stopped${modError ? `: ${modError}` : "."}`
+                : `The ${modId} mod is off.`}
+          </span>
+          {status === "starting" ? null : (
+            <Button size="xs" variant="outline" onClick={openModsSettings}>
+              Open Mods settings
+            </Button>
+          )}
+        </PanelStateMessage>
+      </div>
+    );
+  }
+
   return (
-    <div className={cn("flex min-h-0 min-w-0 flex-col", props.className)}>
+    <div className={cn("flex min-h-0 min-w-0 flex-col [&>*]:shrink-0", props.className)}>
       {state.error ? (
-        <div className="mx-2 my-1 flex items-start justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/6 px-2 py-1.5 text-ui-sm text-destructive">
+        <div
+          role="alert"
+          className="mx-2 my-1 flex items-start justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/6 px-2 py-1.5 text-ui-sm text-destructive"
+        >
           <span className="min-w-0 break-words whitespace-pre-wrap">{state.error}</span>
-          <button
-            type="button"
-            className="shrink-0 underline-offset-2 hover:underline"
-            onClick={() => setRetry((count) => count + 1)}
-          >
-            Retry
-          </button>
+          <span className="flex shrink-0 items-center gap-1">
+            <Button size="xs" variant="ghost" onClick={() => setRetry((count) => count + 1)}>
+              Retry
+            </Button>
+            <Button size="xs" variant="ghost" onClick={openModsSettings}>
+              Log
+            </Button>
+          </span>
         </div>
       ) : null}
       {!state.loaded ? (
-        <span className="px-3 py-2 text-ui-sm text-muted-foreground">Loading…</span>
+        <PanelStateMessage>
+          <Spinner className="size-4" aria-label="Loading the view" />
+        </PanelStateMessage>
+      ) : state.tree === null && state.error === null ? (
+        <PanelStateMessage>Nothing to show.</PanelStateMessage>
       ) : (
-        <ModUiRenderer tree={state.tree} dispatch={dispatch} />
+        <ModUiRenderer tree={state.tree} dispatch={dispatch} site={props.site} />
       )}
     </div>
   );

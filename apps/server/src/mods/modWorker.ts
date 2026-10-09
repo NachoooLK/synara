@@ -31,7 +31,6 @@ if (!port) {
 }
 
 const post = (message: WorkerToHostMessage): void => {
-  // oxlint-disable-next-line unicorn/require-post-message-target-origin -- a worker_threads port, not window.postMessage
   port.postMessage(message);
 };
 
@@ -144,12 +143,103 @@ function requireFrom(fromFile: string, specifier: string): unknown {
   );
 }
 
+const ASYNC_PREFIX = "async ";
+const ARROW_REFINE_LIMIT = 8;
+
+interface ParseFailure {
+  readonly message: string;
+  readonly pos: number | null;
+}
+
+function parseFailure(error: unknown): ParseFailure {
+  // Sucrase reports "Error transforming <path>: <problem> (line:column)"; keep the problem.
+  const message = (error instanceof Error ? error.message : String(error))
+    .replace(/^Error transforming [^:]*: /u, "")
+    .replace(/ \(\d+:\d+\)$/u, "");
+  const pos = (error as { readonly pos?: unknown }).pos;
+  return { message, pos: typeof pos === "number" ? pos : null };
+}
+
+/** Where the parameters of the arrow whose `=>` starts at `arrow` begin, or null. */
+function arrowHeadStart(code: string, arrow: number): number | null {
+  if (!code.startsWith("=>", arrow)) return null;
+  let index = arrow - 1;
+  while (index >= 0 && /\s/u.test(code[index]!)) index -= 1;
+  let start: number;
+  if (code[index] === ")") {
+    let depth = 0;
+    for (; index >= 0; index -= 1) {
+      if (code[index] === ")") depth += 1;
+      else if (code[index] === "(" && --depth === 0) break;
+    }
+    if (index < 0) return null;
+    start = index;
+  } else {
+    while (index >= 0 && /[\w$]/u.test(code[index]!)) index -= 1;
+    start = index + 1;
+    if (start > arrow - 1) return null;
+  }
+  return /async\s*$/u.test(code.slice(0, start)) ? null : start;
+}
+
+/**
+ * Sucrase reports a mistake inside a non-async arrow function at that arrow's
+ * `=>`, so most errors in `register = (on) => { … }` would point at line 1.
+ * Marking the arrow `async` makes it parse the body, and the error moves to
+ * where it is; repeat for nested arrows. The changed source is only parsed,
+ * never run, and the position is mapped back to the file as written.
+ */
+function locateSyntaxError(
+  source: string,
+  first: ParseFailure,
+  parse: (code: string) => void,
+): ParseFailure {
+  let code = source;
+  let current = first;
+  const insertions: number[] = [];
+  for (let step = 0; step < ARROW_REFINE_LIMIT && current.pos !== null; step += 1) {
+    const head = arrowHeadStart(code, current.pos);
+    if (head === null) break;
+    const candidate = `${code.slice(0, head)}${ASYNC_PREFIX}${code.slice(head)}`;
+    let next: ParseFailure | null = null;
+    try {
+      parse(candidate);
+    } catch (error) {
+      next = parseFailure(error);
+    }
+    // Only a failure further on, inside that arrow, is a better answer.
+    if (next?.pos == null || next.pos <= current.pos + ASYNC_PREFIX.length) break;
+    code = candidate;
+    insertions.push(head);
+    current = next;
+  }
+  let pos = current.pos;
+  if (pos === null) return current;
+  for (const head of insertions.toReversed()) if (pos > head) pos -= ASYNC_PREFIX.length;
+  return { message: current.message, pos };
+}
+
+/** "problem (line:column)" and the line with a caret under the column. */
+function describeSyntaxError(source: string, failure: ParseFailure): string {
+  if (failure.pos === null) return failure.message;
+  const before = source.slice(0, failure.pos);
+  const line = before.split("\n").length;
+  const column = failure.pos - (before.lastIndexOf("\n") + 1) + 1;
+  const text = source.split("\n")[line - 1] ?? "";
+  const gutter = String(line);
+  return [
+    `${failure.message} (${line}:${column})`,
+    `  ${gutter} | ${text}`,
+    `  ${" ".repeat(gutter.length)} | ${" ".repeat(column - 1)}^`,
+  ].join("\n");
+}
+
 function compile(file: string, source: string): string {
   const transforms: Transform[] = ["imports"];
   if (/\.[cm]?tsx?$/u.test(file)) transforms.push("typescript");
   if (file.endsWith(".tsx") || file.endsWith(".jsx")) transforms.push("jsx");
-  try {
-    return transform(source, {
+  const run = (code: string) =>
+    transform(code, {
       transforms,
       filePath: file,
       jsxPragma: "h",
@@ -157,13 +247,13 @@ function compile(file: string, source: string): string {
       production: true,
       disableESTransforms: true,
     }).code;
+  try {
+    return run(source);
   } catch (error) {
-    // Sucrase reports "Error transforming <path>: <problem> (line:column)"; keep the problem.
-    const problem = (error instanceof Error ? error.message : String(error)).replace(
-      /^Error transforming [^:]*: /u,
-      "",
+    const failure = locateSyntaxError(source, parseFailure(error), run);
+    const syntaxError = new SyntaxError(
+      `${path.relative(modRoot, file)}: ${describeSyntaxError(source, failure)}`,
     );
-    const syntaxError = new SyntaxError(`${path.relative(modRoot, file)}: ${problem}`);
     syntaxError.stack = `SyntaxError: ${syntaxError.message}`;
     throw syntaxError;
   }

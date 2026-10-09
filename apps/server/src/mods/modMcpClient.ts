@@ -1,7 +1,9 @@
 // FILE: modMcpClient.ts
 // Purpose: The MCP client behind a mod's `$.mcp`: one connection per server the
 //          mod's manifest declares, started on first use and closed with the mod.
-//          Local servers speak JSON-RPC over stdio; remote ones streamable HTTP.
+//          Local servers speak JSON-RPC over stdio in their own process tree, with
+//          the filtered environment provider children get; remote ones speak
+//          streamable HTTP under one deadline per request, body included.
 // Layer: Mods runtime
 
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -14,11 +16,25 @@ import {
 } from "@synara/shared/jsonrpc-stdio";
 import { spawnProcess } from "@synara/shared/processRuntime";
 
+import { teardownChildProcessTree } from "../platform/supervisedProcessTeardown.ts";
+import {
+  buildProviderChildEnvironment,
+  withoutProviderCredentialEnvironment,
+} from "../providerChildEnvironment.ts";
+
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MCP_REQUEST_TIMEOUT_MS = 30_000;
+/** Caps one stdio line and one HTTP answer body. */
 const MCP_FRAME_BYTES = 8 * 1024 * 1024;
 const MCP_STDERR_TAIL_CHARS = 2_000;
 const CLIENT_INFO = { name: "synara-mods", version: "1" } as const;
+const INITIALIZE_PARAMS = {
+  protocolVersion: MCP_PROTOCOL_VERSION,
+  capabilities: {},
+  clientInfo: CLIENT_INFO,
+} as const;
+const CLOSED_MESSAGE = "The mod's MCP connection closed.";
+const ENV_REFERENCE = /\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/gu;
 
 export interface ModMcpTool {
   readonly name: string;
@@ -36,11 +52,19 @@ export class ModMcpError extends Error {
   override readonly name = "ModMcpError";
 }
 
-/** Replaces `${env:NAME}` with Synara's environment variable (empty when unset). */
+/** Synara's own variables (auth token, ports, homes) are never handed to a mod. */
+function isSynaraVariable(name: string): boolean {
+  // Uppercased because Windows environment names are case-insensitive.
+  return name.toUpperCase().startsWith("SYNARA_");
+}
+
+/**
+ * Replaces `${env:NAME}` with Synara's environment variable (empty when unset).
+ * `SYNARA_*` names always expand to empty.
+ */
 export function expandModMcpValue(value: string, env: NodeJS.ProcessEnv = process.env): string {
-  return value.replace(
-    /\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/gu,
-    (_, name: string) => env[name] ?? "",
+  return value.replace(ENV_REFERENCE, (_, name: string) =>
+    isSynaraVariable(name) ? "" : (env[name] ?? ""),
   );
 }
 
@@ -52,39 +76,93 @@ function expandRecord(
   );
 }
 
+/** The `${env:SYNARA_*}` names a config asks for; they were left empty. */
+function refusedEnvNames(config: ModMcpServerConfig): string[] {
+  const values =
+    "command" in config
+      ? [config.command, ...(config.args ?? []), ...Object.values(config.env ?? {}), config.cwd]
+      : [config.url, ...Object.values(config.headers ?? {})];
+  const names = new Set<string>();
+  for (const value of values) {
+    for (const [, name] of (value ?? "").matchAll(ENV_REFERENCE)) {
+      if (name !== undefined && isSynaraVariable(name)) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+/**
+ * A local server gets what provider children get (no `SYNARA_*` control-plane
+ * variables, no `NODE_OPTIONS`-style capabilities) minus every provider
+ * credential, plus only what the manifest's `env` passes. The provider kind only
+ * selects credential grants, and none are left to grant.
+ */
+function modMcpChildEnvironment(
+  explicit: Readonly<Record<string, string>> | undefined,
+): NodeJS.ProcessEnv {
+  return {
+    ...buildProviderChildEnvironment({
+      provider: "acp",
+      baseEnv: withoutProviderCredentialEnvironment(process.env),
+    }),
+    ...expandRecord(explicit),
+  };
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 interface McpTransport {
   request(method: string, params: unknown): Promise<unknown>;
   notify(method: string, params: unknown): Promise<void>;
-  close(): void;
+  /** Idempotent. Never rejects unhandled, so callers may ignore it. */
+  close(): Promise<void>;
+}
+
+async function initializeSession(
+  transport: Pick<McpTransport, "request" | "notify">,
+): Promise<void> {
+  await transport.request("initialize", INITIALIZE_PARAMS);
+  await transport.notify("notifications/initialized", {});
 }
 
 class StdioTransport implements McpTransport {
+  private readonly serverName: string;
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly writer: JsonRpcStdioWriter;
   private readonly registry: JsonRpcStdioRequestRegistry;
   private readonly framer: JsonRpcStdioFramer;
   private stderrTail = "";
   private exitError: Error | null = null;
+  private teardown: Promise<void> | null = null;
 
   constructor(
     serverName: string,
     config: Extract<ModMcpServerConfig, { readonly command: string }>,
   ) {
+    this.serverName = serverName;
     this.child = spawnProcess(
       expandModMcpValue(config.command),
       (config.args ?? []).map((arg) => expandModMcpValue(arg)),
       {
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, ...expandRecord(config.env) },
+        env: modMcpChildEnvironment(config.env),
+        // Launchers such as `npx` (a `.cmd` shim on Windows) start the real
+        // server as a grandchild; owning the group lets teardown reach it.
+        ownProcessGroup: true,
         ...(config.cwd ? { cwd: expandModMcpValue(config.cwd) } : {}),
       },
     );
+    // A write racing the server's exit fails with EPIPE outside any pending
+    // write; without a permanent listener that error would crash Synara.
+    this.child.stdin.on("error", () => undefined);
     this.writer = new JsonRpcStdioWriter(this.child.stdin);
     this.registry = new JsonRpcStdioRequestRegistry({
       requestTimeoutMs: MCP_REQUEST_TIMEOUT_MS,
@@ -149,18 +227,96 @@ class StdioTransport implements McpTransport {
   }
 
   request(method: string, params: unknown): Promise<unknown> {
+    if (this.teardown) return Promise.reject(new ModMcpError(CLOSED_MESSAGE));
     if (this.exitError) return Promise.reject(this.exitError);
     return this.registry.request(method, params, (message) => this.writer.write(message));
   }
 
   async notify(method: string, params: unknown): Promise<void> {
+    if (this.teardown) throw new ModMcpError(CLOSED_MESSAGE);
     if (this.exitError) throw this.exitError;
     await this.writer.write({ jsonrpc: "2.0", method, params });
   }
 
-  close(): void {
-    this.registry.rejectAll(new ModMcpError("The mod's MCP connection closed."));
-    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
+  /** Fails pending calls now and settles once the server's process tree is gone. */
+  close(): Promise<void> {
+    if (this.teardown) return this.teardown;
+    const closed = new ModMcpError(CLOSED_MESSAGE);
+    this.registry.rejectAll(closed);
+    this.writer.close(closed);
+    this.teardown = teardownChildProcessTree(this.child).then(
+      () => undefined,
+      (cause: unknown) => {
+        throw new ModMcpError(
+          `The "${this.serverName}" MCP server could not be proven stopped: ${errorMessage(cause)}`,
+        );
+      },
+    );
+    this.teardown.catch(() => undefined);
+    return this.teardown;
+  }
+}
+
+type HttpOutcome =
+  | { readonly kind: "result"; readonly value: unknown }
+  /** HTTP 404 to a request that carried this session id: the server forgot it. */
+  | { readonly kind: "expired"; readonly sessionId: string };
+
+/**
+ * Incremental `text/event-stream` reader. Hands each event's `data:` lines,
+ * joined with newlines, to `onData`, which returns true to stop reading.
+ */
+class EventStreamParser {
+  private partial = "";
+  private data: string[] = [];
+  private skipLeadingLf = false;
+
+  constructor(private readonly onData: (data: string) => boolean) {}
+
+  push(text: string, ended: boolean): boolean {
+    let input = text;
+    if (this.skipLeadingLf && input.length > 0) {
+      // The previous chunk ended in CR; a LF here belongs to the same CRLF.
+      if (input.startsWith("\n")) input = input.slice(1);
+      this.skipLeadingLf = false;
+    }
+    let lineStart = 0;
+    for (let index = 0; index < input.length; index += 1) {
+      const char = input[index];
+      if (char !== "\n" && char !== "\r") continue;
+      const line = this.partial + input.slice(lineStart, index);
+      this.partial = "";
+      if (char === "\r") {
+        if (index + 1 >= input.length) this.skipLeadingLf = true;
+        else if (input[index + 1] === "\n") index += 1;
+      }
+      lineStart = index + 1;
+      if (this.line(line)) return true;
+    }
+    this.partial += input.slice(lineStart);
+    if (!ended) return false;
+    // Be lenient with a server that ends the stream without a final blank line.
+    const last = this.partial;
+    this.partial = "";
+    if (last && this.line(last)) return true;
+    return this.dispatch();
+  }
+
+  private line(line: string): boolean {
+    if (line === "") return this.dispatch();
+    if (line.startsWith(":")) return false;
+    const colon = line.indexOf(":");
+    if ((colon === -1 ? line : line.slice(0, colon)) !== "data") return false;
+    const value = colon === -1 ? "" : line.slice(colon + 1);
+    this.data.push(value.startsWith(" ") ? value.slice(1) : value);
+    return false;
+  }
+
+  private dispatch(): boolean {
+    if (this.data.length === 0) return false;
+    const data = this.data.join("\n");
+    this.data = [];
+    return this.onData(data);
   }
 }
 
@@ -169,7 +325,9 @@ class HttpTransport implements McpTransport {
   private readonly headers: Record<string, string>;
   private readonly serverName: string;
   private sessionId: string | null = null;
+  private renewal: Promise<void> | null = null;
   private nextId = 1;
+  private closed = false;
   private readonly aborts = new Set<AbortController>();
 
   constructor(serverName: string, config: Extract<ModMcpServerConfig, { readonly url: string }>) {
@@ -181,77 +339,206 @@ class HttpTransport implements McpTransport {
     this.headers = expandRecord(config.headers);
   }
 
-  private async post(body: Record<string, unknown>): Promise<Response> {
+  /**
+   * One POST under one deadline. `consume` reads (or cancels) the body inside
+   * it, so the timer and `close()` can stop a body that never ends.
+   */
+  private async post<T>(
+    body: Record<string, unknown>,
+    sessionId: string | null,
+    consume: (response: Response) => Promise<T>,
+  ): Promise<T> {
+    if (this.closed) throw new ModMcpError(CLOSED_MESSAGE);
     const abort = new AbortController();
     this.aborts.add(abort);
-    const timer = setTimeout(() => abort.abort(), MCP_REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(
+      () =>
+        abort.abort(
+          new ModMcpError(`The "${this.serverName}" MCP server did not answer within 30 s.`),
+        ),
+      MCP_REQUEST_TIMEOUT_MS,
+    );
     try {
-      return await fetch(this.url, {
-        method: "POST",
-        headers: {
-          ...this.headers,
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          "mcp-protocol-version": MCP_PROTOCOL_VERSION,
-          ...(this.sessionId ? { "mcp-session-id": this.sessionId } : {}),
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", ...body }),
-        signal: abort.signal,
-      });
-    } catch (error) {
-      throw new ModMcpError(
-        abort.signal.aborted
-          ? `The "${this.serverName}" MCP server did not answer within 30 s.`
-          : `The "${this.serverName}" MCP server cannot be reached: ${(error as Error).message}`,
-      );
+      let response: Response;
+      try {
+        response = await fetch(this.url, {
+          method: "POST",
+          headers: {
+            ...this.headers,
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+            ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", ...body }),
+          signal: abort.signal,
+        });
+      } catch (error) {
+        if (abort.signal.reason instanceof ModMcpError) throw abort.signal.reason;
+        throw new ModMcpError(
+          `The "${this.serverName}" MCP server cannot be reached: ${errorMessage(error)}`,
+        );
+      }
+      try {
+        return await consume(response);
+      } catch (error) {
+        if (abort.signal.reason instanceof ModMcpError) throw abort.signal.reason;
+        if (error instanceof ModMcpError) throw error;
+        throw new ModMcpError(
+          `The "${this.serverName}" MCP server dropped its answer: ${errorMessage(error)}`,
+        );
+      }
     } finally {
       clearTimeout(timer);
       this.aborts.delete(abort);
     }
   }
 
-  async request(method: string, params: unknown): Promise<unknown> {
-    const id = this.nextId++;
-    const response = await this.post({ id, method, params });
-    this.sessionId = response.headers.get("mcp-session-id") ?? this.sessionId;
-    if (!response.ok) {
-      throw new ModMcpError(
-        `The "${this.serverName}" MCP server answered ${method} with HTTP ${response.status}.`,
-      );
+  /**
+   * Reads the body at most `MCP_FRAME_BYTES` long. `onText` returns true to stop
+   * early; the rest of the body is cancelled either way.
+   */
+  private async readBody(
+    response: Response,
+    method: string,
+    onText: (text: string, ended: boolean) => boolean,
+  ): Promise<void> {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      onText("", true);
+      return;
     }
-    const text = await response.text();
-    const messages = (response.headers.get("content-type") ?? "").includes("text/event-stream")
-      ? text
-          .split(/\r?\n/u)
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice("data:".length).trim())
-      : [text];
-    for (const raw of messages) {
-      let message: Record<string, unknown> | null = null;
-      try {
-        message = asRecord(JSON.parse(raw));
-      } catch {
-        continue;
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          onText(decoder.decode(), true);
+          return;
+        }
+        bytes += value.byteLength;
+        if (bytes > MCP_FRAME_BYTES) {
+          throw new ModMcpError(
+            `The "${this.serverName}" MCP server answered ${method} with more than 8 MB.`,
+          );
+        }
+        if (onText(decoder.decode(value, { stream: true }), false)) return;
       }
-      if (message?.id !== id) continue;
+    } finally {
+      // Stops an event stream the server keeps open; a no-op once the body ended.
+      void reader.cancel().catch(() => undefined);
+    }
+  }
+
+  private async readAnswer(
+    response: Response,
+    method: string,
+    id: number,
+  ): Promise<Record<string, unknown> | null> {
+    let answer: Record<string, unknown> | null = null;
+    const take = (raw: string): boolean => {
+      try {
+        const message = asRecord(JSON.parse(raw));
+        if (message?.id === id) answer = message;
+      } catch {
+        // Not JSON-RPC; keep looking.
+      }
+      return answer !== null;
+    };
+    if ((response.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      const parser = new EventStreamParser(take);
+      await this.readBody(response, method, (text, ended) => parser.push(text, ended));
+    } else {
+      let text = "";
+      await this.readBody(response, method, (chunk, ended) => {
+        text += chunk;
+        if (ended) take(text);
+        return false;
+      });
+    }
+    return answer;
+  }
+
+  private httpError(method: string, status: number): ModMcpError {
+    return new ModMcpError(
+      `The "${this.serverName}" MCP server answered ${method} with HTTP ${status}.`,
+    );
+  }
+
+  private send(method: string, params: unknown): Promise<HttpOutcome> {
+    const id = this.nextId++;
+    const sessionId = this.sessionId;
+    return this.post({ id, method, params }, sessionId, async (response) => {
+      if (this.sessionId === sessionId) {
+        this.sessionId = response.headers.get("mcp-session-id") ?? this.sessionId;
+      }
+      if (response.status === 404 && sessionId !== null) {
+        void response.body?.cancel().catch(() => undefined);
+        return { kind: "expired", sessionId };
+      }
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => undefined);
+        throw this.httpError(method, response.status);
+      }
+      const message = await this.readAnswer(response, method, id);
+      if (message === null) {
+        throw new ModMcpError(`The "${this.serverName}" MCP server sent no answer to ${method}.`);
+      }
       const error = asRecord(message.error);
       if (error) {
         throw new ModMcpError(
           `The "${this.serverName}" MCP server failed ${method}: ${String(error.message ?? "error")}`,
         );
       }
-      return message.result;
-    }
-    throw new ModMcpError(`The "${this.serverName}" MCP server sent no answer to ${method}.`);
+      return { kind: "result", value: message.result };
+    });
+  }
+
+  private async requestOnce(method: string, params: unknown): Promise<unknown> {
+    const outcome = await this.send(method, params);
+    if (outcome.kind === "expired") throw this.httpError(method, 404);
+    return outcome.value;
+  }
+
+  /** Starts a new session in place of `stale`, once however many calls saw it expire. */
+  private renewSession(stale: string): Promise<void> {
+    if (this.sessionId !== stale) return this.renewal ?? Promise.resolve();
+    this.sessionId = null;
+    const renewal = initializeSession({
+      request: (method, params) => this.requestOnce(method, params),
+      notify: (method, params) => this.notify(method, params),
+    });
+    this.renewal = renewal;
+    const settle = () => {
+      if (this.renewal === renewal) this.renewal = null;
+    };
+    renewal.then(settle, settle);
+    return renewal;
+  }
+
+  async request(method: string, params: unknown): Promise<unknown> {
+    if (this.renewal) await this.renewal.catch(() => undefined);
+    const outcome = await this.send(method, params);
+    if (outcome.kind === "result") return outcome.value;
+    // The server restarted or expired the session: start a new one and retry once.
+    await this.renewSession(outcome.sessionId);
+    return this.requestOnce(method, params);
   }
 
   async notify(method: string, params: unknown): Promise<void> {
-    await this.post({ method, params });
+    await this.post({ method, params }, this.sessionId, async (response) => {
+      // Nothing to read from a notification's answer; release the connection.
+      void response.body?.cancel().catch(() => undefined);
+    });
   }
 
-  close(): void {
-    for (const abort of this.aborts) abort.abort();
+  close(): Promise<void> {
+    this.closed = true;
+    const closed = new ModMcpError(CLOSED_MESSAGE);
+    for (const abort of this.aborts) abort.abort(closed);
     this.aborts.clear();
+    return Promise.resolve();
   }
 }
 
@@ -259,79 +546,118 @@ class HttpTransport implements McpTransport {
 export class ModMcpClient {
   private readonly serverName: string;
   private readonly config: ModMcpServerConfig;
+  private readonly refusedEnv: ReadonlyArray<string>;
+  /** Set before the handshake so `close()` can stop a server that is still starting. */
+  private transport: McpTransport | null = null;
   private connection: Promise<McpTransport> | null = null;
+  private readonly stopping = new Set<Promise<void>>();
   private closed = false;
 
   constructor(serverName: string, config: ModMcpServerConfig) {
     this.serverName = serverName;
     this.config = config;
+    this.refusedEnv = refusedEnvNames(config);
   }
 
   private connect(): Promise<McpTransport> {
-    if (this.closed) return Promise.reject(new ModMcpError("The mod's MCP connection closed."));
-    this.connection ??= (async () => {
-      const transport: McpTransport =
-        "command" in this.config
-          ? new StdioTransport(this.serverName, this.config)
-          : new HttpTransport(this.serverName, this.config);
-      try {
-        await transport.request("initialize", {
-          protocolVersion: MCP_PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: CLIENT_INFO,
-        });
-        await transport.notify("notifications/initialized", {});
-        return transport;
-      } catch (error) {
-        transport.close();
-        throw error;
-      }
-    })();
+    if (this.closed) return Promise.reject(new ModMcpError(CLOSED_MESSAGE));
+    if (this.connection) return this.connection;
+    const transport: McpTransport =
+      "command" in this.config
+        ? new StdioTransport(this.serverName, this.config)
+        : new HttpTransport(this.serverName, this.config);
+    this.transport = transport;
+    const connection = this.handshake(transport);
+    this.connection = connection;
     // A failed start can be retried by the next call.
-    this.connection.catch(() => {
+    connection.catch(() => {
+      if (this.connection !== connection) return;
       this.connection = null;
+      this.transport = null;
     });
-    return this.connection;
+    return connection;
+  }
+
+  private async handshake(transport: McpTransport): Promise<McpTransport> {
+    try {
+      await initializeSession(transport);
+      if (this.closed) throw new ModMcpError(CLOSED_MESSAGE);
+      return transport;
+    } catch (error) {
+      void this.retire(transport);
+      throw error;
+    }
+  }
+
+  private retire(transport: McpTransport): Promise<void> {
+    const stopped = transport.close();
+    this.stopping.add(stopped);
+    const forget = () => this.stopping.delete(stopped);
+    stopped.then(forget, forget);
+    return stopped;
+  }
+
+  /** Names the `${env:SYNARA_*}` references that were left empty, if any. */
+  private explain(error: unknown): unknown {
+    if (!(error instanceof ModMcpError) || this.refusedEnv.length === 0) return error;
+    const names = this.refusedEnv.map((name) => `\${env:${name}}`).join(", ");
+    return new ModMcpError(
+      `${error.message} (${names} ${this.refusedEnv.length === 1 ? "was" : "were"} left empty: mods cannot read Synara's own SYNARA_ variables.)`,
+    );
   }
 
   async listTools(): Promise<ModMcpTool[]> {
-    const transport = await this.connect();
-    const tools: ModMcpTool[] = [];
-    let cursor: string | undefined;
-    do {
-      const result = asRecord(await transport.request("tools/list", cursor ? { cursor } : {}));
-      for (const tool of Array.isArray(result?.tools) ? result.tools : []) {
-        const record = asRecord(tool);
-        if (typeof record?.name !== "string") continue;
-        tools.push({
-          name: record.name,
-          description: typeof record.description === "string" ? record.description : null,
-          inputSchema: record.inputSchema ?? null,
-        });
-      }
-      cursor = typeof result?.nextCursor === "string" ? result.nextCursor : undefined;
-    } while (cursor);
-    return tools;
+    try {
+      const transport = await this.connect();
+      const tools: ModMcpTool[] = [];
+      let cursor: string | undefined;
+      do {
+        const result = asRecord(await transport.request("tools/list", cursor ? { cursor } : {}));
+        for (const tool of Array.isArray(result?.tools) ? result.tools : []) {
+          const record = asRecord(tool);
+          if (typeof record?.name !== "string") continue;
+          tools.push({
+            name: record.name,
+            description: typeof record.description === "string" ? record.description : null,
+            inputSchema: record.inputSchema ?? null,
+          });
+        }
+        cursor = typeof result?.nextCursor === "string" ? result.nextCursor : undefined;
+      } while (cursor);
+      return tools;
+    } catch (error) {
+      throw this.explain(error);
+    }
   }
 
   async callTool(tool: string, args: unknown): Promise<ModMcpCallResult> {
-    const transport = await this.connect();
-    const result = asRecord(
-      await transport.request("tools/call", { name: tool, arguments: asRecord(args) ?? {} }),
-    );
-    return {
-      content: Array.isArray(result?.content) ? result.content : [],
-      structuredContent: result?.structuredContent ?? null,
-      isError: result?.isError === true,
-    };
+    try {
+      const transport = await this.connect();
+      const result = asRecord(
+        await transport.request("tools/call", { name: tool, arguments: asRecord(args) ?? {} }),
+      );
+      return {
+        content: Array.isArray(result?.content) ? result.content : [],
+        structuredContent: result?.structuredContent ?? null,
+        isError: result?.isError === true,
+      };
+    } catch (error) {
+      throw this.explain(error);
+    }
   }
 
-  close(): void {
+  /**
+   * Fails pending calls and stops the server, a starting one included. Safe to
+   * call without awaiting; the promise settles once every process this client
+   * started is gone, and rejects when that cannot be proven.
+   */
+  close(): Promise<void> {
     this.closed = true;
-    void this.connection?.then(
-      (transport) => transport.close(),
-      () => undefined,
-    );
+    if (this.transport) void this.retire(this.transport);
+    this.transport = null;
     this.connection = null;
+    const stopped = Promise.all(this.stopping).then(() => undefined);
+    stopped.catch(() => undefined);
+    return stopped;
   }
 }

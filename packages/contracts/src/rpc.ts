@@ -96,6 +96,10 @@ import {
   MODS_WS_METHODS,
   ModsDispatchUiInput,
   ModsDispatchUiResult,
+  ModsExportInput,
+  ModsExportResult,
+  ModsImportInput,
+  ModsImportResult,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
@@ -908,6 +912,18 @@ export const WsModsDispatchUiRpc = Rpc.make(MODS_WS_METHODS.dispatchUi, {
   error: WsRpcError,
 });
 
+export const WsModsExportRpc = Rpc.make(MODS_WS_METHODS.export, {
+  payload: ModsExportInput,
+  success: ModsExportResult,
+  error: WsRpcError,
+});
+
+export const WsModsImportRpc = Rpc.make(MODS_WS_METHODS.import, {
+  payload: ModsImportInput,
+  success: ModsImportResult,
+  error: WsRpcError,
+});
+
 export const WsSubscribeModsEventsRpc = Rpc.make(MODS_WS_METHODS.subscribeEvents, {
   payload: Schema.Struct({}),
   success: ModsStreamEvent,
@@ -923,6 +939,8 @@ export const WsModsRpcGroup = RpcGroup.make(
   WsModsRunCommandRpc,
   WsModsRenderViewRpc,
   WsModsDispatchUiRpc,
+  WsModsExportRpc,
+  WsModsImportRpc,
   WsSubscribeModsEventsRpc,
 );
 

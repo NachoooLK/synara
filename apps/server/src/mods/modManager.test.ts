@@ -1,14 +1,15 @@
 // FILE: modManager.test.ts
 // Purpose: Runs real mods in real workers: loading, commands, hook chains,
-//          failures, hung hooks, reloads and the `$` state and store.
+//          failures, hung hooks, reloads, the `$` state and store, and moving a
+//          mod between installs by export and import.
 // Layer: Mods runtime tests
 
 import { mkdtempSync, rmSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { ModsSnapshot, ModSummary } from "@synara/contracts";
+import type { ModBundle, ModsSnapshot, ModSummary } from "@synara/contracts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { ModProject, ModThread } from "./modApi.ts";
@@ -228,6 +229,94 @@ describe("ModManager", () => {
     expect(summaryOf(snapshot, "bare-import").error).toMatch(/only their own files and "synara"/u);
   });
 
+  it("points a syntax error inside the register arrow at its own line", async () => {
+    await writeMod("typo", {
+      "hooks/register.tsx": [
+        "export const register = (on) => {",
+        '  on("mod.start", async ($) => {',
+        "    const ok = 1;",
+        '    await $.ui.toast("hi";',
+        "  });",
+        '  on("ui.render", () => <Box>{[1].map((n) => <Text>{n}</Text>)}</Box>);',
+        "};",
+        "",
+      ].join("\n"),
+    });
+    await writeFile(
+      path.join(modsDir, "typo", "hooks", "hooks.json"),
+      JSON.stringify({ modules: ["./register.tsx"] }),
+    );
+    const manager = makeManager();
+    const summary = await startEnabled(manager, "typo");
+    expect(summary.status).toBe("error");
+    expect(summary.error).toContain('hooks/register.tsx: Unexpected token, expected "," (4:26)');
+    expect(summary.error).toContain(
+      '  4 |     await $.ui.toast("hi";\n    |                          ^',
+    );
+  });
+
+  it("tells the window when a render hook or a command fails instead of drawing nothing", async () => {
+    await writeMod("faulty", {
+      "hooks/register.ts": `
+        export const register = (on) => {
+          on("mod.start", async ($) => {
+            await $.ui.view({ id: "boom", site: "dock", title: "Boom" });
+            await $.command.register({ name: "explode", title: "Explode" });
+          });
+          on("ui.render", () => { throw new Error("render broke"); });
+          on("command.run", () => { throw new Error("command broke"); });
+        };
+      `,
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "faulty");
+    await expect(
+      manager.renderView("faulty", "boom", { threadId: null, projectId: null }),
+    ).rejects.toThrow(/"boom" view could not be drawn: .*render broke/u);
+    await expect(manager.runCommand("faulty", "explode", null)).rejects.toThrow(
+      /"explode" command failed: .*command broke/u,
+    );
+  });
+
+  it("refuses elements it cannot draw and drops icons that do not exist, saying so once", async () => {
+    await writeMod("icons", {
+      "hooks/register.ts": `
+        export const register = (on) => {
+          on("mod.start", async ($) => {
+            await $.ui.view({ id: "rail", site: "sidebar", title: "Rail", icon: "no-such-icon" });
+            await $.ui.view({ id: "table", site: "dock", title: "Table" });
+          });
+          on("ui.render", { view: "rail" }, () => h(Box, {}, h(Row, { icon: "no-such-icon" }, "a"), h(Icon, { name: "star" }), h(Icon, { name: "missing-too" })));
+          on("ui.render", { view: "table" }, () => h("Table", {}, "x"));
+        };
+      `,
+    });
+    const manager = makeManager({ iconNames: new Set(["star"]) });
+    const summary = await startEnabled(manager, "icons");
+    expect(summary.views.find((view) => view.id === "rail")?.icon).toBeNull();
+    const context = { threadId: null, projectId: null };
+    const { tree } = await manager.renderView("icons", "rail", context);
+    await manager.renderView("icons", "rail", context);
+    expect(tree).toEqual({
+      type: "Box",
+      props: {},
+      children: [
+        { type: "Row", props: {}, children: ["a"] },
+        { type: "Icon", props: { name: "star" }, children: [] },
+      ],
+    });
+    const warnings = manager
+      .readLogs("icons")
+      .logs.filter((entry) => entry.level === "warn")
+      .map((entry) => entry.message);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatch(/no icon named "no-such-icon"/u);
+    expect(warnings[1]).toMatch(/no icon named "missing-too"/u);
+    await expect(manager.renderView("icons", "table", context)).rejects.toThrow(
+      /"Table" is not an element Synara draws/u,
+    );
+  });
+
   it("drops a failing hook from the chain and logs why", async () => {
     await writeMod("broken", {
       "hooks/register.ts": `
@@ -239,7 +328,9 @@ describe("ModManager", () => {
     });
     const manager = makeManager();
     await startEnabled(manager, "broken");
-    await expect(manager.runCommand("broken", "boom", null)).resolves.toEqual({ text: null });
+    await expect(manager.runCommand("broken", "boom", null)).rejects.toThrow(
+      /"boom" command failed: .*kaboom/u,
+    );
     const { logs } = manager.readLogs("broken");
     expect(logs.some((entry) => entry.level === "error" && entry.message.includes("kaboom"))).toBe(
       true,
@@ -258,7 +349,9 @@ describe("ModManager", () => {
     });
     const manager = makeManager({ hookTimeoutMs: 200 });
     await startEnabled(manager, "spinner");
-    await expect(manager.runCommand("spinner", "spin", null)).resolves.toEqual({ text: null });
+    await expect(manager.runCommand("spinner", "spin", null)).rejects.toThrow(
+      /"spin" command failed/u,
+    );
     await waitFor(() => summaryOf(manager.snapshot(), "spinner").status === "error");
     expect(summaryOf(manager.snapshot(), "spinner").error).toMatch(/ran synchronously/u);
   });
@@ -317,8 +410,128 @@ describe("ModManager", () => {
     await expect(manager.runCommand("counter", "bump", null)).resolves.toEqual({
       text: "2,2,thread-new,1",
     });
+    // The store reaches the disk after a burst settles, and at the latest on stop.
+    await manager.stop();
     const stored = JSON.parse(await readFile(path.join(dataDir, "store", "counter.json"), "utf8"));
     expect(stored).toEqual({ lastRuns: 2 });
+  });
+
+  it("keeps every key when a mod writes its store in parallel", async () => {
+    await writeMod("parallel", {
+      "hooks/register.ts": `
+        export const register = (on) => {
+          on("mod.start", async ($) => { await $.command.register({ name: "fill", title: "Fill" }); });
+          on("command.run", async ($) => {
+            await Promise.all(Array.from({ length: 20 }, (_, i) => $.store.set("k" + i, i)));
+            return { text: String((await $.store.keys()).length) };
+          });
+        };
+      `,
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "parallel");
+    await expect(manager.runCommand("parallel", "fill", null)).resolves.toEqual({ text: "20" });
+    await manager.stop();
+    const stored = JSON.parse(await readFile(path.join(dataDir, "store", "parallel.json"), "utf8"));
+    expect(Object.keys(stored)).toHaveLength(20);
+  });
+
+  it("joins redraw requests and ignores the ones a view makes while it draws", async () => {
+    await writeMod("looper", {
+      "hooks/register.ts": `
+        export const register = (on) => {
+          on("mod.start", async ($) => {
+            await $.ui.view({ id: "main", site: "dock", title: "Main" });
+            await $.command.register({ name: "touch", title: "Touch" });
+          });
+          on("ui.render", async ($) => {
+            await $.state.set("drawnAt", Math.random());
+            await $.ui.invalidate("main");
+            return "drawn";
+          });
+          on("command.run", async ($) => {
+            await $.state.set("a", 1);
+            await $.state.set("b", 2);
+            await $.state.set("b", 2);
+            await $.ui.invalidate("main");
+          });
+        };
+      `,
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "looper");
+    // Registering the view asked for one first drawing; let it pass.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const invalidations: string[] = [];
+    manager.subscribe((event) => {
+      if (event.type === "invalidate") invalidations.push(event.viewId ?? "*");
+    });
+    const context = { threadId: null, projectId: null };
+    await manager.renderView("looper", "main", context);
+    await manager.renderView("looper", "main", context);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(invalidations).toEqual([]);
+    await manager.runCommand("looper", "touch", null);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(invalidations).toEqual(["*"]);
+  });
+
+  it("bounds a hook that keeps waiting on $ instead of letting it block the mod", async () => {
+    await writeMod("waiter", {
+      "hooks/register.ts": `
+        export const register = (on) => {
+          on("mod.start", async ($) => { for (;;) await $.state.get("k"); });
+        };
+      `,
+    });
+    const manager = makeManager({ hookTimeoutMs: 200, hookDeadlineMs: 600 });
+    const started = Date.now();
+    await startEnabled(manager, "waiter");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    // The hook runs out of its own budget (each wait costs a little) or of the whole deadline.
+    await waitFor(() =>
+      manager
+        .readLogs("waiter")
+        .logs.some((entry) =>
+          /"mod\.start" hook failed: The hook did not finish/u.test(entry.message),
+        ),
+    );
+    await manager.setEnabled("waiter", false);
+    expect(summaryOf(manager.snapshot(), "waiter").status).toBe("disabled");
+  });
+
+  it("forgets that a mod was trusted when its folder goes away", async () => {
+    await writeMod("gone", {
+      "hooks/register.ts": `export const register = (on) => { on("mod.start", () => undefined); };`,
+    });
+    const manager = makeManager({ watch: true });
+    await startEnabled(manager, "gone");
+    rmSync(path.join(modsDir, "gone"), { recursive: true, force: true });
+    await waitFor(() => !manager.snapshot().mods.some((mod) => mod.id === "gone"));
+    // New code under the old name starts off, waiting for the person.
+    await writeMod("gone", {
+      "hooks/register.ts": `export const register = (on) => { on("mod.start", () => undefined); };`,
+    });
+    await waitFor(() => manager.snapshot().mods.some((mod) => mod.id === "gone"));
+    await manager.whenIdle();
+    expect(summaryOf(manager.snapshot(), "gone")).toMatchObject({
+      enabled: false,
+      status: "disabled",
+    });
+    const registry = JSON.parse(await readFile(path.join(dataDir, "registry.json"), "utf8"));
+    expect(registry.enabled).toEqual([]);
+  });
+
+  it("drops trust left for folders that no longer exist when it starts", async () => {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(
+      path.join(dataDir, "registry.json"),
+      JSON.stringify({ version: 1, enabled: ["missing"] }),
+    );
+    const manager = makeManager();
+    await manager.start();
+    const registry = JSON.parse(await readFile(path.join(dataDir, "registry.json"), "utf8"));
+    expect(registry.enabled).toEqual([]);
   });
 
   it("reloads a mod when its files change", async () => {
@@ -460,5 +673,148 @@ describe("ModManager", () => {
     await expect(manager.runCommand("strict", "open", null)).resolves.toEqual({
       text: "$.ui.openThread() works only inside a handler of a view, such as an onPress.",
     });
+  });
+});
+
+function bundleOf(
+  name: string,
+  files: Record<string, string>,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    format: "synara-mod",
+    formatVersion: 1,
+    name,
+    version: "0.1.0",
+    exportedAt: "2026-10-09T00:00:00.000Z",
+    files: Object.entries(files).map(([filePath, content]) => ({
+      path: filePath,
+      encoding: "utf8",
+      content,
+    })),
+    ...overrides,
+  };
+}
+
+function modFiles(name: string, version = "0.1.0"): Record<string, string> {
+  return {
+    ".synara-mod/mod.json": JSON.stringify({ name, version }),
+    "hooks/hooks.json": JSON.stringify({ modules: ["./register.ts"] }),
+    "hooks/register.ts": 'export const register = (on) => { on("mod.start", () => undefined); };',
+  };
+}
+
+describe("ModManager export and import", () => {
+  it("exports a mod without its secrets and tooling and imports it elsewhere, turned off", async () => {
+    const source = await writeMod("share", {
+      "hooks/register.ts": `export const register = (on) => { on("mod.start", () => undefined); };`,
+      "hooks/lib/util.ts": "export const one = 1;",
+      ".env": "TOKEN=secret",
+      "node_modules/dep/index.js": "module.exports = 1;",
+    });
+    const logo = Buffer.from([0, 255, 1, 128]);
+    await mkdir(path.join(source, "assets"), { recursive: true });
+    await writeFile(path.join(source, "assets", "logo.bin"), logo);
+    const first = makeManager();
+    await first.start();
+
+    const exported = await first.exportMod("share");
+    expect(exported.filename).toBe("share.synara-mod.json");
+    const bundle = JSON.parse(exported.contents) as ModBundle;
+    expect(bundle).toMatchObject({ format: "synara-mod", formatVersion: 1, name: "share" });
+    expect(bundle.files.map((file) => [file.path, file.encoding])).toEqual([
+      [".synara-mod/mod.json", "utf8"],
+      ["assets/logo.bin", "base64"],
+      ["hooks/hooks.json", "utf8"],
+      ["hooks/lib/util.ts", "utf8"],
+      ["hooks/register.ts", "utf8"],
+    ]);
+
+    const otherMods = path.join(root, "other", "mods");
+    const second = makeManager({ modsDir: otherMods, dataDir: path.join(root, "other", "state") });
+    await second.start();
+    const result = await second.importMod(bundle, false);
+    expect(result).toMatchObject({ id: "share", replaced: false });
+    expect(summaryOf(result.snapshot, "share")).toMatchObject({
+      enabled: false,
+      status: "disabled",
+      error: null,
+    });
+    await expect(readFile(path.join(otherMods, "share", "assets", "logo.bin"))).resolves.toEqual(
+      logo,
+    );
+    await expect(
+      readFile(path.join(otherMods, "share", "hooks", "lib", "util.ts"), "utf8"),
+    ).resolves.toBe("export const one = 1;");
+    expect(await readdir(otherMods)).toEqual(["share"]);
+
+    await second.setEnabled("share", true);
+    await second.whenIdle();
+    expect(summaryOf(second.snapshot(), "share").status).toBe("running");
+  });
+
+  it("replaces an installed mod only when asked, and turns it off", async () => {
+    await writeMod("dup", {
+      "hooks/register.ts": `export const register = (on) => { on("mod.start", () => undefined); };`,
+      "hooks/old.ts": "export const old = true;",
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "dup");
+    const newer = bundleOf("dup", modFiles("dup", "0.2.0"));
+
+    await expect(manager.importMod(newer, false)).rejects.toThrow(/already installed/u);
+    expect(summaryOf(manager.snapshot(), "dup")).toMatchObject({ status: "running" });
+
+    const result = await manager.importMod(newer, true);
+    expect(result.replaced).toBe(true);
+    expect(summaryOf(result.snapshot, "dup")).toMatchObject({
+      enabled: false,
+      status: "disabled",
+      version: "0.2.0",
+    });
+    await expect(readFile(path.join(modsDir, "dup", "hooks", "old.ts"))).rejects.toThrow();
+    const registry = JSON.parse(await readFile(path.join(dataDir, "registry.json"), "utf8"));
+    expect(registry.enabled).toEqual([]);
+  });
+
+  it("keeps a mod imported under a name that was enabled before turned off", async () => {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(
+      path.join(dataDir, "registry.json"),
+      JSON.stringify({ version: 1, enabled: ["ghost"] }),
+    );
+    const manager = makeManager();
+    await manager.start();
+
+    const result = await manager.importMod(bundleOf("ghost", modFiles("ghost")), false);
+    await manager.whenIdle();
+    expect(summaryOf(result.snapshot, "ghost")).toMatchObject({
+      enabled: false,
+      status: "disabled",
+    });
+    const registry = JSON.parse(await readFile(path.join(dataDir, "registry.json"), "utf8"));
+    expect(registry.enabled).toEqual([]);
+  });
+
+  it("refuses files that are not mods or would write outside the mod, leaving nothing behind", async () => {
+    const manager = makeManager();
+    await manager.start();
+    const cases: Array<[unknown, RegExp]> = [
+      [{ hello: "world" }, /not an exported Synara mod/u],
+      [bundleOf("x", modFiles("x"), { formatVersion: 2 }), /newer version of Synara/u],
+      [bundleOf("Bad Name", modFiles("x")), /damaged/u],
+      [bundleOf("x", { ...modFiles("x"), "../escape.ts": "x" }), /plain relative path/u],
+      [bundleOf("x", { ...modFiles("x"), "/etc/escape.ts": "x" }), /plain relative path/u],
+      [bundleOf("x", { ...modFiles("x"), "hooks\\escape.ts": "x" }), /characters a path/u],
+      [bundleOf("x", { ...modFiles("x"), ".env": "TOKEN=1" }), /hidden file/u],
+      [bundleOf("x", { ...modFiles("x"), "Hooks/Register.ts": "x" }), /twice/u],
+      [bundleOf("x", modFiles("y")), /cannot be imported: .*"y"/u],
+      [bundleOf("x", { "readme.md": "hi" }), /no manifest and no hooks file/u],
+    ];
+    for (const [value, expected] of cases) {
+      await expect(manager.importMod(value, false)).rejects.toThrow(expected);
+    }
+    expect(await readdir(modsDir)).toEqual([]);
+    await expect(readFile(path.join(root, "escape.ts"))).rejects.toThrow();
   });
 });

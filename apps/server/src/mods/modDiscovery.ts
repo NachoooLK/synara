@@ -53,7 +53,9 @@ async function readJson(
   try {
     text = await fs.readFile(file, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { found: false };
+    // A file where a folder should be (a README next to the mods) is not a mod either.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { found: false };
     return { found: true, error: `cannot be read: ${(error as Error).message}` };
   }
   try {

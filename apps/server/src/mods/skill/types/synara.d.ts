@@ -290,7 +290,7 @@ export interface ListProps extends WithChildren {}
 export interface RowProps extends WithChildren {
   readonly icon?: string;
   readonly meta?: string;
-  /** Tooltip. */
+  /** The row's text; children follow it (a badge, a count). Without it, the children are the text. */
   readonly title?: string;
   /** Marks the row selected, like the open thread in the sidebar. */
   readonly active?: boolean;

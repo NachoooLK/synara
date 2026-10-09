@@ -290,6 +290,23 @@ function scoreProject(project: SidebarSearchProject, query: string): number | nu
   return null;
 }
 
+// The label equals the query or starts with it: the person is typing the command's name.
+const STRONG_ACTION_MATCH_SCORE = 120;
+
+/**
+ * Whether the best action (the first of `matchSidebarSearchActions`) matches on its label
+ * strongly enough to lead the results, so typing a command's name highlights it rather
+ * than a thread that mentions the same words.
+ */
+export function isStrongSidebarSearchActionMatch(
+  action: SidebarSearchAction | undefined,
+  query: string,
+): boolean {
+  const normalizedQuery = normalizeText(query);
+  if (!action || !normalizedQuery) return false;
+  return (scoreAction(action, normalizedQuery) ?? 0) >= STRONG_ACTION_MATCH_SCORE;
+}
+
 export function matchSidebarSearchActions(
   actions: readonly SidebarSearchAction[],
   query: string,

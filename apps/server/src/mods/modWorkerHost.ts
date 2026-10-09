@@ -17,10 +17,14 @@ import {
 
 /** How long `register()` may take before the mod counts as failed. */
 export const MOD_LOAD_TIMEOUT_MS = 10_000;
-/** How long one hook may run, not counting the time it waits on `next`. */
+/** How long one hook may run, not counting the time it waits on `next` or `$`. */
 export const MOD_HOOK_TIMEOUT_MS = 10_000;
+/** How long one hook may take in all, waits included, so it cannot wait forever. */
+export const MOD_HOOK_DEADLINE_MS = 60_000;
 /** How long a worker has to answer a ping after a hook overran. */
 const MOD_PING_TIMEOUT_MS = 1_000;
+/** How often an idle worker is asked whether it still answers. */
+const MOD_HEARTBEAT_INTERVAL_MS = 15_000;
 /** Heap ceiling per mod worker, so one mod cannot exhaust the server's memory. */
 const MOD_WORKER_MAX_OLD_GENERATION_MB = 256;
 
@@ -50,6 +54,8 @@ export interface ModWorkerHostOptions {
   readonly workerUrl: URL;
   readonly loadTimeoutMs?: number;
   readonly hookTimeoutMs?: number;
+  readonly hookDeadlineMs?: number;
+  readonly heartbeatIntervalMs?: number;
   /**
    * Answers one `$` call; a rejection reaches the mod as a thrown error.
    * `context` is what the caller passed to the invoke the call came from, or null.
@@ -70,6 +76,12 @@ interface Invocation {
   readonly next: (input: unknown) => Promise<unknown>;
   readonly context: unknown;
   timer: ReturnType<typeof setTimeout> | null;
+  /** When the budget timer was last armed; the time since then is spent budget. */
+  armedAt: number;
+  /** What is left of the hook's own budget; waits on `next` and `$` do not use it. */
+  budgetLeftMs: number;
+  /** The cap on the whole call, waits included. */
+  deadline: ReturnType<typeof setTimeout> | null;
   /** Calls the hook is waiting on (`next` or `$`); its budget only runs while this is 0. */
   nextInFlight: number;
 }
@@ -78,6 +90,11 @@ export class ModWorkerHost {
   private readonly worker: Worker;
   private readonly options: ModWorkerHostOptions;
   private readonly hookTimeoutMs: number;
+  private readonly hookDeadlineMs: number;
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
+  /** Calls that ran out of time; `$` calls they still make are refused, so a runaway loop ends. */
+  private readonly expiredCalls = new Set<number>();
+  private heartbeatPending = false;
   private readonly invocations = new Map<number, Invocation>();
   private readonly pings = new Map<number, () => void>();
   private registrations: ReadonlyArray<ModHookRegistration> = [];
@@ -89,6 +106,10 @@ export class ModWorkerHost {
   private constructor(options: ModWorkerHostOptions) {
     this.options = options;
     this.hookTimeoutMs = options.hookTimeoutMs ?? MOD_HOOK_TIMEOUT_MS;
+    this.hookDeadlineMs = Math.max(
+      options.hookDeadlineMs ?? MOD_HOOK_DEADLINE_MS,
+      this.hookTimeoutMs,
+    );
     this.worker = new Worker(options.workerUrl, {
       workerData: options.data,
       name: `synara-mod:${options.data.modId}`,
@@ -163,6 +184,19 @@ export class ModWorkerHost {
     this.worker.on("exit", (code: number) =>
       this.handleExit(`The mod's worker exited with code ${code}.`),
     );
+    // Code a timer or an event runs outside any hook can also loop forever; a worker
+    // that cannot answer for longer than a hook may run is stuck and has to go.
+    this.heartbeat = setInterval(() => {
+      if (this.heartbeatPending || !this.isAlive) return;
+      this.heartbeatPending = true;
+      void this.ping(this.hookTimeoutMs + 5_000).then((alive) => {
+        this.heartbeatPending = false;
+        if (alive || this.exited || this.stopping) return;
+        this.handleExit("The mod stopped answering, so it was stopped.");
+        void this.worker.terminate();
+      });
+    }, this.options.heartbeatIntervalMs ?? MOD_HEARTBEAT_INTERVAL_MS);
+    this.heartbeat.unref?.();
   }
 
   private post(message: HostToWorkerMessage): void {
@@ -177,7 +211,7 @@ export class ModWorkerHost {
         const invocation = this.invocations.get(message.callId);
         if (!invocation) return;
         this.invocations.delete(message.callId);
-        this.disarm(invocation);
+        this.clearTimers(invocation);
         invocation.resolve(
           message.ok
             ? { kind: "result", value: message.value }
@@ -210,6 +244,15 @@ export class ModWorkerHost {
         return;
       }
       case "api": {
+        if (message.callId !== null && this.expiredCalls.has(message.callId)) {
+          this.post({
+            type: "api-result",
+            requestId: message.requestId,
+            ok: false,
+            error: "The hook that made this call ran out of time.",
+          });
+          return;
+        }
         // Time a hook spends waiting on Synara (an MCP call, a store write) is not its own.
         const invocation =
           message.callId === null ? undefined : this.invocations.get(message.callId);
@@ -274,22 +317,60 @@ export class ModWorkerHost {
     this.post({ type: "next-result", callId, nextId, ...outcome });
   }
 
+  /** Runs the hook's budget again with what is left of it, not a fresh one. */
   private arm(callId: number, invocation: Invocation): void {
     this.disarm(invocation);
-    invocation.timer = setTimeout(() => this.timeOut(callId), this.hookTimeoutMs);
+    invocation.armedAt = Date.now();
+    invocation.timer = setTimeout(() => this.timeOut(callId), invocation.budgetLeftMs);
   }
 
+  /** Pauses the budget while the hook waits, keeping what it has spent. */
   private disarm(invocation: Invocation): void {
     if (invocation.timer !== null) {
       clearTimeout(invocation.timer);
       invocation.timer = null;
+      invocation.budgetLeftMs = Math.max(
+        0,
+        invocation.budgetLeftMs - (Date.now() - invocation.armedAt),
+      );
     }
+  }
+
+  private markExpired(callId: number): void {
+    this.expiredCalls.add(callId);
+    if (this.expiredCalls.size > 256) {
+      const oldest = this.expiredCalls.values().next().value;
+      if (oldest !== undefined) this.expiredCalls.delete(oldest);
+    }
+  }
+
+  private clearTimers(invocation: Invocation): void {
+    this.disarm(invocation);
+    if (invocation.deadline !== null) {
+      clearTimeout(invocation.deadline);
+      invocation.deadline = null;
+    }
+  }
+
+  /** The whole call ran past its cap while waiting; the worker itself is fine. */
+  private expire(callId: number): void {
+    const invocation = this.invocations.get(callId);
+    if (!invocation) return;
+    this.invocations.delete(callId);
+    this.clearTimers(invocation);
+    this.markExpired(callId);
+    invocation.resolve({
+      kind: "error",
+      error: `The hook did not finish within ${this.hookDeadlineMs / 1000} s, waits included.`,
+    });
   }
 
   private timeOut(callId: number): void {
     const invocation = this.invocations.get(callId);
     if (!invocation) return;
     this.invocations.delete(callId);
+    this.clearTimers(invocation);
+    this.markExpired(callId);
     invocation.resolve({
       kind: "error",
       error: `The hook did not finish within ${this.hookTimeoutMs / 1000} s.`,
@@ -357,14 +438,24 @@ export class ModWorkerHost {
     }
     const callId = this.nextCallId++;
     return new Promise((resolve) => {
-      const invocation: Invocation = { resolve, next, context, timer: null, nextInFlight: 0 };
+      const invocation: Invocation = {
+        resolve,
+        next,
+        context,
+        timer: null,
+        armedAt: Date.now(),
+        budgetLeftMs: this.hookTimeoutMs,
+        deadline: null,
+        nextInFlight: 0,
+      };
       this.invocations.set(callId, invocation);
       this.arm(callId, invocation);
+      invocation.deadline = setTimeout(() => this.expire(callId), this.hookDeadlineMs);
       try {
         this.post(message(callId));
       } catch (error) {
         this.invocations.delete(callId);
-        this.disarm(invocation);
+        this.clearTimers(invocation);
         resolve({ kind: "error", error: describeModError(error) });
       }
     });
@@ -373,13 +464,19 @@ export class ModWorkerHost {
   private handleExit(reason: string): void {
     if (this.exited) return;
     this.exited = true;
+    this.stopHeartbeat();
     this.failInFlight("The mod stopped before the hook finished.");
     if (!this.stopping) this.options.onExit(reason);
   }
 
+  private stopHeartbeat(): void {
+    if (this.heartbeat !== null) clearInterval(this.heartbeat);
+    this.heartbeat = null;
+  }
+
   private failInFlight(error: string): void {
     for (const invocation of this.invocations.values()) {
-      this.disarm(invocation);
+      this.clearTimers(invocation);
       invocation.resolve({ kind: "error", error });
     }
     this.invocations.clear();
@@ -391,6 +488,7 @@ export class ModWorkerHost {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.stopHeartbeat();
     this.failInFlight("The mod was stopped.");
     if (this.exited) return;
     this.exited = true;

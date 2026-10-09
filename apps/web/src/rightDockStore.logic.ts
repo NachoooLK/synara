@@ -104,6 +104,13 @@ function sanitizePersistedPane(value: unknown): RightDockPane | null {
   if (typeof candidate.id !== "string" || !isRightDockPaneKind(candidate.kind)) {
     return null;
   }
+  // A mod pane that does not say which view it shows cannot draw anything.
+  if (
+    candidate.kind === "mod" &&
+    (typeof candidate.modId !== "string" || typeof candidate.modViewId !== "string")
+  ) {
+    return null;
+  }
   return {
     id: candidate.id,
     kind: candidate.kind,

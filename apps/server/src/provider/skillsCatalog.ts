@@ -433,6 +433,16 @@ export function synaraBuiltinSkillsDir(synaraBaseDir: string): string {
   return nodePath.join(synaraBaseDir, "builtin-skills");
 }
 
+/** Every folder Synara loads its own skills from: the person's, then the built-in ones. */
+export function synaraSkillRoots(synaraBaseDir: string): string[] {
+  return [
+    synaraSkillsDir(synaraBaseDir),
+    ...(isServerBetaFeatureEnabled(MODS_BETA_FEATURE)
+      ? [synaraBuiltinSkillsDir(synaraBaseDir)]
+      : []),
+  ];
+}
+
 export function synaraSkillsDir(synaraBaseDir: string): string {
   return nodePath.join(synaraBaseDir, "skills");
 }
@@ -461,12 +471,7 @@ interface SkillOriginRootSpec {
 
 const SKILL_ORIGIN_ROOTS = {
   synara: {
-    homeRoots: (input) => [
-      synaraSkillsDir(input.synaraBaseDir),
-      ...(isServerBetaFeatureEnabled(MODS_BETA_FEATURE)
-        ? [synaraBuiltinSkillsDir(input.synaraBaseDir)]
-        : []),
-    ],
+    homeRoots: (input) => synaraSkillRoots(input.synaraBaseDir),
     projectRootNames: [".synara"],
   },
   codex: {

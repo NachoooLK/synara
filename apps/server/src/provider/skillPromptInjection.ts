@@ -41,8 +41,8 @@ export function shouldInlineSkillForProvider(provider: ProviderKind, skillPath: 
     case "antigravity":
       return true;
     case "codex":
-      // Codex loads .codex and .agents skills natively, plus ~/.synara/skills
-      // registered via skills/extraRoots/set. Only foreign provider roots
+      // Codex loads .codex and .agents skills natively, plus ~/.synara/skills and
+      // Synara's built-in skills registered via skills/extraRoots/set. Only foreign provider roots
       // need inline instructions alongside their structured skill reference.
       return [".claude", ".cursor"].some((dir) => segments.has(dir));
     case "cursor":

@@ -17,11 +17,12 @@ import { Effect, Layer, Queue, Stream } from "effect";
 import { isServerBetaFeatureEnabled } from "../../betaFeatureGate.ts";
 import { ServerConfig } from "../../config.ts";
 import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
+import { shouldPublishThreadShellForEvent } from "../../orchestration/threadShellEvents.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ModHostError } from "../Errors.ts";
 import type { ModProject, ModThread } from "../modApi.ts";
 import { ModManager, type ModViewSource } from "../modManager.ts";
-import { installModSkill, resolveModSkillSourceDir } from "../modSkill.ts";
+import { installModSkill, readModIconNames, resolveModSkillSourceDir } from "../modSkill.ts";
 import { synaraBuiltinSkillsDir } from "../../provider/skillsCatalog.ts";
 import { ModHost, type ModHostShape } from "../Services/ModHost.ts";
 
@@ -86,23 +87,43 @@ export const ModHostLive = Layer.effect(
       runFork(log.pipe(Effect.annotateLogs({ component: "mods", modId })));
     };
 
+    // Mods read thread and project lists often (every redraw of a view that shows
+    // them). One shared copy serves them until a change that mods can see.
+    let shellCache: Promise<{
+      readonly threads: ReadonlyArray<ModThread>;
+      readonly projects: ReadonlyArray<ModProject>;
+    }> | null = null;
+    const readShell = () => {
+      shellCache ??= runPromise(
+        snapshotQuery.getShellSnapshot().pipe(
+          Effect.map((snapshot) => ({
+            threads: snapshot.threads.map(toModThread),
+            projects: snapshot.projects.map(toModProject),
+          })),
+        ),
+      ).catch((error: unknown) => {
+        shellCache = null;
+        throw error;
+      });
+      return shellCache;
+    };
+
     const modsDir = path.join(config.baseDir, MODS_DIRECTORY_NAME);
+    const skillSourceDir = available
+      ? yield* Effect.promise(() => resolveModSkillSourceDir().catch(() => null))
+      : null;
+    // Without the list (a build missing the skill files) icon names go unchecked.
+    const iconNames =
+      skillSourceDir === null
+        ? null
+        : yield* Effect.promise(() => readModIconNames(skillSourceDir).catch(() => null));
     const manager = new ModManager({
+      iconNames,
       modsDir,
       dataDir: path.join(config.stateDir, "mods"),
       backend: {
-        listThreads: () =>
-          runPromise(
-            snapshotQuery
-              .getShellSnapshot()
-              .pipe(Effect.map((snapshot) => snapshot.threads.map(toModThread))),
-          ),
-        listProjects: () =>
-          runPromise(
-            snapshotQuery
-              .getShellSnapshot()
-              .pipe(Effect.map((snapshot) => snapshot.projects.map(toModProject))),
-          ),
+        listThreads: () => readShell().then((shell) => shell.threads),
+        listProjects: () => readShell().then((shell) => shell.projects),
         log: logModLine,
       },
     });
@@ -119,24 +140,24 @@ export const ModHostLive = Layer.effect(
         () => Effect.promise(() => manager.stop()),
       );
       // The authoring skill lets any provider's agent write mods for this install.
-      yield* Effect.tryPromise({
-        try: async () => {
-          const sourceDir = await resolveModSkillSourceDir();
-          if (sourceDir === null) throw new Error("this build has no mod skill files");
-          return installModSkill({
-            sourceDir,
-            targetRoot: synaraBuiltinSkillsDir(config.baseDir),
-            modsDir,
-          });
-        },
-        catch: toModHostError,
-      }).pipe(
-        Effect.catch((error) =>
-          Effect.logWarning("The mod authoring skill could not be installed", error.message).pipe(
-            Effect.annotateLogs({ component: "mods" }),
-          ),
-        ),
-      );
+      // It installs in the background so it does not hold up the server's start;
+      // closing waits for it, so no write lands after the server is gone.
+      const skillInstall = (async () => {
+        if (skillSourceDir === null) throw new Error("this build has no mod skill files");
+        await installModSkill({
+          sourceDir: skillSourceDir,
+          targetRoot: synaraBuiltinSkillsDir(config.baseDir),
+          modsDir,
+        });
+      })().catch((error: unknown) => {
+        runFork(
+          Effect.logWarning(
+            "The mod authoring skill could not be installed",
+            error instanceof Error ? error.message : String(error),
+          ).pipe(Effect.annotateLogs({ component: "mods" })),
+        );
+      });
+      yield* Effect.addFinalizer(() => Effect.promise(() => skillInstall));
       // Views that follow threads or projects redraw shortly after a change, once
       // per burst: a running turn emits many thread events.
       const pendingSources = new Map<ModViewSource, ReturnType<typeof setTimeout>>();
@@ -158,8 +179,16 @@ export const ModHostLive = Layer.effect(
       yield* Effect.forkScoped(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) =>
           Effect.sync(() => {
-            if (event.type.startsWith("thread.")) noteChange("threads");
-            else if (event.type.startsWith("project.")) noteChange("projects");
+            // Only changes to what mods see count: a streamed reply emits many thread
+            // events that leave every listed field as it was.
+            if (event.type.startsWith("thread.")) {
+              if (!shouldPublishThreadShellForEvent(event)) return;
+              shellCache = null;
+              noteChange("threads");
+            } else if (event.type.startsWith("project.")) {
+              shellCache = null;
+              noteChange("projects");
+            }
           }),
         ),
       );
@@ -197,6 +226,8 @@ export const ModHostLive = Layer.effect(
         guarded(() => manager.renderView(input.modId, input.viewId, input.context)),
       dispatchUi: (input) =>
         guarded(() => manager.dispatchUi(input.modId, input.handlerId, input.payload)),
+      export: (input) => guarded(() => manager.exportMod(input.id)),
+      import: (input) => guarded(() => manager.importMod(input.bundle, input.replace)),
       streamEvents,
     } satisfies ModHostShape;
   }),

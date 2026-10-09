@@ -42,6 +42,7 @@ export function ModComposerBands(props: { threadId: ThreadId; projectId: string 
           modId={view.modId}
           viewId={view.viewId}
           context={{ threadId: props.threadId, projectId: props.projectId }}
+          site="band"
           quiet
           className="min-w-0 px-3 py-1.5"
           frame={(content) => <ComposerStackedPanel>{content}</ComposerStackedPanel>}
@@ -62,8 +63,10 @@ export function ModHeaderActions(props: { threadId: ThreadId; projectId: string 
           modId={view.modId}
           viewId={view.viewId}
           context={{ threadId: props.threadId, projectId: props.projectId }}
+          site="header"
           quiet
-          className="flex shrink-0 items-center gap-1"
+          // A mod's header controls may not push the thread title out of a narrow header.
+          className="flex max-w-72 shrink-0 items-center gap-1 overflow-hidden"
         />
       ))}
     </>

@@ -1,6 +1,10 @@
 import type {
   ModsDispatchUiInput,
   ModsDispatchUiResult,
+  ModsExportInput,
+  ModsExportResult,
+  ModsImportInput,
+  ModsImportResult,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
@@ -33,6 +37,8 @@ export interface ModHostShape {
   readonly dispatchUi: (
     input: ModsDispatchUiInput,
   ) => Effect.Effect<ModsDispatchUiResult, ModHostError>;
+  readonly export: (input: ModsExportInput) => Effect.Effect<ModsExportResult, ModHostError>;
+  readonly import: (input: ModsImportInput) => Effect.Effect<ModsImportResult, ModHostError>;
   /** A snapshot of every mod, then each snapshot change, toast and redraw request after it. */
   readonly streamEvents: Stream.Stream<ModsStreamEvent, ModHostError>;
 }

@@ -347,7 +347,6 @@ burger
 burn-tokens
 burst
 bus
-c
 cabinet
 calculator
 calendar-1
@@ -563,7 +562,6 @@ collaboration-pointer-left
 collaboration-pointer-right
 color-palette
 color-palette-2
-color-picker
 color-roll
 color-swatch
 colors
@@ -580,7 +578,6 @@ commits
 compass-round
 compass-square
 components
-compose-pencil
 computer-use
 concise
 conductor
@@ -1604,7 +1601,6 @@ silver-medal
 sim-card-1
 sim-card-2
 siren
-siri
 sketch
 sketchbook
 skip

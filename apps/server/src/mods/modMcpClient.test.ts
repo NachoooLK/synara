@@ -1,6 +1,8 @@
 // FILE: modMcpClient.test.ts
 // Purpose: Runs `$.mcp` against real MCP servers: a stdio server Synara starts
-//          and stops, and a streamable HTTP server, both minimal fakes.
+//          and stops, and a streamable HTTP server, both minimal fakes. Covers the
+//          filtered child environment, process-tree teardown, open event streams,
+//          cancellation on close and session renewal.
 // Layer: Mods runtime tests
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -16,18 +18,27 @@ import { expandModMcpValue, ModMcpClient } from "./modMcpClient.ts";
 import { ModManager } from "./modManager.ts";
 
 // A stdio MCP server: answers initialize, lists one tool and echoes calls as JSON text.
+// FAKE_SILENT_INIT never answers initialize; FAKE_GRANDCHILD_PID_FILE starts a
+// grandchild the way `npx` starts the real server.
 const FAKE_STDIO_SERVER = `
 const readline = require("node:readline");
+const fs = require("node:fs");
 const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
 process.stdout.write("starting fake server (not JSON)\\n");
-if (process.env.FAKE_PID_FILE) require("node:fs").writeFileSync(process.env.FAKE_PID_FILE, String(process.pid));
+if (process.env.FAKE_PID_FILE) fs.writeFileSync(process.env.FAKE_PID_FILE, String(process.pid));
+if (process.env.FAKE_GRANDCHILD_PID_FILE) {
+  const grandchild = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  fs.writeFileSync(process.env.FAKE_GRANDCHILD_PID_FILE, String(grandchild.pid));
+}
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
-  if (message.method === "initialize") send({ id: message.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } } });
+  if (message.method === "initialize") {
+    if (!process.env.FAKE_SILENT_INIT) send({ id: message.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } } });
+  }
   else if (message.method === "tools/list") send({ id: message.id, result: { tools: [{ name: "echo", description: "Echoes", inputSchema: { type: "object" } }] } });
   else if (message.method === "tools/call") {
     if (message.params.name === "fail") send({ id: message.id, result: { content: [{ type: "text", text: "it broke" }], isError: true } });
-    else send({ id: message.id, result: { content: [{ type: "text", text: JSON.stringify({ echoed: message.params.arguments, token: process.env.FAKE_TOKEN }) }] } });
+    else send({ id: message.id, result: { content: [{ type: "text", text: JSON.stringify({ echoed: message.params.arguments, token: process.env.FAKE_TOKEN, refused: process.env.FAKE_REFUSED, leak: process.env.SYNARA_MOD_MCP_TEST_SECRET }) }] } });
   }
 });
 `;
@@ -39,6 +50,23 @@ function isAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+async function waitFor<T>(read: () => Promise<T | undefined> | T | undefined): Promise<T> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const value = await read();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error("Timed out waiting in the test.");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function readPid(file: string): Promise<number | undefined> {
+  return readFile(file, "utf8").then(
+    (text) => (text ? Number(text) : undefined),
+    () => undefined,
+  );
 }
 
 let root: string;
@@ -53,10 +81,100 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+function setEnv(name: string, value: string): void {
+  process.env[name] = value;
+  cleanups.push(() => {
+    delete process.env[name];
+  });
+}
+
 async function writeFakeStdioServer(): Promise<string> {
   const script = path.join(root, "fake-mcp.cjs");
   await writeFile(script, FAKE_STDIO_SERVER);
   return script;
+}
+
+interface FakeHttpRequest {
+  readonly method: string;
+  readonly tool: string | undefined;
+  readonly session: string | undefined;
+  readonly auth: string | undefined;
+}
+
+/**
+ * A streamable HTTP MCP server answering over an event stream: a notification
+ * first, then the answer split over two `data:` lines. Sessions start at
+ * `initialize`; a request with an unknown session gets 404. The tool "hang"
+ * never answers, and `keepOpen` leaves every stream open after the answer.
+ */
+async function startFakeHttpServer(options: { keepOpen?: boolean; status?: number } = {}) {
+  const requests: FakeHttpRequest[] = [];
+  const sessions = new Set<string>();
+  let created = 0;
+  const server: Server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      const message = JSON.parse(body);
+      const session = request.headers["mcp-session-id"] as string | undefined;
+      requests.push({
+        method: message.method,
+        tool: message.params?.name,
+        session,
+        auth: request.headers.authorization,
+      });
+      if (options.status !== undefined) {
+        response.writeHead(options.status).end();
+        return;
+      }
+      if (message.method !== "initialize" && (session === undefined || !sessions.has(session))) {
+        response.writeHead(404).end();
+        return;
+      }
+      if (message.id === undefined) {
+        response.writeHead(202).end();
+        return;
+      }
+      const headers: Record<string, string> = { "content-type": "text/event-stream" };
+      if (message.method === "initialize") {
+        headers["mcp-session-id"] = `session-${++created}`;
+        sessions.add(headers["mcp-session-id"]);
+      }
+      response.writeHead(200, headers);
+      response.write(
+        `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: {} })}\n\n`,
+      );
+      if (message.params?.name === "hang") {
+        response.write(": still working\n\n");
+        return;
+      }
+      const result =
+        message.method === "initialize"
+          ? {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              serverInfo: { name: "http", version: "1" },
+            }
+          : {
+              content: [{ type: "text", text: "{}" }],
+              structuredContent: { ok: true, auth: request.headers.authorization },
+            };
+      const json = JSON.stringify({ jsonrpc: "2.0", id: message.id, result });
+      const cut = json.indexOf(",") + 1;
+      response.write(`event: message\ndata: ${json.slice(0, cut)}\ndata: ${json.slice(cut)}\n\n`);
+      if (!options.keepOpen) response.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(
+    () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  );
+  const { port } = server.address() as AddressInfo;
+  return { url: `http://127.0.0.1:${port}/mcp`, requests, sessions };
 }
 
 describe("expandModMcpValue", () => {
@@ -65,74 +183,136 @@ describe("expandModMcpValue", () => {
     expect(expandModMcpValue("${env:MISSING}-x", {})).toBe("-x");
     expect(expandModMcpValue("$HOME ${other}", {})).toBe("$HOME ${other}");
   });
+
+  it("never expands Synara's own variables", () => {
+    const env = { SYNARA_AUTH_TOKEN: "secret", synara_auth_token: "secret" };
+    expect(expandModMcpValue("Bearer ${env:SYNARA_AUTH_TOKEN}", env)).toBe("Bearer ");
+    expect(expandModMcpValue("${env:synara_auth_token}", env)).toBe("");
+  });
 });
 
 describe("ModMcpClient", () => {
-  it("talks to a stdio server and passes environment variables through", async () => {
-    process.env.SYNARA_TEST_FAKE_TOKEN = "secret-1";
-    cleanups.push(() => {
-      delete process.env.SYNARA_TEST_FAKE_TOKEN;
-    });
+  it("gives a stdio server only the explicit env, never Synara's own variables", async () => {
+    setEnv("MOD_MCP_TEST_TOKEN", "secret-1");
+    setEnv("SYNARA_MOD_MCP_TEST_SECRET", "leak");
     const client = new ModMcpClient("fake", {
       command: process.execPath,
       args: [await writeFakeStdioServer()],
-      env: { FAKE_TOKEN: "${env:SYNARA_TEST_FAKE_TOKEN}" },
+      env: {
+        FAKE_TOKEN: "${env:MOD_MCP_TEST_TOKEN}",
+        FAKE_REFUSED: "${env:SYNARA_MOD_MCP_TEST_SECRET}",
+      },
     });
     cleanups.push(() => client.close());
     await expect(client.listTools()).resolves.toEqual([
       { name: "echo", description: "Echoes", inputSchema: { type: "object" } },
     ]);
     const result = await client.callTool("echo", { pr: 7 });
+    // No `leak`: the SYNARA_ variable is not inherited, and `${env:SYNARA_*}` is empty.
     expect(JSON.parse((result.content[0] as { text: string }).text)).toEqual({
       echoed: { pr: 7 },
       token: "secret-1",
+      refused: "",
     });
   });
 
-  it("talks to a streamable HTTP server and keeps its session id", async () => {
-    const sessions: Array<string | undefined> = [];
-    const server: Server = createServer((request, response) => {
-      let body = "";
-      request.on("data", (chunk) => (body += chunk));
-      request.on("end", () => {
-        sessions.push(request.headers["mcp-session-id"] as string | undefined);
-        const message = JSON.parse(body);
-        if (message.id === undefined) {
-          response.writeHead(202).end();
-          return;
-        }
-        const result =
-          message.method === "initialize"
-            ? {
-                protocolVersion: "2025-06-18",
-                capabilities: {},
-                serverInfo: { name: "http", version: "1" },
-              }
-            : {
-                content: [{ type: "text", text: "{}" }],
-                structuredContent: { ok: true, auth: request.headers.authorization },
-              };
-        // Answer as an event stream, the way many streamable HTTP servers do.
-        response.writeHead(200, {
-          "content-type": "text/event-stream",
-          "mcp-session-id": "session-9",
-        });
-        response.end(
-          `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: message.id, result })}\n\n`,
-        );
-      });
+  it("stops a server still starting at once, grandchildren included", async () => {
+    const pidFile = path.join(root, "server.pid");
+    const grandchildPidFile = path.join(root, "grandchild.pid");
+    const client = new ModMcpClient("slow", {
+      command: process.execPath,
+      args: [await writeFakeStdioServer()],
+      env: {
+        FAKE_SILENT_INIT: "1",
+        FAKE_PID_FILE: pidFile,
+        FAKE_GRANDCHILD_PID_FILE: grandchildPidFile,
+      },
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
-    const { port } = server.address() as AddressInfo;
+    cleanups.push(() => client.close());
+    const listing = client.listTools().then(
+      () => "resolved",
+      (error: Error) => error.message,
+    );
+    const pid = await waitFor(() => readPid(pidFile));
+    const grandchild = await waitFor(() => readPid(grandchildPidFile));
+    cleanups.push(() => {
+      if (isAlive(grandchild)) process.kill(grandchild, "SIGKILL");
+    });
+    expect(isAlive(grandchild)).toBe(true);
+
+    const started = Date.now();
+    await client.close();
+    expect(await listing).toBe("The mod's MCP connection closed.");
+    // Far below the 30 s initialize timeout the old close() waited for.
+    expect(Date.now() - started).toBeLessThan(10_000);
+    await waitFor(() => (isAlive(pid) || isAlive(grandchild) ? undefined : true));
+  });
+
+  it("talks to a streamable HTTP server and keeps its session id", async () => {
+    const fake = await startFakeHttpServer();
     const client = new ModMcpClient("http", {
-      url: `http://127.0.0.1:${port}/mcp`,
+      url: fake.url,
       headers: { authorization: "Bearer fixed" },
     });
     cleanups.push(() => client.close());
     const result = await client.callTool("anything", {});
     expect(result.structuredContent).toEqual({ ok: true, auth: "Bearer fixed" });
-    expect(sessions).toEqual([undefined, "session-9", "session-9"]);
+    expect(fake.requests.map(({ method, session }) => [method, session])).toEqual([
+      ["initialize", undefined],
+      ["notifications/initialized", "session-1"],
+      ["tools/call", "session-1"],
+    ]);
+  });
+
+  it("answers from an event stream the server keeps open, and close() cancels a pending call", async () => {
+    const fake = await startFakeHttpServer({ keepOpen: true });
+    const client = new ModMcpClient("http", { url: fake.url });
+    cleanups.push(() => client.close());
+    await expect(client.callTool("anything", {})).resolves.toMatchObject({
+      structuredContent: { ok: true },
+    });
+
+    const pending = client.callTool("hang", {}).then(
+      () => "resolved",
+      (error: Error) => error.message,
+    );
+    await waitFor(() => (fake.requests.some(({ tool }) => tool === "hang") ? true : undefined));
+    await client.close();
+    expect(await pending).toBe("The mod's MCP connection closed.");
+  });
+
+  it("starts a new session once when the server forgets the old one", async () => {
+    const fake = await startFakeHttpServer();
+    const client = new ModMcpClient("http", { url: fake.url });
+    cleanups.push(() => client.close());
+    await client.callTool("first", {});
+    fake.sessions.clear(); // The server restarted.
+    await expect(client.callTool("second", {})).resolves.toMatchObject({
+      structuredContent: { ok: true },
+    });
+    expect(fake.requests.map(({ method, session }) => [method, session])).toEqual([
+      ["initialize", undefined],
+      ["notifications/initialized", "session-1"],
+      ["tools/call", "session-1"],
+      ["tools/call", "session-1"],
+      ["initialize", undefined],
+      ["notifications/initialized", "session-2"],
+      ["tools/call", "session-2"],
+    ]);
+  });
+
+  it("says which ${env:SYNARA_*} it left empty when the server refuses", async () => {
+    setEnv("SYNARA_MOD_MCP_TEST_SECRET", "leak");
+    const fake = await startFakeHttpServer({ status: 401 });
+    const client = new ModMcpClient("http", {
+      url: fake.url,
+      headers: { authorization: "Bearer ${env:SYNARA_MOD_MCP_TEST_SECRET}" },
+    });
+    cleanups.push(() => client.close());
+    await expect(client.listTools()).rejects.toThrow(
+      'The "http" MCP server answered initialize with HTTP 401. (${env:SYNARA_MOD_MCP_TEST_SECRET} was left empty',
+    );
+    expect(fake.requests[0]?.auth?.trim()).toBe("Bearer");
   });
 });
 

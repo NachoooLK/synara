@@ -1238,7 +1238,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   private readonly pluginDetailCache = new Map<string, ProviderReadPluginResult>();
 
   private runPromise: (effect: Effect.Effect<unknown, never>) => Promise<unknown>;
-  private readonly synaraSkillsDir: string | undefined;
+  private readonly synaraSkillRoots: ReadonlyArray<string>;
   private readonly agentGatewayMcp:
     | {
         readonly endpointUrl: () => string;
@@ -1260,7 +1260,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   constructor(
     services?: ServiceMap.ServiceMap<never>,
     options?: {
-      readonly synaraSkillsDir?: string;
+      readonly synaraSkillRoots?: ReadonlyArray<string>;
       readonly agentGatewayMcp?: {
         readonly endpointUrl: () => string;
         readonly acquireSessionLease: (
@@ -1277,7 +1277,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   ) {
     super();
     this.runPromise = services ? Effect.runPromiseWith(services) : Effect.runPromise;
-    this.synaraSkillsDir = options?.synaraSkillsDir;
+    this.synaraSkillRoots = options?.synaraSkillRoots ?? [];
     this.agentGatewayMcp = options?.agentGatewayMcp;
     this.spawnAppServer = options?.spawnAppServer ?? spawnCodexAppServer;
     this.teardownProcessTree = options?.teardownProcessTree ?? teardownProviderProcessTree;
@@ -1316,17 +1316,18 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     };
   }
 
-  // Registers `~/.synara/skills` as a codex skill root so portable skills are
-  // first-class: skills/list returns them and turn/start `skill` items inject
-  // their instructions. Verified live: skill items with paths outside known
-  // roots are silently ignored by codex app-server, so this call is required.
+  // Registers `~/.synara/skills` (and, with mods on, Synara's built-in skills)
+  // as codex skill roots so portable skills are first-class: skills/list returns
+  // them and turn/start `skill` items inject their instructions. Verified live:
+  // skill items with paths outside known roots are silently ignored by codex
+  // app-server, so this call is required.
   private async registerSynaraSkillsRoot(context: CodexSessionContext): Promise<void> {
-    if (!this.synaraSkillsDir) {
+    if (this.synaraSkillRoots.length === 0) {
       return;
     }
     try {
       await this.sendRequest(context, "skills/extraRoots/set", {
-        extraRoots: [this.synaraSkillsDir],
+        extraRoots: [...this.synaraSkillRoots],
       });
     } catch (error) {
       if (!this.isContextRoutable(context)) throw error;

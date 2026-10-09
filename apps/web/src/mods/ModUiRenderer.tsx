@@ -4,17 +4,19 @@
 //          the text sizes the person chose in Settings; unknown elements show a notice.
 // Layer: Web mods UI
 
-import type { ModUiTree } from "@synara/contracts";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import type { ModUiTree, ModViewSite } from "@synara/contracts";
+import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 
 import ChatMarkdown from "~/components/ChatMarkdown";
 import { SidebarSectionLabel } from "~/components/SidebarListSection";
+import { ChatHeaderIconButton } from "~/components/chat/chatHeaderControls";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { Separator } from "~/components/ui/separator";
 import { Spinner } from "~/components/ui/spinner";
 import { Switch } from "~/components/ui/switch";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { CentralIcon } from "~/lib/central-icons";
 import { openExternalLink } from "~/lib/linkChips";
 import { cn } from "~/lib/utils";
@@ -37,8 +39,14 @@ export interface ModUiElement {
 }
 export type ModUiNode = ModUiElement | string;
 
-/** Sends a `{ $handler }` reference back to the mod with what happened. */
-export type ModUiDispatch = (handler: unknown, payload: unknown) => void;
+/**
+ * Sends a `{ $handler }` reference back to the mod with what happened. Resolves
+ * true once the mod handled it, false when it failed (the host shows why).
+ */
+export type ModUiDispatch = (handler: unknown, payload: unknown) => Promise<boolean>;
+
+/** The site a tree is drawn in; elements match that place's own controls. */
+export const ModUiSiteContext = createContext<ModViewSite | null>(null);
 
 const INPUT_CHANGE_DEBOUNCE_MS = 300;
 
@@ -172,6 +180,7 @@ function ModUiChildren(props: { nodes: ReadonlyArray<ModUiNode>; dispatch: ModUi
 function ModUiInput(props: { element: ModUiElement; dispatch: ModUiDispatch }) {
   const { element, dispatch } = props;
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [pending, setPending] = useState(false);
   useEffect(
     () => () => {
       if (timer.current !== null) clearTimeout(timer.current);
@@ -187,6 +196,7 @@ function ModUiInput(props: { element: ModUiElement; dispatch: ModUiDispatch }) {
       placeholder={stringProp(element.props, "placeholder")}
       defaultValue={stringProp(element.props, "defaultValue") ?? stringProp(element.props, "value")}
       aria-label={stringProp(element.props, "label") ?? stringProp(element.props, "placeholder")}
+      aria-busy={pending || undefined}
       onChange={(event) => {
         if (!isHandler(onChange)) return;
         const value = event.currentTarget.value;
@@ -194,9 +204,18 @@ function ModUiInput(props: { element: ModUiElement; dispatch: ModUiDispatch }) {
         timer.current = setTimeout(() => dispatch(onChange, value), INPUT_CHANGE_DEBOUNCE_MS);
       }}
       onKeyDown={(event) => {
-        if (event.key === "Enter" && isHandler(onSubmit)) {
-          dispatch(onSubmit, event.currentTarget.value);
-        }
+        if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+        // A band sits inside the composer's form: Enter must not also send the draft.
+        event.preventDefault();
+        event.stopPropagation();
+        if (!isHandler(onSubmit) || pending) return;
+        const field = event.currentTarget;
+        setPending(true);
+        void dispatch(onSubmit, field.value).then((handled) => {
+          setPending(false);
+          // Ready for the next entry; a mod that shows the saved value redraws with it.
+          if (handled) field.value = "";
+        });
       }}
     />
   );
@@ -216,7 +235,11 @@ function ModUiSwitch(props: { element: ModUiElement; dispatch: ModUiDispatch }) 
       aria-label={label}
       onCheckedChange={(next) => {
         setChecked(Boolean(next));
-        if (isHandler(element.props.onChange)) dispatch(element.props.onChange, Boolean(next));
+        if (!isHandler(element.props.onChange)) return;
+        void dispatch(element.props.onChange, Boolean(next)).then((handled) => {
+          // The mod never took the change, so show the value it still has.
+          if (!handled) setChecked(checkedProp);
+        });
       }}
     />
   );
@@ -229,13 +252,94 @@ function ModUiSwitch(props: { element: ModUiElement; dispatch: ModUiDispatch }) 
   );
 }
 
+function ModUiButton(props: {
+  element: ModUiElement;
+  dispatch: ModUiDispatch;
+  children: ReactNode;
+}) {
+  const { element, dispatch } = props;
+  const p = element.props;
+  const site = useContext(ModUiSiteContext);
+  const [pending, setPending] = useState(false);
+  const icon = stringProp(p, "icon");
+  const label = stringProp(p, "label");
+  const hasChildren = element.children.length > 0;
+  // An icon-only button still needs a name for screen readers and its tooltip.
+  const name = label ?? (textOf(element.children) || icon);
+  const onPress = isHandler(p.onPress)
+    ? () => {
+        // A handler can take seconds; a second press would run it again.
+        if (pending) return;
+        setPending(true);
+        void dispatch(p.onPress, null).then(() => setPending(false));
+      }
+    : undefined;
+  const disabled = p.disabled === true || !onPress || pending;
+
+  if (site === "header" && icon) {
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <ChatHeaderIconButton
+              type="button"
+              tone="surface"
+              label={name ?? ""}
+              disabled={disabled}
+              aria-busy={pending || undefined}
+              onClick={onPress}
+            />
+          }
+        >
+          <CentralIcon name={icon} className="size-4 shrink-0" />
+        </TooltipTrigger>
+        {name ? <TooltipPopup side="bottom">{name}</TooltipPopup> : null}
+      </Tooltip>
+    );
+  }
+
+  const variant =
+    typeof p.variant === "string" && BUTTON_VARIANTS.has(p.variant)
+      ? p.variant
+      : site === "header"
+        ? "ghost"
+        : "outline";
+  const iconOnly = !hasChildren && icon !== undefined && label === undefined;
+  return (
+    <Button
+      size={iconOnly ? "icon-xs" : "xs"}
+      variant={variant as "default" | "outline" | "ghost" | "secondary" | "destructive"}
+      className={cn(site === "header" && "max-w-40")}
+      disabled={disabled}
+      aria-label={name}
+      aria-busy={pending || undefined}
+      title={name}
+      onClick={onPress}
+    >
+      {pending && !icon ? <Spinner className="size-3.5" /> : null}
+      {icon ? (
+        pending ? (
+          <Spinner className="size-3.5" />
+        ) : (
+          <CentralIcon name={icon} className="size-3.5" />
+        )
+      ) : null}
+      {iconOnly ? null : hasChildren ? (
+        props.children
+      ) : (
+        <span className="min-w-0 truncate">{label}</span>
+      )}
+    </Button>
+  );
+}
+
 function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): ReactNode {
   const { node, dispatch } = props;
   if (typeof node === "string") return node;
   const element = node;
   const p = element.props;
   const children = <ModUiChildren nodes={element.children} dispatch={dispatch} />;
-  const onPress = isHandler(p.onPress) ? () => dispatch(p.onPress, null) : undefined;
+  const onPress = isHandler(p.onPress) ? () => void dispatch(p.onPress, null) : undefined;
 
   switch (element.type) {
     case "Fragment":
@@ -254,6 +358,9 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
             pick(JUSTIFY_CLASS_NAMES, p.justify),
             p.grow === true && "flex-1",
             p.wrap === true && "flex-wrap",
+            // A column taller than its space scrolls; it must not squash its children
+            // (headings to nothing, code to one line). A row may shrink them to truncate.
+            p.direction !== "row" && "[&>*]:shrink-0",
             p.border === true && "rounded-md border",
             p.scroll === true && "min-h-0 overflow-y-auto",
           )}
@@ -291,7 +398,7 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
       );
     case "Section":
       return (
-        <section className="flex min-w-0 flex-col gap-0.5">
+        <section className="flex min-w-0 flex-col gap-0.5 [&>*]:shrink-0">
           {stringProp(p, "title") ? (
             <SidebarSectionLabel
               label={stringProp(p, "title") ?? ""}
@@ -302,10 +409,13 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
         </section>
       );
     case "List":
-      return <div className="flex min-w-0 flex-col gap-0.5">{children}</div>;
+      return <div className="flex min-w-0 flex-col gap-0.5 [&>*]:shrink-0">{children}</div>;
     case "Row": {
       const icon = stringProp(p, "icon");
       const meta = stringProp(p, "meta");
+      // `title` is the row's text; children follow it (a badge, a count) or are the text.
+      const title = stringProp(p, "title");
+      const tooltip = title ?? textOf(element.children);
       const className = cn(
         "flex w-full min-w-0 items-center text-left",
         SIDEBAR_ROW_HEIGHT_CLASS_NAME,
@@ -320,45 +430,42 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
       const content = (
         <>
           {icon ? <CentralIcon name={icon} className="size-4 shrink-0 opacity-80" /> : null}
-          <span className="min-w-0 flex-1 truncate">{children}</span>
+          {title !== undefined ? (
+            <>
+              <span className="min-w-0 flex-1 truncate">{title}</span>
+              {element.children.length > 0 ? (
+                <span className="flex shrink-0 items-center gap-1">{children}</span>
+              ) : null}
+            </>
+          ) : (
+            <span className="min-w-0 flex-1 truncate">{children}</span>
+          )}
           {meta ? <span className="shrink-0 text-ui-xs text-muted-foreground">{meta}</span> : null}
         </>
       );
+      const current = p.active === true ? "true" : undefined;
       return onPress ? (
         <button
           type="button"
           className={className}
-          title={stringProp(p, "title")}
+          title={tooltip || undefined}
+          aria-current={current}
           onClick={onPress}
         >
           {content}
         </button>
       ) : (
-        <div className={className} title={stringProp(p, "title")}>
+        <div className={className} title={tooltip || undefined} aria-current={current}>
           {content}
         </div>
       );
     }
-    case "Button": {
-      const icon = stringProp(p, "icon");
-      const label = stringProp(p, "label");
-      const variant =
-        typeof p.variant === "string" && BUTTON_VARIANTS.has(p.variant) ? p.variant : "outline";
-      const iconOnly = element.children.length === 0 && icon !== undefined;
+    case "Button":
       return (
-        <Button
-          size={iconOnly ? "icon-xs" : "xs"}
-          variant={variant as "default" | "outline" | "ghost" | "secondary" | "destructive"}
-          disabled={p.disabled === true || !onPress}
-          aria-label={label}
-          title={label}
-          onClick={onPress}
-        >
-          {icon ? <CentralIcon name={icon} className="size-3.5" /> : null}
-          {iconOnly ? null : element.children.length > 0 ? children : label}
-        </Button>
+        <ModUiButton element={element} dispatch={dispatch}>
+          {children}
+        </ModUiButton>
       );
-    }
     case "Icon": {
       const name = stringProp(p, "name");
       if (!name) return null;
@@ -398,12 +505,15 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
       );
     case "Link": {
       const href = stringProp(p, "href");
+      const opensUrl = href !== undefined && /^https?:\/\//iu.test(href);
       return (
         <button
           type="button"
-          className="text-info-foreground underline-offset-2 hover:underline"
+          className="rounded-sm text-info-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:no-underline disabled:opacity-60"
+          disabled={!opensUrl && !onPress}
+          title={opensUrl ? href : undefined}
           onClick={() => {
-            if (href && /^https?:\/\//iu.test(href)) openExternalLink(href);
+            if (opensUrl) openExternalLink(href);
             onPress?.();
           }}
         >
@@ -428,7 +538,14 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
         </div>
       );
     case "Input":
-      return <ModUiInput element={element} dispatch={dispatch} />;
+      // A new value from the mod (a saved note) replaces what the field shows.
+      return (
+        <ModUiInput
+          key={String(stringProp(p, "defaultValue") ?? stringProp(p, "value") ?? "")}
+          element={element}
+          dispatch={dispatch}
+        />
+      );
     case "Switch":
       return <ModUiSwitch element={element} dispatch={dispatch} />;
     default:
@@ -441,8 +558,16 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
 }
 
 /** Draws a whole tree; a value that is not a tree draws nothing. */
-export function ModUiRenderer(props: { tree: ModUiTree | null; dispatch: ModUiDispatch }) {
+export function ModUiRenderer(props: {
+  tree: ModUiTree | null;
+  dispatch: ModUiDispatch;
+  site?: ModViewSite | undefined;
+}) {
   const node = asNode(props.tree);
   if (node === null) return null;
-  return <ModUiNodeView node={node} dispatch={props.dispatch} />;
+  return (
+    <ModUiSiteContext.Provider value={props.site ?? null}>
+      <ModUiNodeView node={node} dispatch={props.dispatch} />
+    </ModUiSiteContext.Provider>
+  );
 }

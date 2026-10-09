@@ -89,6 +89,7 @@ import {
 } from "./ChatThreadSurfacePrimitives";
 import { FloatingBrowserPanel } from "./FloatingBrowserPanel";
 import { shouldRenderFloatingBrowserPanel } from "./floatingBrowserPanel.logic";
+import { SurfaceChipIcon } from "./chatHeaderControls";
 import { PanelStateMessage } from "./PanelStateMessage";
 import { RightDock } from "./RightDock";
 import { SidechatDockPane, useSidechatDockPanePruning } from "./SidechatDockPane";
@@ -126,6 +127,7 @@ import {
 import { isShortcutDispatchSuspended, resolveShortcutCommand } from "~/keybindings";
 import { isTerminalFocused } from "~/lib/terminalFocus";
 import { cn } from "~/lib/utils";
+import { MODS_ON } from "~/betaFeatures";
 import { ModViewHost } from "~/mods/ModViewHost";
 import { useModDockItems } from "~/mods/useModDockItems";
 
@@ -813,10 +815,21 @@ export function SingleChatSurface(props: {
   const pullRequestPaneStateIcon = usePullRequestPaneStateIcon(
     pullRequestPane ? pullRequestDetailInputFromPane(pullRequestPane) : null,
   );
-  const paneIconOverrides =
-    pullRequestPane && pullRequestPaneStateIcon
-      ? { [pullRequestPane.id]: pullRequestPaneStateIcon }
-      : undefined;
+  const paneIconOverrides = useMemo(() => {
+    const overrides: Record<string, ReactNode> = {};
+    if (pullRequestPane && pullRequestPaneStateIcon) {
+      overrides[pullRequestPane.id] = pullRequestPaneStateIcon;
+    }
+    // A mod's tab shows its view's own icon, like its entry in the + menu.
+    for (const pane of dockState.panes) {
+      if (pane.kind === "mod" && pane.modId && pane.modViewId) {
+        overrides[pane.id] = (
+          <SurfaceChipIcon icon={modDockItems.viewIcon(pane.modId, pane.modViewId)} />
+        );
+      }
+    }
+    return Object.keys(overrides).length > 0 ? overrides : undefined;
+  }, [pullRequestPane, pullRequestPaneStateIcon, dockState.panes, modDockItems]);
 
   const createDockSidechat = async () => {
     // Reuse /side so the current model, permissions and workspace stay inherited.
@@ -989,15 +1002,17 @@ export function SingleChatSurface(props: {
           </Suspense>
         );
       case "mod":
-        return pane.modId && pane.modViewId ? (
+        // Stable keeps a saved mod tab but leaves it inert.
+        return MODS_ON && pane.modId && pane.modViewId ? (
           <ModViewHost
             modId={pane.modId}
             viewId={pane.modViewId}
             context={{ threadId: props.threadId, projectId: props.projectId }}
+            site="dock"
             className="h-full overflow-y-auto p-2"
           />
         ) : (
-          <RightDockPanePlaceholder kind={pane.kind} />
+          <PanelStateMessage>This mod panel is not available.</PanelStateMessage>
         );
       case "sidechat":
         return (

@@ -28,7 +28,7 @@ import type {
 import { resolveActivePane } from "~/rightDockStore.logic";
 import { Button } from "../ui/button";
 import { IconButton } from "../ui/icon-button";
-import { Menu, MenuItem, MenuTrigger } from "../ui/menu";
+import { Menu, MenuGroup, MenuGroupLabel, MenuItem, MenuSeparator, MenuTrigger } from "../ui/menu";
 import {
   Sidebar,
   SIDEBAR_OFFCANVAS_MOTION_CLASS,
@@ -283,6 +283,21 @@ export function RightDock(props: RightDockProps) {
     ? SIDEBAR_OFFCANVAS_MOTION_SUPPRESSED_CLASS
     : SIDEBAR_OFFCANVAS_MOTION_CLASS;
 
+  // Mod dock views sit under their own "Mods" heading in the + menu, after Synara's panes.
+  const extraAddMenuItems = {
+    other: (props.extraLauncherItems ?? []).filter((item) => item.kind !== "mod"),
+    mods: (props.extraLauncherItems ?? []).filter((item) => item.kind === "mod"),
+  };
+  const renderExtraAddMenuItem = (item: RightDockLauncherItem) => (
+    <MenuItem
+      key={item.key ?? item.kind}
+      onClick={() => (item.onOpen ? item.onOpen() : props.onAddPane(item.kind))}
+    >
+      <item.Icon className="size-3.5 shrink-0" />
+      <span>{item.label}</span>
+    </MenuItem>
+  );
+
   return (
     <SidebarProvider
       defaultOpen={false}
@@ -359,15 +374,18 @@ export function RightDock(props: RightDockProps) {
                       </MenuItem>
                     );
                   })}
-                  {(props.extraLauncherItems ?? []).map((item) => (
-                    <MenuItem
-                      key={item.key ?? item.kind}
-                      onClick={() => (item.onOpen ? item.onOpen() : props.onAddPane(item.kind))}
-                    >
-                      <item.Icon className="size-3.5 shrink-0" />
-                      <span>{item.label}</span>
-                    </MenuItem>
-                  ))}
+                  {extraAddMenuItems.other.map(renderExtraAddMenuItem)}
+                  {extraAddMenuItems.mods.length > 0 ? (
+                    <>
+                      {props.addMenuKinds.length + extraAddMenuItems.other.length > 0 ? (
+                        <MenuSeparator />
+                      ) : null}
+                      <MenuGroup>
+                        <MenuGroupLabel>Mods</MenuGroupLabel>
+                        {extraAddMenuItems.mods.map(renderExtraAddMenuItem)}
+                      </MenuGroup>
+                    </>
+                  ) : null}
                 </ComposerPickerMenuPopup>
               </Menu>
             ) : null}

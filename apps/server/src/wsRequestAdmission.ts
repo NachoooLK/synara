@@ -1,15 +1,29 @@
 import * as Crypto from "node:crypto";
 
-import { ORCHESTRATION_WS_METHODS, WS_METHODS, WsRpcError } from "@synara/contracts";
+import {
+  MODS_WS_METHODS,
+  ORCHESTRATION_WS_METHODS,
+  WS_METHODS,
+  WsRpcError,
+} from "@synara/contracts";
 import { Effect, Ref } from "effect";
 
-export type WsRequestClass = "control" | "standard" | "expensive-read";
+export type WsRequestClass = "control" | "standard" | "expensive-read" | "mods";
 
 export const WS_REQUEST_CLASS_LIMITS: Readonly<Record<WsRequestClass, number>> = {
   control: 16,
   standard: 12,
   "expensive-read": 2,
+  // A slow or stuck mod waits on its own slots, never on Synara's.
+  mods: 4,
 };
+
+/** Calls that run a mod's code, which may take seconds. */
+const MOD_METHODS = new Set<string>([
+  MODS_WS_METHODS.renderView,
+  MODS_WS_METHODS.dispatchUi,
+  MODS_WS_METHODS.runCommand,
+]);
 
 const CONTROL_METHODS = new Set<string>([
   WS_METHODS.serverGetRuntimeStatus,
@@ -76,6 +90,7 @@ const EXPENSIVE_READ_METHODS = new Set<string>([
 export function classifyWsRequest(method: string): WsRequestClass {
   if (CONTROL_METHODS.has(method)) return "control";
   if (EXPENSIVE_READ_METHODS.has(method)) return "expensive-read";
+  if (MOD_METHODS.has(method)) return "mods";
   return "standard";
 }
 

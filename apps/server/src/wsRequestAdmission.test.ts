@@ -1,4 +1,4 @@
-import { ORCHESTRATION_WS_METHODS, WS_METHODS } from "@synara/contracts";
+import { MODS_WS_METHODS, ORCHESTRATION_WS_METHODS, WS_METHODS } from "@synara/contracts";
 import { Deferred, Effect, Fiber } from "effect";
 import { describe, expect, it } from "vitest";
 
@@ -13,6 +13,8 @@ describe("WsRequestAdmission", () => {
     expect(classifyWsRequest(ORCHESTRATION_WS_METHODS.getTurnDiff)).toBe("expensive-read");
     expect(classifyWsRequest(ORCHESTRATION_WS_METHODS.repairState)).toBe("expensive-read");
     expect(classifyWsRequest(WS_METHODS.serverPrewarmVoice)).toBe("expensive-read");
+    expect(classifyWsRequest(MODS_WS_METHODS.renderView)).toBe("mods");
+    expect(classifyWsRequest(MODS_WS_METHODS.list)).toBe("standard");
     expect(classifyWsRequest(WS_METHODS.projectsResolveWorkspaceFileReferences)).toBe(
       "expensive-read",
     );

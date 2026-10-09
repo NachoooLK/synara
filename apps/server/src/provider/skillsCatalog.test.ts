@@ -18,6 +18,7 @@ import {
   filterDisabledSkills,
   mergeSkillsIntoCatalog,
   parseSkillFrontmatter,
+  synaraSkillRoots,
 } from "./skillsCatalog.ts";
 import { pathIsWithin } from "./claudePluginSkills.ts";
 
@@ -138,6 +139,16 @@ description: Use when: the user asks for it
 ---
 `),
     ).toEqual({ name: "loose", description: "Use when: the user asks for it" });
+  });
+});
+
+describe("synaraSkillRoots", () => {
+  it("adds the built-in skills folder where mods are on, so Codex loads the mods skill", () => {
+    // Tests run without a desktop bundle id, a host where Beta-only features stay on.
+    expect(synaraSkillRoots("/home/me/.synara-beta")).toEqual([
+      path.join("/home/me/.synara-beta", "skills"),
+      path.join("/home/me/.synara-beta", "builtin-skills"),
+    ]);
   });
 });
 

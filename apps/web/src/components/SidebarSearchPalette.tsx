@@ -59,6 +59,7 @@ import {
   type SidebarSearchTheme,
   type SidebarSearchThread,
   buildSidebarSearchServerThreadMatches,
+  isStrongSidebarSearchActionMatch,
   matchSidebarSearchActions,
   matchSidebarSearchProjects,
   matchSidebarSearchThemes,
@@ -104,6 +105,7 @@ const PALETTE_STATUS_CLASS = "px-4 pt-1 pb-3 text-ui text-muted-foreground/79";
 const SETTINGS_ACTION_IDS: ReadonlySet<string> = new Set([
   "settings",
   "usage-settings",
+  "mods-settings",
   "feedback",
 ]);
 
@@ -718,6 +720,19 @@ export function SidebarSearchPalette(props: SidebarSearchPaletteProps) {
       </CommandItem>
     );
   };
+  // A query that names a command (its label, or the start of it) puts Actions above
+  // Threads, so the auto-highlighted first row is that command, not a thread that
+  // happens to mention the same words.
+  const actionsLead = isStrongSidebarSearchActionMatch(quickActions[0], query);
+  const actionsGroup =
+    !isBrowsing && quickActions.length > 0 ? (
+      <CommandGroup>
+        <CommandGroupLabel className={PALETTE_GROUP_LABEL_CLASS}>
+          <span>{query ? "Actions" : "Quick actions"}</span>
+        </CommandGroupLabel>
+        {quickActions.map(renderActionItem)}
+      </CommandGroup>
+    ) : null;
 
   const normalizedSourceQuery = query.trim().toLowerCase();
   const importProjectsSources = IMPORT_PROJECTS_SOURCES.filter((source) =>
@@ -1008,6 +1023,8 @@ export function SidebarSearchPalette(props: SidebarSearchPaletteProps) {
                   </CommandGroup>
                 ) : null}
 
+                {actionsLead ? actionsGroup : null}
+
                 {/* Recent threads lead when idle (mirrors the Ctrl+Tab switcher order);
                     with a query the group turns into the thread matches. */}
                 {!isBrowsing && matchedThreads.length > 0 ? (
@@ -1088,14 +1105,7 @@ export function SidebarSearchPalette(props: SidebarSearchPaletteProps) {
                   </CommandGroup>
                 ) : null}
 
-                {!isBrowsing && quickActions.length > 0 ? (
-                  <CommandGroup>
-                    <CommandGroupLabel className={PALETTE_GROUP_LABEL_CLASS}>
-                      <span>{query ? "Actions" : "Quick actions"}</span>
-                    </CommandGroupLabel>
-                    {quickActions.map(renderActionItem)}
-                  </CommandGroup>
-                ) : null}
+                {actionsLead ? null : actionsGroup}
 
                 {!isBrowsing && settingsActions.length > 0 ? (
                   <CommandGroup>

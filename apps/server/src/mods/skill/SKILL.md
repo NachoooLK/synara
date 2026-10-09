@@ -1,6 +1,6 @@
 ---
 name: synara-mods
-description: Write, load and debug Synara mods, small TypeScript modules that customize Synara itself with sidebar views, dock panels, bands above the composer, thread header buttons and palette commands. Use when the person asks to build, change or fix a Synara mod or plugin, to add something to Synara's interface, or to show their own data (pull requests, tickets, notes) inside Synara.
+description: Write, load, debug and explain Synara mods, small TypeScript modules that customize Synara itself with sidebar views, dock panels, bands above the composer, thread header buttons and palette commands. Use when the person asks to build, change or fix a Synara mod or plugin, to add something to Synara's interface, or to show their own data (pull requests, tickets, notes) inside Synara; and when they ask what mods are, where they run, or how to enable, share, export or import one.
 ---
 
 # Synara mods
@@ -12,6 +12,27 @@ Synara renders with its own components.
 
 - Mods folder: `{{MODS_DIR}}`
 - This skill's files: `{{SKILL_DIR}}`
+
+## What to tell the person about mods
+
+When the person asks about mods rather than for one, answer from this:
+
+- **What it is.** A folder of TypeScript that adds to Synara's interface: a
+  sidebar view, a dock panel, a band above the composer, buttons in the thread
+  header, palette commands, notices and a status line. It can read the thread
+  and project lists and call MCP servers its manifest declares.
+- **Beta only.** Mods exist only in Synara Beta; a Stable build ignores them.
+- **Where it runs.** On the computer that runs Synara's server, each mod in its
+  own worker. Windows connected from elsewhere only draw its views.
+- **Trust.** A mod is not sandboxed: it runs with Synara's own access. A new
+  mod starts off; the person turns it on in **Settings → Mods**, which asks them
+  to confirm they trust it. The same page shows each mod's state, log, commands
+  and views, and reloads it.
+- **Sharing.** **Export** next to a mod in Settings → Mods saves one
+  `<name>.synara-mod.json` file; **Import…** on the same page, or dropping
+  the file onto it, installs one, turned off. Hidden files such as `.env`, `node_modules`, what the mod saved
+  with `$.store` and its on or off state stay behind. Importing a mod that is
+  already installed asks to replace it, turns it off, and keeps its saved data.
 
 ## A mod in three files
 
@@ -91,7 +112,9 @@ A mod reaches outside services through MCP servers declared in its manifest:
 ```
 
 - `${env:NAME}` takes the value from Synara's environment, so tokens stay out of
-  the mod's files. Never write a token into a mod.
+  the mod's files. Never write a token into a mod. A local server gets ordinary
+  variables plus its `env`, never Synara's own `SYNARA_*` variables or provider
+  credentials, and `${env:SYNARA_*}` is always empty.
 - Call `$.mcp.tools("bitbucket")` first to learn the tool names and arguments
   (for example from a command that logs them) before using them.
 - Many servers answer with JSON as text; `$.mcp.json` parses it for you.
@@ -111,7 +134,7 @@ native. Props take fixed values, not CSS or class names.
 | `Box`                                                  | `direction`, `gap`, `padding`, `paddingX`, `paddingY` (0, 1, 2, 3, 4, 6), `align`, `justify`, `grow`, `wrap`, `border`, `scroll` |
 | `Text`                                                 | `size` (`xs`, `sm`, `md`, `lg`), `tone` (`muted`, `success`, `warning`, `danger`, `info`), `weight`, `mono`, `truncate`, `block` |
 | `Heading`, `Section`                                   | `Section title` groups rows the way "Projects" does in the sidebar                                                               |
-| `List`, `Row`                                          | `Row`: `icon`, `meta`, `active`, `title`, `onPress`. It is a sidebar row.                                                        |
+| `List`, `Row`                                          | `Row`: `title` (its text), `icon`, `meta`, `active`, `onPress`; children follow the title (a badge). It is a sidebar row.        |
 | `Button`                                               | `icon`, `label`, `variant` (`outline`, `ghost`, `default`, `secondary`, `destructive`), `disabled`, `onPress`                    |
 | `Input`                                                | `placeholder`, `defaultValue`, `onSubmit(value)` (Enter), `onChange(value)` (after a pause)                                      |
 | `Switch`                                               | `checked`, `label`, `onChange(checked)`                                                                                          |
@@ -119,10 +142,18 @@ native. Props take fixed values, not CSS or class names.
 | `Icon`, `Badge`, `Link`, `Divider`, `Spinner`, `Empty` | see `types/synara.d.ts`                                                                                                          |
 
 - **Handlers.** `onPress`, `onChange` and `onSubmit` run in the mod. Keep them
-  short; redraw by changing `$.state` or calling `$.ui.invalidate`.
-- **Icons.** Icons are Central icon names. A name that does not exist draws
-  nothing, so check it first with `grep -x <name> {{SKILL_DIR}}/reference/icons.txt`,
-  or search with `grep <word> …/icons.txt`.
+  short; redraw by changing `$.state` or calling `$.ui.invalidate`. A button is
+  disabled while its handler runs, and an `Input` clears after `onSubmit`.
+- **Rendering.** `ui.render` only reads and returns a tree. `$.state.set` and
+  `$.ui.invalidate` called while a view draws do not redraw it, so load data
+  in a handler or command, or cache it in `$.state` on first draw.
+- **Errors.** A render or command that throws shows its error in the window
+  and in the log, so let errors surface instead of returning nothing.
+- **Icons.** Icons are Central icon names. A name that does not exist is
+  dropped (a view falls back to the mod glyph) and the log says so, so check it
+  first with `grep -x <name> {{SKILL_DIR}}/reference/icons.txt`, or search with
+  `grep <word> …/icons.txt`. Common names: `star`, `bell`, `clock`, `code`,
+  `folder-2`, `pull-request`, `branch`, `chat-bubble-7`, `layout-dashboard`.
 - **Sites.** Each site has its own space:
   - `sidebar` views get a rail button and replace the thread list.
   - `dock` views open as a tab next to the thread, from the dock's + menu or `$.ui.openDockView`.
@@ -161,6 +192,9 @@ native. Props take fixed values, not CSS or class names.
 - Every effect goes through `$`.
 - Do not read files, start processes or call the network from a mod. The mod
   interface has no way to do it, and imports outside the mod are refused.
+- Limits: `$.state` 4 MB and 1,000 keys, `$.store` 1 MB, 5 toasts and 200 log
+  lines every 10 s, 20 views and 50 commands. A hook may run for 10 s of its own
+  time and 60 s in all, waits included.
 - Keep data a view needs in `$.state` (fast, lost on restart) or `$.store`
   (saved), never in module variables. A reload starts the module over.
 - Mods are a Beta feature. On a Stable build the mods folder is ignored.

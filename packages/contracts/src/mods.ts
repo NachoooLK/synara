@@ -17,6 +17,8 @@ export const MODS_WS_METHODS = {
   runCommand: "mods.runCommand",
   renderView: "mods.renderView",
   dispatchUi: "mods.dispatchUi",
+  export: "mods.export",
+  import: "mods.import",
   subscribeEvents: "mods.subscribeEvents",
 } as const;
 
@@ -328,3 +330,70 @@ export const ModsDispatchUiResult = Schema.Struct({
   effects: Schema.Array(ModUiEffect),
 });
 export type ModsDispatchUiResult = typeof ModsDispatchUiResult.Type;
+
+// ── Export and import ────────────────────────────────────────────────
+// An exported mod is one JSON file holding every file of its folder, so it can
+// be shared like any document and imported into another Synara.
+
+export const MOD_BUNDLE_FORMAT = "synara-mod";
+export const MOD_BUNDLE_FORMAT_VERSION = 1;
+/** An exported mod is saved as `<name>.synara-mod.json`. */
+export const MOD_BUNDLE_FILE_SUFFIX = ".synara-mod.json";
+
+/** Limits of one exported mod; `bytes` is its compact JSON, which must fit one WebSocket message. */
+export const MOD_BUNDLE_LIMITS = {
+  files: 200,
+  bytes: 1_500_000,
+  pathLength: 256,
+} as const;
+
+export const ModBundleFile = Schema.Struct({
+  /** Relative to the mod's folder, with `/` between segments. */
+  path: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(MOD_BUNDLE_LIMITS.pathLength),
+  ),
+  /** Text files travel as they are; anything else as base64. */
+  encoding: Schema.Literals(["utf8", "base64"]),
+  content: Schema.String,
+});
+export type ModBundleFile = typeof ModBundleFile.Type;
+
+export const ModBundle = Schema.Struct({
+  format: Schema.Literal(MOD_BUNDLE_FORMAT),
+  formatVersion: Schema.Literal(MOD_BUNDLE_FORMAT_VERSION),
+  name: ModId,
+  version: Schema.String.check(Schema.isMaxLength(64)),
+  exportedAt: IsoDateTime,
+  files: Schema.Array(ModBundleFile).check(Schema.isMaxLength(MOD_BUNDLE_LIMITS.files)),
+});
+export type ModBundle = typeof ModBundle.Type;
+
+export const ModsExportInput = Schema.Struct({
+  id: ModId,
+});
+export type ModsExportInput = typeof ModsExportInput.Type;
+
+export const ModsExportResult = Schema.Struct({
+  /** The name to save the file under: `<name>.synara-mod.json`. */
+  filename: Schema.String,
+  /** The file's text. */
+  contents: Schema.String,
+});
+export type ModsExportResult = typeof ModsExportResult.Type;
+
+export const ModsImportInput = Schema.Struct({
+  /** The parsed file; the server checks it against `ModBundle` and explains what is wrong. */
+  bundle: Schema.Json,
+  /** Replace an installed mod with the same name. Without it, the server refuses. */
+  replace: Schema.Boolean,
+});
+export type ModsImportInput = typeof ModsImportInput.Type;
+
+export const ModsImportResult = Schema.Struct({
+  id: ModId,
+  /** Whether an installed mod was replaced. An imported mod always starts turned off. */
+  replaced: Schema.Boolean,
+  snapshot: ModsSnapshot,
+});
+export type ModsImportResult = typeof ModsImportResult.Type;
