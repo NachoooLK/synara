@@ -16,6 +16,8 @@ export const MOD_API_METHODS = [
   "ui.openThread",
   "ui.openUrl",
   "ui.openDockView",
+  "mcp.tools",
+  "mcp.call",
   "command.register",
   "command.unregister",
   "threads.list",

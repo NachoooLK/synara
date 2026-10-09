@@ -36,6 +36,7 @@ import type { ModProject, ModThread } from "./modApi.ts";
 import { listModFolders, readModDefinition, type ModDefinition } from "./modDiscovery.ts";
 import { ModWorkerHost, resolveModWorkerUrl } from "./modWorkerHost.ts";
 import { normalizeModUiTree } from "./modUiTree.ts";
+import { ModMcpClient } from "./modMcpClient.ts";
 
 const MOD_LOG_LIMIT = 200;
 const MOD_LOG_TEXT_LIMIT = 4_000;
@@ -111,6 +112,8 @@ interface ModRecord {
   generation: number;
   readonly commands: Map<string, ModCommand>;
   readonly views: Map<string, ModView>;
+  /** Connections to the MCP servers the manifest declares, opened on first use. */
+  readonly mcp: Map<string, ModMcpClient>;
   statusText: string | null;
   loadedAt: string | null;
   readonly logs: ModLogEntry[];
@@ -398,6 +401,29 @@ export class ModManager {
 
   // ── Records ────────────────────────────────────────────────────────
 
+  private mcpClient(record: ModRecord, server: unknown): ModMcpClient {
+    const servers = record.definition.manifest?.mcpServers ?? {};
+    if (typeof server !== "string" || !Object.hasOwn(servers, server)) {
+      const declared = Object.keys(servers);
+      throw new ModManagerError(
+        `$.mcp: "${String(server)}" is not one of this mod's MCP servers (${
+          declared.length > 0 ? declared.join(", ") : "it declares none in mod.json"
+        }).`,
+      );
+    }
+    let client = record.mcp.get(server);
+    if (!client) {
+      client = new ModMcpClient(server, servers[server]!);
+      record.mcp.set(server, client);
+    }
+    return client;
+  }
+
+  private closeMcp(record: ModRecord): void {
+    for (const client of record.mcp.values()) client.close();
+    record.mcp.clear();
+  }
+
   private requireRunning(id: string): ModRecord {
     const record = this.requireRecord(id);
     if (record.status !== "running" || record.host === null) {
@@ -450,6 +476,7 @@ export class ModManager {
         generation: 0,
         commands: new Map(),
         views: new Map(),
+        mcp: new Map(),
         statusText: null,
         loadedAt: null,
         logs: [],
@@ -475,6 +502,7 @@ export class ModManager {
     const generation = record.generation;
     record.commands.clear();
     record.views.clear();
+    this.closeMcp(record);
     record.statusText = null;
     record.loadedAt = null;
     record.runtimeError = null;
@@ -552,6 +580,7 @@ export class ModManager {
     record.host = null;
     record.commands.clear();
     record.views.clear();
+    this.closeMcp(record);
     record.statusText = null;
     record.loadedAt = null;
     record.runtimeError = null;
@@ -567,6 +596,7 @@ export class ModManager {
     record.runtimeError = reason;
     record.commands.clear();
     record.views.clear();
+    this.closeMcp(record);
     record.statusText = null;
     this.appendLog(record, "error", reason);
     this.scheduleSnapshot();
@@ -725,6 +755,15 @@ export class ModManager {
           context.effects.push({ type: "openDockView", modId, viewId: view.id });
         }
         return undefined;
+      }
+      case "mcp.tools":
+        return this.mcpClient(record, args[0]).listTools();
+      case "mcp.call": {
+        const tool = args[1];
+        if (typeof tool !== "string" || tool.length === 0) {
+          throw new ModManagerError("$.mcp.call(server, tool, args): tool must be a tool name.");
+        }
+        return this.mcpClient(record, args[0]).callTool(tool, args[2]);
       }
       case "command.register": {
         const definition = args[0] as
@@ -962,6 +1001,7 @@ export class ModManager {
       hooks: [...new Set((record.host?.hooks ?? []).map((hook) => hook.event))],
       commands: [...record.commands.values()],
       views: [...record.views.values()],
+      mcpServers: Object.keys(definition.manifest?.mcpServers ?? {}),
       statusText: record.statusText,
       loadedAt: record.loadedAt,
     };

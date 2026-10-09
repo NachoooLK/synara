@@ -241,6 +241,28 @@ function buildApi(): unknown {
     const target = (namespaces[namespace] ??= {});
     target[name] = (...args: unknown[]) => callApi(method, args);
   }
+  // $.mcp.json: a tool's structured result, or its text parsed as JSON.
+  const mcpNamespace = namespaces.mcp ?? {};
+  mcpNamespace.json = async (...args: unknown[]) => {
+    const result = (await callApi("mcp.call", args)) as {
+      readonly content: ReadonlyArray<{ readonly type?: string; readonly text?: string }>;
+      readonly structuredContent: unknown;
+      readonly isError: boolean;
+    };
+    const text = result.content
+      .filter((part) => part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("\n");
+    if (result.isError) throw new Error(text || `The MCP tool ${String(args[1])} failed.`);
+    if (result.structuredContent !== null && result.structuredContent !== undefined) {
+      return result.structuredContent;
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`The MCP tool ${String(args[1])} did not return JSON: ${text.slice(0, 200)}`);
+    }
+  };
   const logNamespace = namespaces.log ?? {};
   const log = Object.assign((message: unknown) => logNamespace.info?.(message), logNamespace);
   return Object.freeze({

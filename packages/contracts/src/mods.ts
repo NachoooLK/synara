@@ -48,12 +48,40 @@ const MOD_COMMAND_NAME_MAX_LENGTH = 64;
 export const ModId = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9-]{0,63}$/));
 export type ModId = typeof ModId.Type;
 
+/** A name a mod gives one of its MCP servers: `$.mcp.call("<name>", …)`. */
+export const ModMcpServerName = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9_-]{0,63}$/));
+export type ModMcpServerName = typeof ModMcpServerName.Type;
+
+const ModMcpText = Schema.String.check(Schema.isMaxLength(4_096));
+
+/**
+ * An MCP server a mod uses. Values may say `${env:NAME}` to take a variable
+ * from Synara's environment, so tokens stay out of the mod's files.
+ */
+export const ModMcpServerConfig = Schema.Union([
+  Schema.Struct({
+    /** A local server Synara starts on first use and stops with the mod. */
+    command: TrimmedNonEmptyString.check(Schema.isMaxLength(1_024)),
+    args: Schema.optional(Schema.Array(ModMcpText).check(Schema.isMaxLength(64))),
+    env: Schema.optional(Schema.Record(Schema.String, ModMcpText)),
+    cwd: Schema.optional(ModMcpText),
+  }),
+  Schema.Struct({
+    /** A remote server reached over streamable HTTP. */
+    url: TrimmedNonEmptyString.check(Schema.isMaxLength(2_048)),
+    headers: Schema.optional(Schema.Record(Schema.String, ModMcpText)),
+  }),
+]);
+export type ModMcpServerConfig = typeof ModMcpServerConfig.Type;
+
 export const ModManifest = Schema.Struct({
   name: ModId,
   version: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
   description: Schema.optional(Schema.String.check(Schema.isMaxLength(MOD_TEXT_MAX_LENGTH))),
   /** The `$` interface version the mod was written against; absent means 1. */
   apiVersion: Schema.optional(Schema.Literal(MOD_API_VERSION)),
+  /** MCP servers the mod calls through `$.mcp`, by the name it uses for them. */
+  mcpServers: Schema.optional(Schema.Record(ModMcpServerName, ModMcpServerConfig)),
 });
 export type ModManifest = typeof ModManifest.Type;
 
@@ -183,6 +211,8 @@ export const ModSummary = Schema.Struct({
   hooks: Schema.Array(Schema.String),
   commands: Schema.Array(ModCommand),
   views: Schema.Array(ModView),
+  /** The names of the MCP servers the manifest declares. */
+  mcpServers: Schema.Array(Schema.String),
   /** The mod's status line entry, set with `$.ui.status`. */
   statusText: Schema.NullOr(Schema.String),
   loadedAt: Schema.NullOr(IsoDateTime),

@@ -70,6 +70,7 @@ interface Invocation {
   readonly next: (input: unknown) => Promise<unknown>;
   readonly context: unknown;
   timer: ReturnType<typeof setTimeout> | null;
+  /** Calls the hook is waiting on (`next` or `$`); its budget only runs while this is 0. */
   nextInFlight: number;
 }
 
@@ -209,18 +210,37 @@ export class ModWorkerHost {
         return;
       }
       case "api": {
-        const context =
-          message.callId === null ? null : (this.invocations.get(message.callId)?.context ?? null);
-        void this.options.handleApi(message.method, message.args, context).then(
-          (value) =>
-            this.post({ type: "api-result", requestId: message.requestId, ok: true, value }),
-          (error: unknown) =>
+        // Time a hook spends waiting on Synara (an MCP call, a store write) is not its own.
+        const invocation =
+          message.callId === null ? undefined : this.invocations.get(message.callId);
+        if (invocation) {
+          this.disarm(invocation);
+          invocation.nextInFlight += 1;
+        }
+        const settle = () => {
+          if (!invocation || message.callId === null) return;
+          invocation.nextInFlight -= 1;
+          if (
+            invocation.nextInFlight === 0 &&
+            this.invocations.get(message.callId) === invocation
+          ) {
+            this.arm(message.callId, invocation);
+          }
+        };
+        void this.options.handleApi(message.method, message.args, invocation?.context ?? null).then(
+          (value) => {
+            settle();
+            this.post({ type: "api-result", requestId: message.requestId, ok: true, value });
+          },
+          (error: unknown) => {
+            settle();
             this.post({
               type: "api-result",
               requestId: message.requestId,
               ok: false,
               error: error instanceof Error ? error.message : describeModError(error),
-            }),
+            });
+          },
         );
         return;
       }

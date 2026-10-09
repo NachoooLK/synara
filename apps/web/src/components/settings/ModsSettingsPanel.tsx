@@ -165,6 +165,8 @@ function ModRow({ mod }: { mod: ModSummary }) {
     mod.commands.length > 0
       ? `Commands: ${mod.commands.map((command) => command.title).join(", ")}`
       : null,
+    mod.views.length > 0 ? `Views: ${mod.views.map((view) => view.title).join(", ")}` : null,
+    mod.mcpServers.length > 0 ? `MCP: ${mod.mcpServers.join(", ")}` : null,
   ].filter((detail): detail is string => detail !== null);
 
   return (

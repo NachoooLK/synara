@@ -45,6 +45,24 @@ export interface ModCommandDefinition {
   readonly description?: string;
 }
 
+/** A tool an MCP server offers. */
+export interface ModMcpTool {
+  readonly name: string;
+  readonly description: string | null;
+  readonly inputSchema: unknown;
+}
+
+/** What an MCP tool returned, as the MCP spec describes it. */
+export interface ModMcpCallResult {
+  /** Content parts, usually `{ type: "text", text }`. */
+  readonly content: ReadonlyArray<
+    { readonly type: string; readonly text?: string } & Record<string, unknown>
+  >;
+  /** The tool's structured result, when the server sends one. */
+  readonly structuredContent: unknown;
+  readonly isError: boolean;
+}
+
 // ── Views ────────────────────────────────────────────────────────────
 
 /** Where a view is drawn: the sidebar panel, a dock tab, a band above the composer, the thread header. */
@@ -181,6 +199,24 @@ export interface ModApi {
   };
   readonly projects: {
     readonly list: () => Promise<ModProject[]>;
+  };
+  /**
+   * The MCP servers the mod's mod.json declares under "mcpServers", by name.
+   * Synara starts a local server on first use and stops it with the mod.
+   */
+  readonly mcp: {
+    readonly tools: (server: string) => Promise<ModMcpTool[]>;
+    readonly call: (
+      server: string,
+      tool: string,
+      args?: Record<string, unknown>,
+    ) => Promise<ModMcpCallResult>;
+    /** Calls a tool and returns its structured result, or its text parsed as JSON; throws on a tool error. */
+    readonly json: <T = unknown>(
+      server: string,
+      tool: string,
+      args?: Record<string, unknown>,
+    ) => Promise<T>;
   };
   /** Values Synara holds while it runs; they survive a reload of the mod. Setting one redraws the mod's views. */
   readonly state: {

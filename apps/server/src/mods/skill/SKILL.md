@@ -52,20 +52,52 @@ its worker with synchronous code for 10 seconds stops the mod.
 
 ## The `$` object
 
-| Call                                                                            | What it does                                                                                                                                                                                                                                                    |
-| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `$.ui.view({ id, site, title, icon?, refreshOn? })`                             | Adds a view. `site` is `"sidebar"`, `"dock"`, `"band"` or `"header"`. `refreshOn: ["threads"]` redraws it when threads change.                                                                                                                                  |
-| `$.ui.invalidate(viewId?)`                                                      | Draws a view again (all of the mod's views without an id).                                                                                                                                                                                                      |
-| `$.ui.toast(text, { tone })`, `$.ui.status(text)`                               | A notice in every window; a status line in Settings → Mods.                                                                                                                                                                                                     |
-| `$.ui.openThread(id)`, `$.ui.openUrl(url)`, `$.ui.openDockView(viewId)`         | Only inside a handler such as `onPress`. They act on the window that pressed.                                                                                                                                                                                   |
-| `$.command.register({ name, title, description? })`                             | Adds a command to the palette (⌘K). Answer it with a `command.run` hook.                                                                                                                                                                                        |
-| `$.threads.list({ projectId?, includeArchived?, limit? })`, `$.threads.get(id)` | Threads, newest first. Fields: `id`, `projectId`, `title`, `provider`, `model`, `branch`, `worktreePath`, `parentThreadId`, `isPinned`, `latestTurnState`, `hasPendingApprovals`, `hasPendingUserInput`, `createdAt`, `updatedAt`, `archivedAt`. No transcript. |
-| `$.projects.list()`                                                             | Projects: `id`, `title`, `workspaceRoot`, `kind`, `isPinned`, `createdAt`, `updatedAt`. `kind === "project"` are the folders in the sidebar.                                                                                                                    |
-| `$.state.get/set(key, value)`                                                   | Values held while Synara runs; they survive reloads. `set` redraws the mod's views.                                                                                                                                                                             |
-| `$.store.get/set/delete/keys`                                                   | JSON saved to disk, 1 MB per mod.                                                                                                                                                                                                                               |
-| `$.log(msg)`, `$.log.warn/error`, `console.log`                                 | The mod's log in Settings → Mods.                                                                                                                                                                                                                               |
+| Call                                                                                      | What it does                                                                                                                                                                                                                                                    |
+| ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$.ui.view({ id, site, title, icon?, refreshOn? })`                                       | Adds a view. `site` is `"sidebar"`, `"dock"`, `"band"` or `"header"`. `refreshOn: ["threads"]` redraws it when threads change.                                                                                                                                  |
+| `$.ui.invalidate(viewId?)`                                                                | Draws a view again (all of the mod's views without an id).                                                                                                                                                                                                      |
+| `$.ui.toast(text, { tone })`, `$.ui.status(text)`                                         | A notice in every window; a status line in Settings → Mods.                                                                                                                                                                                                     |
+| `$.ui.openThread(id)`, `$.ui.openUrl(url)`, `$.ui.openDockView(viewId)`                   | Only inside a handler such as `onPress`. They act on the window that pressed.                                                                                                                                                                                   |
+| `$.command.register({ name, title, description? })`                                       | Adds a command to the palette (⌘K). Answer it with a `command.run` hook.                                                                                                                                                                                        |
+| `$.threads.list({ projectId?, includeArchived?, limit? })`, `$.threads.get(id)`           | Threads, newest first. Fields: `id`, `projectId`, `title`, `provider`, `model`, `branch`, `worktreePath`, `parentThreadId`, `isPinned`, `latestTurnState`, `hasPendingApprovals`, `hasPendingUserInput`, `createdAt`, `updatedAt`, `archivedAt`. No transcript. |
+| `$.projects.list()`                                                                       | Projects: `id`, `title`, `workspaceRoot`, `kind`, `isPinned`, `createdAt`, `updatedAt`. `kind === "project"` are the folders in the sidebar.                                                                                                                    |
+| `$.mcp.tools(server)`, `$.mcp.call(server, tool, args)`, `$.mcp.json(server, tool, args)` | Calls an MCP server the manifest declares (see below). `json` returns the structured result or the text parsed as JSON.                                                                                                                                         |
+| `$.state.get/set(key, value)`                                                             | Values held while Synara runs; they survive reloads. `set` redraws the mod's views.                                                                                                                                                                             |
+| `$.store.get/set/delete/keys`                                                             | JSON saved to disk, 1 MB per mod.                                                                                                                                                                                                                               |
+| `$.log(msg)`, `$.log.warn/error`, `console.log`                                           | The mod's log in Settings → Mods.                                                                                                                                                                                                                               |
 
 Every call returns a promise. `types/synara.d.ts` has the exact signatures.
+
+## MCP servers
+
+A mod reaches outside services through MCP servers declared in its manifest:
+
+```json
+{
+  "name": "pr-panel",
+  "version": "0.1.0",
+  "mcpServers": {
+    "bitbucket": {
+      "command": "npx",
+      "args": ["-y", "some-bitbucket-mcp-server"],
+      "env": { "BITBUCKET_TOKEN": "${env:BITBUCKET_TOKEN}" }
+    },
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${env:REMOTE_TOKEN}" }
+    }
+  }
+}
+```
+
+- `${env:NAME}` takes the value from Synara's environment, so tokens stay out of
+  the mod's files. Never write a token into a mod.
+- Call `$.mcp.tools("bitbucket")` first to learn the tool names and arguments
+  (for example from a command that logs them) before using them.
+- Many servers answer with JSON as text; `$.mcp.json` parses it for you.
+- Waiting on an MCP call does not count toward a hook's 10 seconds. A call
+  itself gives up after 30 seconds.
+- Changing `mcpServers` restarts the mod and its servers.
 
 ## Views
 
