@@ -7,5 +7,7 @@
     "noEmit": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["src", "perf", "tsdown.config.ts", "scripts", "integration", "../../scripts/lib"]
+  "include": ["src", "perf", "tsdown.config.ts", "scripts", "integration", "../../scripts/lib"],
+  // Example mods and the mod worker's globals compile with their own settings (see modSkill.test.ts).
+  "exclude": ["src/mods/skill/examples", "src/mods/skill/types/globals.d.ts"]
 }

@@ -264,9 +264,9 @@ export function makeServerRuntimeServicesLayer(
     Layer.provideMerge(providerHealthLayer),
     Layer.provideMerge(BrowserAutomationHostLive),
     // The gateway exposes device_* tools only where a backend can exist, but it
-    // resolves the service on every platform to make that decision.
-    Layer.provideMerge(DeviceServiceLive),
-    Layer.provideMerge(ComputerServiceLive),
+    // resolves the service on every platform to make that decision. Mod tools
+    // follow the same rule with the Beta-only mod host.
+    Layer.provideMerge(Layer.mergeAll(DeviceServiceLive, ComputerServiceLive, modHostLayer)),
   );
   // The inbox owns the repository inventory, GitHub read queue, and snapshots; the pull request
   // service shares them so detail reads and mutations stay consistent with the list.

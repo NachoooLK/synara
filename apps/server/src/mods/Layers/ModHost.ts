@@ -21,6 +21,8 @@ import { ProjectionSnapshotQuery } from "../../orchestration/Services/Projection
 import { ModHostError } from "../Errors.ts";
 import type { ModProject, ModThread } from "../modApi.ts";
 import { ModManager, type ModViewSource } from "../modManager.ts";
+import { installModSkill, resolveModSkillSourceDir } from "../modSkill.ts";
+import { synaraBuiltinSkillsDir } from "../../provider/skillsCatalog.ts";
 import { ModHost, type ModHostShape } from "../Services/ModHost.ts";
 
 export function toModThread(thread: OrchestrationThreadShell): ModThread {
@@ -84,8 +86,9 @@ export const ModHostLive = Layer.effect(
       runFork(log.pipe(Effect.annotateLogs({ component: "mods", modId })));
     };
 
+    const modsDir = path.join(config.baseDir, MODS_DIRECTORY_NAME);
     const manager = new ModManager({
-      modsDir: path.join(config.baseDir, MODS_DIRECTORY_NAME),
+      modsDir,
       dataDir: path.join(config.stateDir, "mods"),
       backend: {
         listThreads: () =>
@@ -114,6 +117,25 @@ export const ModHostLive = Layer.effect(
           ),
         ),
         () => Effect.promise(() => manager.stop()),
+      );
+      // The authoring skill lets any provider's agent write mods for this install.
+      yield* Effect.tryPromise({
+        try: async () => {
+          const sourceDir = await resolveModSkillSourceDir();
+          if (sourceDir === null) throw new Error("this build has no mod skill files");
+          return installModSkill({
+            sourceDir,
+            targetRoot: synaraBuiltinSkillsDir(config.baseDir),
+            modsDir,
+          });
+        },
+        catch: toModHostError,
+      }).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("The mod authoring skill could not be installed", error.message).pipe(
+            Effect.annotateLogs({ component: "mods" }),
+          ),
+        ),
       );
       // Views that follow threads or projects redraw shortly after a change, once
       // per burst: a running turn emits many thread events.

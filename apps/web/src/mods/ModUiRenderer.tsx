@@ -183,6 +183,7 @@ function ModUiInput(props: { element: ModUiElement; dispatch: ModUiDispatch }) {
   return (
     <Input
       size="sm"
+      className="min-w-0 flex-1"
       placeholder={stringProp(element.props, "placeholder")}
       defaultValue={stringProp(element.props, "defaultValue") ?? stringProp(element.props, "value")}
       aria-label={stringProp(element.props, "label") ?? stringProp(element.props, "placeholder")}
@@ -264,13 +265,13 @@ function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): Rea
       return (
         <span
           className={cn(
-            "min-w-0",
             pick(SIZE_CLASS_NAMES, p.size) ?? "text-ui",
             pick(TONE_CLASS_NAMES, p.tone),
             pick(WEIGHT_CLASS_NAMES, p.weight),
             p.mono === true && "font-mono",
             p.italic === true && "italic",
-            p.truncate === true ? "truncate" : "break-words",
+            // Only truncated text may shrink below its longest word; other text wraps between words.
+            p.truncate === true ? "min-w-0 truncate" : "break-words",
             p.block === true && "block",
           )}
         >

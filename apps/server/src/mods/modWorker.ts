@@ -61,11 +61,10 @@ const Fragment = "Fragment";
 Object.assign(globalThis, { h, Fragment });
 
 // Element names are plain strings; `<Box>` compiles to h("Box", …) through these.
-const sdk = Object.freeze({
-  ...Object.fromEntries(data.elements.map((name) => [name, name])),
-  h,
-  Fragment,
-});
+// They are globals too, like `h`, so a view that forgot to import one still draws.
+const elements = Object.fromEntries(data.elements.map((name) => [name, name]));
+Object.assign(globalThis, elements);
+const sdk = Object.freeze({ ...elements, h, Fragment });
 
 // ── Module loading ───────────────────────────────────────────────────
 // A mod imports its own files and the SDK, nothing else, so everything it does

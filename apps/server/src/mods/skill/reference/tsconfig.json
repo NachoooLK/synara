@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "jsx": "react",
+    "jsxFactory": "h",
+    "jsxFragmentFactory": "Fragment",
+    "types": [],
+    "paths": { "synara": ["{{TYPES_DIR}}/synara.d.ts"] }
+  },
+  "include": ["hooks/**/*", "{{TYPES_DIR}}/globals.d.ts"]
+}

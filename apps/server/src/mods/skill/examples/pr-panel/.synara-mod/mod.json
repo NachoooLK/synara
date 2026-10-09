@@ -1,0 +1,5 @@
+{
+  "name": "pr-panel",
+  "version": "0.1.0",
+  "description": "A header button that opens a pull request panel in the dock."
+}

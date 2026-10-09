@@ -1,0 +1,134 @@
+---
+name: synara-mods
+description: Write, load and debug Synara mods, small TypeScript modules that customize Synara itself with sidebar views, dock panels, bands above the composer, thread header buttons and palette commands. Use when the person asks to build, change or fix a Synara mod or plugin, to add something to Synara's interface, or to show their own data (pull requests, tickets, notes) inside Synara.
+---
+
+# Synara mods
+
+A mod is a folder in the mods folder. Synara runs each enabled mod in its own
+worker and reloads it whenever its files change. A mod reaches Synara only
+through the `$` object its hooks receive, and draws its views as JSX trees that
+Synara renders with its own components.
+
+- Mods folder: `{{MODS_DIR}}`
+- This skill's files: `{{SKILL_DIR}}`
+
+## A mod in three files
+
+```
+{{MODS_DIR}}/<name>/
+  .synara-mod/mod.json   {"name": "<name>", "version": "0.1.0", "description": "<one line>"}
+  hooks/hooks.json       {"modules": ["./register.tsx"]}
+  hooks/register.tsx     export const register: Register = (on) => { … }
+```
+
+- `<name>` is lowercase words joined by dashes and must equal the folder name.
+- `register.tsx` may import its own files (`./data`) and `"synara"`, nothing
+  else: no npm packages and no `node:` modules. Everything outside the mod goes
+  through `$`.
+- Write TypeScript and JSX directly; Synara compiles them when it loads the mod.
+
+## Hooks
+
+`on(event, matcher?, hook)` adds a hook. Every hook is `($, e, next)`:
+
+- `$` is the interface to Synara.
+- `e` is the event's input, a frozen plain value.
+- `next(e)` runs the rest of the chain.
+
+The matcher compares fields of `e`, so `on("command.run", { command: "x" }, …)`
+only runs for that command.
+
+| Event         | `e`                                                | Return                                     |
+| ------------- | -------------------------------------------------- | ------------------------------------------ |
+| `mod.start`   | `{}`                                               | nothing. Register views and commands here. |
+| `mod.stop`    | `{}`                                               | nothing. Runs before a reload or disable.  |
+| `ui.render`   | `{ view, site, context: { threadId, projectId } }` | a JSX tree, or `null` to draw nothing      |
+| `command.run` | `{ command, threadId }`                            | `{ text }` to show a toast, or nothing     |
+
+A hook has 10 seconds to finish, not counting time spent in `next`. A hook
+that throws is skipped and its error goes to the mod's log. A hook that blocks
+its worker with synchronous code for 10 seconds stops the mod.
+
+## The `$` object
+
+| Call                                                                            | What it does                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$.ui.view({ id, site, title, icon?, refreshOn? })`                             | Adds a view. `site` is `"sidebar"`, `"dock"`, `"band"` or `"header"`. `refreshOn: ["threads"]` redraws it when threads change.                                                                                                                                  |
+| `$.ui.invalidate(viewId?)`                                                      | Draws a view again (all of the mod's views without an id).                                                                                                                                                                                                      |
+| `$.ui.toast(text, { tone })`, `$.ui.status(text)`                               | A notice in every window; a status line in Settings → Mods.                                                                                                                                                                                                     |
+| `$.ui.openThread(id)`, `$.ui.openUrl(url)`, `$.ui.openDockView(viewId)`         | Only inside a handler such as `onPress`. They act on the window that pressed.                                                                                                                                                                                   |
+| `$.command.register({ name, title, description? })`                             | Adds a command to the palette (⌘K). Answer it with a `command.run` hook.                                                                                                                                                                                        |
+| `$.threads.list({ projectId?, includeArchived?, limit? })`, `$.threads.get(id)` | Threads, newest first. Fields: `id`, `projectId`, `title`, `provider`, `model`, `branch`, `worktreePath`, `parentThreadId`, `isPinned`, `latestTurnState`, `hasPendingApprovals`, `hasPendingUserInput`, `createdAt`, `updatedAt`, `archivedAt`. No transcript. |
+| `$.projects.list()`                                                             | Projects: `id`, `title`, `workspaceRoot`, `kind`, `isPinned`, `createdAt`, `updatedAt`. `kind === "project"` are the folders in the sidebar.                                                                                                                    |
+| `$.state.get/set(key, value)`                                                   | Values held while Synara runs; they survive reloads. `set` redraws the mod's views.                                                                                                                                                                             |
+| `$.store.get/set/delete/keys`                                                   | JSON saved to disk, 1 MB per mod.                                                                                                                                                                                                                               |
+| `$.log(msg)`, `$.log.warn/error`, `console.log`                                 | The mod's log in Settings → Mods.                                                                                                                                                                                                                               |
+
+Every call returns a promise. `types/synara.d.ts` has the exact signatures.
+
+## Views
+
+Return JSX built from the elements `"synara"` exports (they are also globals,
+so the import is optional). Synara draws them with
+its own components and the text size the person chose, so a mod always looks
+native. Props take fixed values, not CSS or class names.
+
+| Element                                                | Props                                                                                                                            |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `Box`                                                  | `direction`, `gap`, `padding`, `paddingX`, `paddingY` (0, 1, 2, 3, 4, 6), `align`, `justify`, `grow`, `wrap`, `border`, `scroll` |
+| `Text`                                                 | `size` (`xs`, `sm`, `md`, `lg`), `tone` (`muted`, `success`, `warning`, `danger`, `info`), `weight`, `mono`, `truncate`, `block` |
+| `Heading`, `Section`                                   | `Section title` groups rows the way "Projects" does in the sidebar                                                               |
+| `List`, `Row`                                          | `Row`: `icon`, `meta`, `active`, `title`, `onPress`. It is a sidebar row.                                                        |
+| `Button`                                               | `icon`, `label`, `variant` (`outline`, `ghost`, `default`, `secondary`, `destructive`), `disabled`, `onPress`                    |
+| `Input`                                                | `placeholder`, `defaultValue`, `onSubmit(value)` (Enter), `onChange(value)` (after a pause)                                      |
+| `Switch`                                               | `checked`, `label`, `onChange(checked)`                                                                                          |
+| `Markdown`, `Code`                                     | `text`, or the text as children                                                                                                  |
+| `Icon`, `Badge`, `Link`, `Divider`, `Spinner`, `Empty` | see `types/synara.d.ts`                                                                                                          |
+
+- **Handlers.** `onPress`, `onChange` and `onSubmit` run in the mod. Keep them
+  short; redraw by changing `$.state` or calling `$.ui.invalidate`.
+- **Icons.** Icons are Central icon names. A name that does not exist draws
+  nothing, so check it first with `grep -x <name> {{SKILL_DIR}}/reference/icons.txt`,
+  or search with `grep <word> …/icons.txt`.
+- **Sites.** Each site has its own space:
+  - `sidebar` views get a rail button and replace the thread list.
+  - `dock` views open as a tab next to the thread, from the dock's + menu or `$.ui.openDockView`.
+  - `band` views sit above the composer of the open thread.
+  - `header` views sit in the thread header. Keep them to one or two buttons; the header hides them on an empty thread.
+- **Size limit.** A tree may hold up to 5,000 elements. Draw what is in view,
+  not every item you have.
+
+## Loading and checking a mod
+
+1. Write the three files. Start from an example in `{{SKILL_DIR}}/examples/`:
+   - `hello-command`: a command and the store
+   - `threads-by-day`: a sidebar view
+   - `thread-notes`: a band with an input
+   - `pr-panel`: a header button and a dock view
+2. A new mod starts disabled. Only the person can enable it, in
+   **Settings → Mods**, because a mod runs with Synara's own access. Ask them to
+   switch it on once. After that every save reloads it. A disabled mod has not
+   run yet, so `synara_mods_list` cannot show its load errors until it is on:
+   do not report it as working before that.
+3. Check it with Synara's tools:
+   - `synara_mods_list`: status, load error, views and commands.
+   - `synara_mod_logs`: its log and console output.
+   - `synara_mod_render`: draw a view as a JSON tree without opening the window.
+   - `synara_mod_reload`: reload it.
+
+   A load error names the file and the line. Once the mod is on, draw every view
+   with `synara_mod_render` and read the log before saying it works.
+
+4. Optional type check:
+   1. Copy `{{SKILL_DIR}}/reference/tsconfig.json` into the mod folder. Its `paths` already point at this skill's types.
+   2. Run `npx -y -p typescript tsc -p <mod folder>`.
+
+## Rules
+
+- Every effect goes through `$`.
+- Do not read files, start processes or call the network from a mod. The mod
+  interface has no way to do it, and imports outside the mod are refused.
+- Keep data a view needs in `$.state` (fast, lost on restart) or `$.store`
+  (saved), never in module variables. A reload starts the module over.
+- Mods are a Beta feature. On a Stable build the mods folder is ignored.

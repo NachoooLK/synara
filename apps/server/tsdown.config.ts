@@ -39,6 +39,8 @@ export default defineConfig({
     __SYNARA_MIGRATION_RUNTIME_SOURCE_DIGEST__: JSON.stringify(migrationRuntimeSourceDigest),
   },
   clean: true,
+  // The mod authoring skill ships as files; modSkill.ts installs it at startup.
+  copy: [{ from: "src/mods/skill", to: "dist" }],
   noExternal: (id) => id.startsWith("@synara/"),
   inlineOnly: false,
   banner: {

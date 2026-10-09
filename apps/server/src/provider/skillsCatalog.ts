@@ -12,7 +12,10 @@ import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
 import type { ProviderKind, ProviderSkillDescriptor } from "@synara/contracts";
+import { MODS_BETA_FEATURE } from "@synara/shared/betaFeatures";
 import YAML from "yaml";
+
+import { isServerBetaFeatureEnabled } from "../betaFeatureGate.ts";
 import { discoverClaudePluginSkillRoots } from "./claudePluginSkills.ts";
 
 type FrontmatterValue = string | boolean;
@@ -422,6 +425,14 @@ export function clearSkillsCatalogCacheForTests(): void {
   ensuredSynaraSkillsDirs.clear();
 }
 
+/**
+ * Skills Synara itself installs (the mod authoring skill); refreshed by the app,
+ * kept apart from the person's own skills folder. Beta-only while mods are.
+ */
+export function synaraBuiltinSkillsDir(synaraBaseDir: string): string {
+  return nodePath.join(synaraBaseDir, "builtin-skills");
+}
+
 export function synaraSkillsDir(synaraBaseDir: string): string {
   return nodePath.join(synaraBaseDir, "skills");
 }
@@ -450,7 +461,12 @@ interface SkillOriginRootSpec {
 
 const SKILL_ORIGIN_ROOTS = {
   synara: {
-    homeRoots: (input) => [synaraSkillsDir(input.synaraBaseDir)],
+    homeRoots: (input) => [
+      synaraSkillsDir(input.synaraBaseDir),
+      ...(isServerBetaFeatureEnabled(MODS_BETA_FEATURE)
+        ? [synaraBuiltinSkillsDir(input.synaraBaseDir)]
+        : []),
+    ],
     projectRootNames: [".synara"],
   },
   codex: {
