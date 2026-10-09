@@ -3088,6 +3088,10 @@ const makeWsRpcHandlersLayer = () =>
           modHost.readLogs(input).pipe(Effect.mapError(toModsRpcError)),
         [MODS_WS_METHODS.runCommand]: (input) =>
           modHost.runCommand(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.renderView]: (input) =>
+          modHost.renderView(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.dispatchUi]: (input) =>
+          modHost.dispatchUi(input).pipe(Effect.mapError(toModsRpcError)),
         [MODS_WS_METHODS.subscribeEvents]: (_, { clientId }) =>
           streamAdmission.guard(
             clientId,

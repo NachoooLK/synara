@@ -50,8 +50,15 @@ export interface ModWorkerHostOptions {
   readonly workerUrl: URL;
   readonly loadTimeoutMs?: number;
   readonly hookTimeoutMs?: number;
-  /** Answers one `$` call; a rejection reaches the mod as a thrown error. */
-  readonly handleApi: (method: string, args: ReadonlyArray<unknown>) => Promise<unknown>;
+  /**
+   * Answers one `$` call; a rejection reaches the mod as a thrown error.
+   * `context` is what the caller passed to the invoke the call came from, or null.
+   */
+  readonly handleApi: (
+    method: string,
+    args: ReadonlyArray<unknown>,
+    context: unknown,
+  ) => Promise<unknown>;
   /** A stray error inside the mod that no hook caught. */
   readonly onUncaught: (error: string) => void;
   /** The worker stopped on its own (crash, out of memory, a hung hook). */
@@ -61,6 +68,7 @@ export interface ModWorkerHostOptions {
 interface Invocation {
   readonly resolve: (outcome: ModHookOutcome) => void;
   readonly next: (input: unknown) => Promise<unknown>;
+  readonly context: unknown;
   timer: ReturnType<typeof setTimeout> | null;
   nextInFlight: number;
 }
@@ -201,7 +209,9 @@ export class ModWorkerHost {
         return;
       }
       case "api": {
-        void this.options.handleApi(message.method, message.args).then(
+        const context =
+          message.callId === null ? null : (this.invocations.get(message.callId)?.context ?? null);
+        void this.options.handleApi(message.method, message.args, context).then(
           (value) =>
             this.post({ type: "api-result", requestId: message.requestId, ok: true, value }),
           (error: unknown) =>
@@ -299,17 +309,39 @@ export class ModWorkerHost {
     hookId: number,
     input: unknown,
     next: (input: unknown) => Promise<unknown>,
+    context: unknown = null,
+  ): Promise<ModHookOutcome> {
+    return this.call((callId) => ({ type: "invoke", callId, hookId, input }), next, context);
+  }
+
+  /** Runs a handler a rendered tree referenced (an onPress), with the same budget as a hook. */
+  invokeHandler(
+    handlerId: string,
+    payload: unknown,
+    context: unknown = null,
+  ): Promise<ModHookOutcome> {
+    return this.call(
+      (callId) => ({ type: "invoke-handler", callId, handlerId, payload }),
+      () => Promise.reject(new Error("Handlers have no next().")),
+      context,
+    );
+  }
+
+  private call(
+    message: (callId: number) => HostToWorkerMessage,
+    next: (input: unknown) => Promise<unknown>,
+    context: unknown,
   ): Promise<ModHookOutcome> {
     if (!this.isAlive) {
       return Promise.resolve({ kind: "error", error: "The mod is not running." });
     }
     const callId = this.nextCallId++;
     return new Promise((resolve) => {
-      const invocation: Invocation = { resolve, next, timer: null, nextInFlight: 0 };
+      const invocation: Invocation = { resolve, next, context, timer: null, nextInFlight: 0 };
       this.invocations.set(callId, invocation);
       this.arm(callId, invocation);
       try {
-        this.post({ type: "invoke", callId, hookId, input });
+        this.post(message(callId));
       } catch (error) {
         this.invocations.delete(callId);
         this.disarm(invocation);

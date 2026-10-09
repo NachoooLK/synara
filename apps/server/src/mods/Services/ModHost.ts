@@ -1,7 +1,11 @@
 import type {
+  ModsDispatchUiInput,
+  ModsDispatchUiResult,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
+  ModsRenderViewInput,
+  ModsRenderViewResult,
   ModsRunCommandInput,
   ModsRunCommandResult,
   ModsSetEnabledInput,
@@ -23,7 +27,13 @@ export interface ModHostShape {
   readonly runCommand: (
     input: ModsRunCommandInput,
   ) => Effect.Effect<ModsRunCommandResult, ModHostError>;
-  /** A snapshot of every mod, then each snapshot change and toast after it. */
+  readonly renderView: (
+    input: ModsRenderViewInput,
+  ) => Effect.Effect<ModsRenderViewResult, ModHostError>;
+  readonly dispatchUi: (
+    input: ModsDispatchUiInput,
+  ) => Effect.Effect<ModsDispatchUiResult, ModHostError>;
+  /** A snapshot of every mod, then each snapshot change, toast and redraw request after it. */
   readonly streamEvents: Stream.Stream<ModsStreamEvent, ModHostError>;
 }
 

@@ -988,6 +988,10 @@ export function createWsNativeApi(): NativeApi {
       // A command waits on the mod's hooks, which may themselves wait on `next`.
       runCommand: (input) =>
         transport.request(MODS_WS_METHODS.runCommand, input, { timeoutMs: null }),
+      renderView: (input) => transport.request(MODS_WS_METHODS.renderView, input),
+      // A handler may await other work before it answers, like a command.
+      dispatchUi: (input) =>
+        transport.request(MODS_WS_METHODS.dispatchUi, input, { timeoutMs: null }),
       // Subscribed on demand, not at startup: Stable refuses the stream.
       onEvent: (callback) =>
         transport.subscribe(MODS_WS_CHANNELS.event, (message) => callback(message.data)),

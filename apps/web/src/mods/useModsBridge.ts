@@ -9,7 +9,9 @@ import { MODS_ON } from "~/betaFeatures";
 import { toastManager } from "~/components/ui/toast";
 import { readNativeApi } from "~/nativeApi";
 
+import { registerModDockViewOpener } from "./ModViewHost";
 import { useModsStore } from "./modsStore";
+import { openModDockView } from "./useModDockItems";
 
 function isModsRefusal(error: unknown): boolean {
   return (
@@ -33,13 +35,18 @@ export function useModsBridge(): void {
     if (!MODS_ON) return;
     const api = readNativeApi();
     if (!api) return;
+    // `$.ui.openDockView` opens the view next to the thread the pressed view belongs to.
+    registerModDockViewOpener((modId, viewId, context) => {
+      if (context.threadId) openModDockView(context.threadId, modId, viewId);
+    });
     const { setSnapshot, setUnavailable } = useModsStore.getState();
     let disposed = false;
     let unsubscribe: (() => void) | null = null;
     const subscribe = () => {
       unsubscribe = api.mods.onEvent((event) => {
         if (event.type === "snapshot") setSnapshot(event.snapshot);
-        else showModToast(event.toast);
+        else if (event.type === "toast") showModToast(event.toast);
+        else useModsStore.getState().invalidate(event.modId, event.viewId);
       });
     };
     // Ask once before opening the stream: a server that refuses mods would
@@ -63,6 +70,7 @@ export function useModsBridge(): void {
     return () => {
       disposed = true;
       unsubscribe?.();
+      registerModDockViewOpener(null);
     };
   }, []);
 }

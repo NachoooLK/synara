@@ -16,10 +16,11 @@ import { Effect, Layer, Queue, Stream } from "effect";
 
 import { isServerBetaFeatureEnabled } from "../../betaFeatureGate.ts";
 import { ServerConfig } from "../../config.ts";
+import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ModHostError } from "../Errors.ts";
 import type { ModProject, ModThread } from "../modApi.ts";
-import { ModManager } from "../modManager.ts";
+import { ModManager, type ModViewSource } from "../modManager.ts";
 import { ModHost, type ModHostShape } from "../Services/ModHost.ts";
 
 export function toModThread(thread: OrchestrationThreadShell): ModThread {
@@ -54,6 +55,8 @@ export function toModProject(project: OrchestrationProjectShell): ModProject {
   };
 }
 
+const VIEW_REFRESH_DEBOUNCE_MS = 400;
+
 const unavailable = () =>
   new ModHostError({ message: "Mods are not available in this version of Synara." });
 
@@ -65,6 +68,7 @@ export const ModHostLive = Layer.effect(
   Effect.gen(function* () {
     const config = yield* ServerConfig;
     const snapshotQuery = yield* ProjectionSnapshotQuery;
+    const orchestrationEngine = yield* OrchestrationEngineService;
     const services = yield* Effect.services<never>();
     const runPromise = Effect.runPromiseWith(services);
     const runFork = Effect.runForkWith(services);
@@ -111,6 +115,32 @@ export const ModHostLive = Layer.effect(
         ),
         () => Effect.promise(() => manager.stop()),
       );
+      // Views that follow threads or projects redraw shortly after a change, once
+      // per burst: a running turn emits many thread events.
+      const pendingSources = new Map<ModViewSource, ReturnType<typeof setTimeout>>();
+      const noteChange = (source: ModViewSource) => {
+        if (pendingSources.has(source)) return;
+        pendingSources.set(
+          source,
+          setTimeout(() => {
+            pendingSources.delete(source);
+            manager.notifyDataChanged(source);
+          }, VIEW_REFRESH_DEBOUNCE_MS),
+        );
+      };
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          for (const timer of pendingSources.values()) clearTimeout(timer);
+        }),
+      );
+      yield* Effect.forkScoped(
+        Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) =>
+          Effect.sync(() => {
+            if (event.type.startsWith("thread.")) noteChange("threads");
+            else if (event.type.startsWith("project.")) noteChange("projects");
+          }),
+        ),
+      );
     }
 
     const guarded = <A>(run: () => Promise<A> | A): Effect.Effect<A, ModHostError> =>
@@ -141,6 +171,10 @@ export const ModHostLive = Layer.effect(
       readLogs: (input) => guarded(() => manager.readLogs(input.id)),
       runCommand: (input) =>
         guarded(() => manager.runCommand(input.modId, input.command, input.threadId ?? null)),
+      renderView: (input) =>
+        guarded(() => manager.renderView(input.modId, input.viewId, input.context)),
+      dispatchUi: (input) =>
+        guarded(() => manager.dispatchUi(input.modId, input.handlerId, input.payload)),
       streamEvents,
     } satisfies ModHostShape;
   }),

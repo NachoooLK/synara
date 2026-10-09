@@ -1,0 +1,447 @@
+// FILE: ModUiRenderer.tsx
+// Purpose: Draws a tree a mod returned from `ui.render` with Synara's own
+//          components. The vocabulary is closed: props map to fixed classes and
+//          the text sizes the person chose in Settings; unknown elements show a notice.
+// Layer: Web mods UI
+
+import type { ModUiTree } from "@synara/contracts";
+import { type ReactNode, useEffect, useRef, useState } from "react";
+
+import ChatMarkdown from "~/components/ChatMarkdown";
+import { SidebarSectionLabel } from "~/components/SidebarListSection";
+import { Badge } from "~/components/ui/badge";
+import { Button } from "~/components/ui/button";
+import { Input } from "~/components/ui/input";
+import { Separator } from "~/components/ui/separator";
+import { Spinner } from "~/components/ui/spinner";
+import { Switch } from "~/components/ui/switch";
+import { CentralIcon } from "~/lib/central-icons";
+import { openExternalLink } from "~/lib/linkChips";
+import { cn } from "~/lib/utils";
+import {
+  SIDEBAR_ROW_ACTIVE_CLASS_NAME,
+  SIDEBAR_ROW_FOCUS_CLASS_NAME,
+  SIDEBAR_ROW_GAP_CLASS_NAME,
+  SIDEBAR_ROW_HEIGHT_CLASS_NAME,
+  SIDEBAR_ROW_HOVER_CLASS_NAME,
+  SIDEBAR_ROW_IDLE_TEXT_CLASS_NAME,
+  SIDEBAR_ROW_PADDING_CLASS_NAME,
+  SIDEBAR_ROW_RADIUS_CLASS_NAME,
+  SIDEBAR_ROW_TEXT_CLASS_NAME,
+} from "~/sidebarRowStyles";
+
+export interface ModUiElement {
+  readonly type: string;
+  readonly props: Readonly<Record<string, unknown>>;
+  readonly children: ReadonlyArray<ModUiNode>;
+}
+export type ModUiNode = ModUiElement | string;
+
+/** Sends a `{ $handler }` reference back to the mod with what happened. */
+export type ModUiDispatch = (handler: unknown, payload: unknown) => void;
+
+const INPUT_CHANGE_DEBOUNCE_MS = 300;
+
+const GAP_CLASS_NAMES: Record<number, string> = {
+  0: "gap-0",
+  1: "gap-1",
+  2: "gap-2",
+  3: "gap-3",
+  4: "gap-4",
+  6: "gap-6",
+};
+const PADDING_CLASS_NAMES: Record<number, string> = {
+  0: "p-0",
+  1: "p-1",
+  2: "p-2",
+  3: "p-3",
+  4: "p-4",
+  6: "p-6",
+};
+const PADDING_X_CLASS_NAMES: Record<number, string> = {
+  0: "px-0",
+  1: "px-1",
+  2: "px-2",
+  3: "px-3",
+  4: "px-4",
+  6: "px-6",
+};
+const PADDING_Y_CLASS_NAMES: Record<number, string> = {
+  0: "py-0",
+  1: "py-1",
+  2: "py-2",
+  3: "py-3",
+  4: "py-4",
+  6: "py-6",
+};
+const ALIGN_CLASS_NAMES: Record<string, string> = {
+  start: "items-start",
+  center: "items-center",
+  end: "items-end",
+  stretch: "items-stretch",
+};
+const JUSTIFY_CLASS_NAMES: Record<string, string> = {
+  start: "justify-start",
+  center: "justify-center",
+  end: "justify-end",
+  between: "justify-between",
+};
+const TONE_CLASS_NAMES: Record<string, string> = {
+  default: "text-foreground",
+  muted: "text-muted-foreground",
+  success: "text-success",
+  warning: "text-warning",
+  danger: "text-destructive",
+  info: "text-info-foreground",
+};
+const SIZE_CLASS_NAMES: Record<string, string> = {
+  xs: "text-ui-xs",
+  sm: "text-ui-sm",
+  md: "text-ui",
+  lg: "text-ui-lg",
+};
+const WEIGHT_CLASS_NAMES: Record<string, string> = {
+  normal: "font-normal",
+  medium: "font-medium",
+  semibold: "font-semibold",
+};
+const BUTTON_VARIANTS = new Set(["default", "outline", "ghost", "secondary", "destructive"]);
+const BADGE_VARIANTS = new Set(["outline", "secondary", "info", "success", "warning", "error"]);
+
+function stringProp(props: Readonly<Record<string, unknown>>, name: string): string | undefined {
+  const value = props[name];
+  return typeof value === "string" ? value : undefined;
+}
+
+function pick(map: Record<string | number, string>, value: unknown): string | undefined {
+  return typeof value === "string" || typeof value === "number" ? map[value] : undefined;
+}
+
+function isHandler(value: unknown): boolean {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    typeof (value as { readonly $handler?: unknown }).$handler === "string"
+  );
+}
+
+function asNode(value: unknown): ModUiNode | null {
+  if (typeof value === "string") return value;
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    typeof (value as ModUiElement).type === "string"
+  ) {
+    const element = value as Partial<ModUiElement>;
+    return {
+      type: element.type as string,
+      props: element.props !== null && typeof element.props === "object" ? element.props : {},
+      children: Array.isArray(element.children) ? element.children : [],
+    };
+  }
+  return null;
+}
+
+/** A child's React key: the mod's `key` prop when it set one, its position otherwise. */
+function childKey(node: ModUiNode, position: number): string {
+  if (typeof node !== "string") {
+    const key = node.props.key;
+    if (typeof key === "string" || typeof key === "number") return `k:${key}`;
+  }
+  return `p:${position}`;
+}
+
+function textOf(children: ReadonlyArray<ModUiNode>): string {
+  return children
+    .map((child) => (typeof child === "string" ? child : textOf(child.children)))
+    .join("");
+}
+
+function ModUiChildren(props: { nodes: ReadonlyArray<ModUiNode>; dispatch: ModUiDispatch }) {
+  return (
+    <>
+      {props.nodes.map((node, position) => (
+        // A child without its own `key` falls back to its position, as React itself would.
+        // oxlint-disable-next-line no-array-index-key
+        <ModUiNodeView key={childKey(node, position)} node={node} dispatch={props.dispatch} />
+      ))}
+    </>
+  );
+}
+
+function ModUiInput(props: { element: ModUiElement; dispatch: ModUiDispatch }) {
+  const { element, dispatch } = props;
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (timer.current !== null) clearTimeout(timer.current);
+    },
+    [],
+  );
+  const onChange = element.props.onChange;
+  const onSubmit = element.props.onSubmit;
+  return (
+    <Input
+      size="sm"
+      placeholder={stringProp(element.props, "placeholder")}
+      defaultValue={stringProp(element.props, "defaultValue") ?? stringProp(element.props, "value")}
+      aria-label={stringProp(element.props, "label") ?? stringProp(element.props, "placeholder")}
+      onChange={(event) => {
+        if (!isHandler(onChange)) return;
+        const value = event.currentTarget.value;
+        if (timer.current !== null) clearTimeout(timer.current);
+        timer.current = setTimeout(() => dispatch(onChange, value), INPUT_CHANGE_DEBOUNCE_MS);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" && isHandler(onSubmit)) {
+          dispatch(onSubmit, event.currentTarget.value);
+        }
+      }}
+    />
+  );
+}
+
+function ModUiSwitch(props: { element: ModUiElement; dispatch: ModUiDispatch }) {
+  const { element, dispatch } = props;
+  const checkedProp = element.props.checked === true;
+  // Shows the flip at once; the mod's next render settles the real value.
+  const [checked, setChecked] = useState(checkedProp);
+  useEffect(() => setChecked(checkedProp), [checkedProp]);
+  const label = stringProp(element.props, "label");
+  const control = (
+    <Switch
+      checked={checked}
+      disabled={element.props.disabled === true}
+      aria-label={label}
+      onCheckedChange={(next) => {
+        setChecked(Boolean(next));
+        if (isHandler(element.props.onChange)) dispatch(element.props.onChange, Boolean(next));
+      }}
+    />
+  );
+  if (!label) return control;
+  return (
+    <label className="flex items-center justify-between gap-3 text-ui">
+      <span className="min-w-0 truncate">{label}</span>
+      {control}
+    </label>
+  );
+}
+
+function ModUiNodeView(props: { node: ModUiNode; dispatch: ModUiDispatch }): ReactNode {
+  const { node, dispatch } = props;
+  if (typeof node === "string") return node;
+  const element = node;
+  const p = element.props;
+  const children = <ModUiChildren nodes={element.children} dispatch={dispatch} />;
+  const onPress = isHandler(p.onPress) ? () => dispatch(p.onPress, null) : undefined;
+
+  switch (element.type) {
+    case "Fragment":
+      return children;
+    case "Box":
+      return (
+        <div
+          className={cn(
+            "flex min-w-0",
+            p.direction === "row" ? "flex-row" : "flex-col",
+            pick(GAP_CLASS_NAMES, p.gap),
+            pick(PADDING_CLASS_NAMES, p.padding),
+            pick(PADDING_X_CLASS_NAMES, p.paddingX),
+            pick(PADDING_Y_CLASS_NAMES, p.paddingY),
+            pick(ALIGN_CLASS_NAMES, p.align),
+            pick(JUSTIFY_CLASS_NAMES, p.justify),
+            p.grow === true && "flex-1",
+            p.wrap === true && "flex-wrap",
+            p.border === true && "rounded-md border",
+            p.scroll === true && "min-h-0 overflow-y-auto",
+          )}
+        >
+          {children}
+        </div>
+      );
+    case "Text":
+      return (
+        <span
+          className={cn(
+            "min-w-0",
+            pick(SIZE_CLASS_NAMES, p.size) ?? "text-ui",
+            pick(TONE_CLASS_NAMES, p.tone),
+            pick(WEIGHT_CLASS_NAMES, p.weight),
+            p.mono === true && "font-mono",
+            p.italic === true && "italic",
+            p.truncate === true ? "truncate" : "break-words",
+            p.block === true && "block",
+          )}
+        >
+          {children}
+        </span>
+      );
+    case "Heading":
+      return (
+        <h3
+          className={cn(
+            "min-w-0 truncate font-medium text-foreground",
+            p.size === "sm" ? "text-ui" : "text-ui-lg",
+          )}
+        >
+          {children}
+        </h3>
+      );
+    case "Section":
+      return (
+        <section className="flex min-w-0 flex-col gap-0.5">
+          {stringProp(p, "title") ? (
+            <SidebarSectionLabel
+              label={stringProp(p, "title") ?? ""}
+              className="px-2 pt-2 pb-0.5"
+            />
+          ) : null}
+          {children}
+        </section>
+      );
+    case "List":
+      return <div className="flex min-w-0 flex-col gap-0.5">{children}</div>;
+    case "Row": {
+      const icon = stringProp(p, "icon");
+      const meta = stringProp(p, "meta");
+      const className = cn(
+        "flex w-full min-w-0 items-center text-left",
+        SIDEBAR_ROW_HEIGHT_CLASS_NAME,
+        SIDEBAR_ROW_RADIUS_CLASS_NAME,
+        SIDEBAR_ROW_PADDING_CLASS_NAME,
+        SIDEBAR_ROW_GAP_CLASS_NAME,
+        SIDEBAR_ROW_TEXT_CLASS_NAME,
+        p.active === true ? SIDEBAR_ROW_ACTIVE_CLASS_NAME : SIDEBAR_ROW_IDLE_TEXT_CLASS_NAME,
+        onPress && SIDEBAR_ROW_FOCUS_CLASS_NAME,
+        onPress && p.active !== true && SIDEBAR_ROW_HOVER_CLASS_NAME,
+      );
+      const content = (
+        <>
+          {icon ? <CentralIcon name={icon} className="size-4 shrink-0 opacity-80" /> : null}
+          <span className="min-w-0 flex-1 truncate">{children}</span>
+          {meta ? <span className="shrink-0 text-ui-xs text-muted-foreground">{meta}</span> : null}
+        </>
+      );
+      return onPress ? (
+        <button
+          type="button"
+          className={className}
+          title={stringProp(p, "title")}
+          onClick={onPress}
+        >
+          {content}
+        </button>
+      ) : (
+        <div className={className} title={stringProp(p, "title")}>
+          {content}
+        </div>
+      );
+    }
+    case "Button": {
+      const icon = stringProp(p, "icon");
+      const label = stringProp(p, "label");
+      const variant =
+        typeof p.variant === "string" && BUTTON_VARIANTS.has(p.variant) ? p.variant : "outline";
+      const iconOnly = element.children.length === 0 && icon !== undefined;
+      return (
+        <Button
+          size={iconOnly ? "icon-xs" : "xs"}
+          variant={variant as "default" | "outline" | "ghost" | "secondary" | "destructive"}
+          disabled={p.disabled === true || !onPress}
+          aria-label={label}
+          title={label}
+          onClick={onPress}
+        >
+          {icon ? <CentralIcon name={icon} className="size-3.5" /> : null}
+          {iconOnly ? null : element.children.length > 0 ? children : label}
+        </Button>
+      );
+    }
+    case "Icon": {
+      const name = stringProp(p, "name");
+      if (!name) return null;
+      return (
+        <CentralIcon
+          name={name}
+          label={stringProp(p, "label")}
+          className={cn(
+            "shrink-0",
+            p.size === "md" ? "size-4" : "size-3.5",
+            pick(TONE_CLASS_NAMES, p.tone),
+          )}
+        />
+      );
+    }
+    case "Badge": {
+      const variant = typeof p.tone === "string" && BADGE_VARIANTS.has(p.tone) ? p.tone : "outline";
+      return (
+        <Badge variant={variant as "outline"} size="sm">
+          {children}
+        </Badge>
+      );
+    }
+    case "Markdown":
+      return (
+        <ChatMarkdown
+          text={stringProp(p, "text") ?? textOf(element.children)}
+          cwd={undefined}
+          className="text-ui"
+        />
+      );
+    case "Code":
+      return (
+        <pre className="max-h-96 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-ui-xs whitespace-pre">
+          <code>{stringProp(p, "text") ?? textOf(element.children)}</code>
+        </pre>
+      );
+    case "Link": {
+      const href = stringProp(p, "href");
+      return (
+        <button
+          type="button"
+          className="text-info-foreground underline-offset-2 hover:underline"
+          onClick={() => {
+            if (href && /^https?:\/\//iu.test(href)) openExternalLink(href);
+            onPress?.();
+          }}
+        >
+          {element.children.length > 0 ? children : href}
+        </button>
+      );
+    }
+    case "Divider":
+      return <Separator className="my-1" />;
+    case "Spinner":
+      return <Spinner className="size-4 text-muted-foreground" />;
+    case "Empty":
+      return (
+        <div className="flex flex-col items-center gap-1 px-4 py-6 text-center">
+          {stringProp(p, "title") ? (
+            <span className="text-ui font-medium text-foreground">{stringProp(p, "title")}</span>
+          ) : null}
+          {stringProp(p, "description") ? (
+            <span className="text-ui-sm text-muted-foreground">{stringProp(p, "description")}</span>
+          ) : null}
+          {children}
+        </div>
+      );
+    case "Input":
+      return <ModUiInput element={element} dispatch={dispatch} />;
+    case "Switch":
+      return <ModUiSwitch element={element} dispatch={dispatch} />;
+    default:
+      return (
+        <span className="rounded border border-dashed border-warning/50 px-1 text-ui-xs text-warning">
+          Unknown element “{element.type}”
+        </span>
+      );
+  }
+}
+
+/** Draws a whole tree; a value that is not a tree draws nothing. */
+export function ModUiRenderer(props: { tree: ModUiTree | null; dispatch: ModUiDispatch }) {
+  const node = asNode(props.tree);
+  if (node === null) return null;
+  return <ModUiNodeView node={node} dispatch={props.dispatch} />;
+}

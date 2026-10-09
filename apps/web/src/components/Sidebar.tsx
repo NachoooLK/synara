@@ -386,6 +386,9 @@ import {
 } from "./ui/sidebar";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { useModPaletteActions } from "~/mods/useModPaletteActions";
+import { ModSidebarPanel } from "~/mods/ModSidebarPanel";
+import { useModSidebarStore, type ModSidebarViewRef } from "~/mods/modSidebarStore";
+import { useModSidebarRailItems } from "~/mods/useModSidebarRailItems";
 import {
   excludeHiddenProjectAgentCoordinatorThreads,
   buildProjectThreadTree,
@@ -1359,6 +1362,22 @@ export default function Sidebar() {
   const isOnKanban = pathname.startsWith("/kanban");
   const isOnTasks = pathname.startsWith("/tasks");
   const isOnAutomations = pathname.startsWith("/automations");
+  // A mod's sidebar view takes the thread list's place until another rail item or a
+  // section with its own panel (Settings, Automations) is opened.
+  const modSidebarView = useModSidebarStore((store) => store.activeView);
+  const selectModSidebarView = useModSidebarStore((store) => store.select);
+  const clearModSidebarView = useModSidebarStore((store) => store.clear);
+  useEffect(() => {
+    if (isOnSettings || isOnAutomations) clearModSidebarView();
+  }, [clearModSidebarView, isOnAutomations, isOnSettings]);
+  const handleSelectModSidebarView = useCallback(
+    (view: ModSidebarViewRef) => {
+      selectRailPanelItem("home");
+      selectModSidebarView(view);
+    },
+    [selectModSidebarView, selectRailPanelItem],
+  );
+  const modSidebarRailItems = useModSidebarRailItems(modSidebarView, handleSelectModSidebarView);
   const isOnPullRequests = pathname.startsWith("/pull-requests");
   const isOnInbox = pathname.startsWith("/inbox");
   // Lightweight read of automations to drive the sidebar attention badge. Shares the
@@ -6950,11 +6969,22 @@ export default function Sidebar() {
   const projectContextMenuHasOpenServer =
     projectContextMenuServer !== null && firstLocalServerUrl(projectContextMenuServer) !== null;
 
+  // While a mod view fills the panel it alone is active, and any other rail item gives
+  // the panel back to Synara's own content.
+  const withModSidebarViewCleared = (items: ReadonlyArray<AppRailItem>): AppRailItem[] =>
+    items.map((item) => ({
+      ...item,
+      active: modSidebarView === null && item.active,
+      onSelect: () => {
+        clearModSidebarView();
+        item.onSelect();
+      },
+    }));
   const appRailProps = {
-    items: railItems,
-    shortcuts: railShortcutItems,
+    items: withModSidebarViewCleared(railItems),
+    shortcuts: [...withModSidebarViewCleared(railShortcutItems), ...modSidebarRailItems],
     moreSlot: railMoreMenu,
-    bottomItems: railBottomItems,
+    bottomItems: withModSidebarViewCleared(railBottomItems),
     bottomSlot: (
       <>
         <AppRailUsage
@@ -7050,7 +7080,13 @@ export default function Sidebar() {
                 </Alert>
               </SidebarGroup>
             ) : null}
-            {isOnSettings ? (
+            {modSidebarView ? (
+              <ModSidebarPanel
+                view={modSidebarView}
+                threadId={routeThreadId}
+                projectId={routeProjectId}
+              />
+            ) : isOnSettings ? (
               <SidebarGroup className="p-0">
                 {/* The rail is the way back, so the panel opens on its title like every section. */}
                 <SidebarPanelTitle title="Settings" />
@@ -7336,6 +7372,7 @@ export default function Sidebar() {
             !activityViewEnabled &&
             !showRailSpacesPanel &&
             !showRailAutomationsPanel &&
+            modSidebarView === null &&
             snoozedSidebarThreads.length > 0 ? (
               <SidebarGroup className="px-1.5 pt-1 pb-2">
                 <SidebarSnoozedThreadsSection
@@ -7350,6 +7387,7 @@ export default function Sidebar() {
             !activityViewEnabled &&
             !showRailSpacesPanel &&
             !showRailAutomationsPanel &&
+            modSidebarView === null &&
             chatsSectionVisible ? (
               // sidebar-surface-enter: mounts on the Groups -> Projects switch, so it
               // animates in step with the keyed surface wrapper above.

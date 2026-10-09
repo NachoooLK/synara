@@ -141,8 +141,10 @@ import { FilesystemBrowseInput } from "./filesystem";
 import {
   MODS_WS_CHANNELS,
   MODS_WS_METHODS,
+  ModsDispatchUiInput,
   ModsReadLogsInput,
   ModsReloadInput,
+  ModsRenderViewInput,
   ModsRunCommandInput,
   ModsSetEnabledInput,
   ModsStreamEvent,
@@ -544,6 +546,8 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(MODS_WS_METHODS.reload, ModsReloadInput),
   tagRequestBody(MODS_WS_METHODS.readLogs, ModsReadLogsInput),
   tagRequestBody(MODS_WS_METHODS.runCommand, ModsRunCommandInput),
+  tagRequestBody(MODS_WS_METHODS.renderView, ModsRenderViewInput),
+  tagRequestBody(MODS_WS_METHODS.dispatchUi, ModsDispatchUiInput),
   tagRequestBody(MODS_WS_METHODS.subscribeEvents, Schema.Struct({})),
 
   // Shell methods

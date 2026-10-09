@@ -94,9 +94,13 @@ import {
 } from "./externalMcp";
 import {
   MODS_WS_METHODS,
+  ModsDispatchUiInput,
+  ModsDispatchUiResult,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
+  ModsRenderViewInput,
+  ModsRenderViewResult,
   ModsRunCommandInput,
   ModsRunCommandResult,
   ModsSetEnabledInput,
@@ -892,6 +896,18 @@ export const WsModsRunCommandRpc = Rpc.make(MODS_WS_METHODS.runCommand, {
   error: WsRpcError,
 });
 
+export const WsModsRenderViewRpc = Rpc.make(MODS_WS_METHODS.renderView, {
+  payload: ModsRenderViewInput,
+  success: ModsRenderViewResult,
+  error: WsRpcError,
+});
+
+export const WsModsDispatchUiRpc = Rpc.make(MODS_WS_METHODS.dispatchUi, {
+  payload: ModsDispatchUiInput,
+  success: ModsDispatchUiResult,
+  error: WsRpcError,
+});
+
 export const WsSubscribeModsEventsRpc = Rpc.make(MODS_WS_METHODS.subscribeEvents, {
   payload: Schema.Struct({}),
   success: ModsStreamEvent,
@@ -905,6 +921,8 @@ export const WsModsRpcGroup = RpcGroup.make(
   WsModsReloadRpc,
   WsModsReadLogsRpc,
   WsModsRunCommandRpc,
+  WsModsRenderViewRpc,
+  WsModsDispatchUiRpc,
   WsSubscribeModsEventsRpc,
 );
 

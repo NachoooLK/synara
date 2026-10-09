@@ -4,6 +4,7 @@
 //        Node (tests, packaged app), so it uses only erasable TypeScript syntax
 //        and imports nothing from the server but the protocol.
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -14,6 +15,7 @@ import { transform, type Transform } from "sucrase";
 import {
   MOD_API_METHODS,
   MOD_SDK_SPECIFIERS,
+  MOD_STALE_HANDLER_ERROR,
   describeModError,
   type HostToWorkerMessage,
   type ModCallOutcome,
@@ -58,7 +60,12 @@ function h(
 const Fragment = "Fragment";
 Object.assign(globalThis, { h, Fragment });
 
-const sdk = Object.freeze({ h, Fragment });
+// Element names are plain strings; `<Box>` compiles to h("Box", …) through these.
+const sdk = Object.freeze({
+  ...Object.fromEntries(data.elements.map((name) => [name, name])),
+  h,
+  Fragment,
+});
 
 // ── Module loading ───────────────────────────────────────────────────
 // A mod imports its own files and the SDK, nothing else, so everything it does
@@ -208,12 +215,17 @@ interface Pending {
 const pendingApi = new Map<number, Pending>();
 let nextRequestId = 1;
 
+// The hook or handler call running now, so the server can tell which press
+// asked for an effect such as opening a thread, even from a closure made at render.
+const currentCall = new AsyncLocalStorage<number>();
+
 function callApi(method: string, args: ReadonlyArray<unknown>): Promise<unknown> {
   const requestId = nextRequestId++;
+  const callId = currentCall.getStore() ?? null;
   return new Promise((resolve, reject) => {
     pendingApi.set(requestId, { resolve, reject });
     try {
-      post({ type: "api", requestId, method, args });
+      post({ type: "api", requestId, callId, method, args });
     } catch {
       pendingApi.delete(requestId);
       reject(
@@ -304,6 +316,68 @@ function deepFreeze<T>(value: T): T {
 
 const pendingNext = new Map<string, Pending>();
 
+// ── Handlers ─────────────────────────────────────────────────────────
+// Functions in a hook's result (a tree's onPress) stay here; the result carries
+// `{ $handler: "<render>.<index>" }`. The handlers of the latest renders are kept.
+
+type UiHandler = (payload: unknown) => unknown;
+
+const HANDLER_RENDERS_KEPT = 128;
+const RESULT_MAX_DEPTH = 64;
+const handlerRenders = new Map<number, UiHandler[]>();
+let nextRenderSeq = 1;
+
+function withHandlerReferences(value: unknown): unknown {
+  const renderSeq = nextRenderSeq;
+  const handlers: UiHandler[] = [];
+  const visit = (current: unknown, depth: number): unknown => {
+    if (typeof current === "function") {
+      handlers.push(current as UiHandler);
+      return { $handler: `${renderSeq}.${handlers.length - 1}` };
+    }
+    if (current === null || typeof current !== "object") return current;
+    if (depth > RESULT_MAX_DEPTH) {
+      throw new Error(`The result nests deeper than ${RESULT_MAX_DEPTH} levels.`);
+    }
+    if (Array.isArray(current)) return current.map((item) => visit(item, depth + 1));
+    const copy: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(current)) copy[key] = visit(item, depth + 1);
+    return copy;
+  };
+  const converted = visit(value, 0);
+  if (handlers.length > 0) {
+    nextRenderSeq += 1;
+    handlerRenders.set(renderSeq, handlers);
+    for (const oldest of handlerRenders.keys()) {
+      if (handlerRenders.size <= HANDLER_RENDERS_KEPT) break;
+      handlerRenders.delete(oldest);
+    }
+  }
+  return converted;
+}
+
+function findHandler(handlerId: string): UiHandler | null {
+  const [renderSeq, index] = handlerId.split(".").map(Number);
+  if (renderSeq === undefined || index === undefined) return null;
+  return handlerRenders.get(renderSeq)?.[index] ?? null;
+}
+
+async function invokeHandler(callId: number, handlerId: string, payload: unknown): Promise<void> {
+  const handler = findHandler(handlerId);
+  if (!handler) {
+    post({ type: "invoke-result", callId, ok: false, error: MOD_STALE_HANDLER_ERROR });
+    return;
+  }
+  let outcome: ModCallOutcome;
+  try {
+    await currentCall.run(callId, () => handler(deepFreeze(payload)));
+    outcome = { ok: true, value: undefined };
+  } catch (error) {
+    outcome = { ok: false, error: describeForMod(error) };
+  }
+  post({ type: "invoke-result", callId, ...outcome });
+}
+
 function settle(pending: Pending | undefined, outcome: ModCallOutcome): void {
   if (!pending) return;
   if (outcome.ok) pending.resolve(outcome.value);
@@ -332,8 +406,8 @@ async function invoke(callId: number, hookId: number, input: unknown): Promise<v
   };
   let outcome: ModCallOutcome;
   try {
-    const value = await hook.fn(api, deepFreeze(input), next);
-    outcome = { ok: true, value };
+    const value = await currentCall.run(callId, () => hook.fn(api, deepFreeze(input), next));
+    outcome = { ok: true, value: withHandlerReferences(value) };
   } catch (error) {
     outcome = { ok: false, error: describeForMod(error) };
   }
@@ -353,6 +427,9 @@ port.on("message", (message: HostToWorkerMessage) => {
   switch (message.type) {
     case "invoke":
       void invoke(message.callId, message.hookId, message.input);
+      return;
+    case "invoke-handler":
+      void invokeHandler(message.callId, message.handlerId, message.payload);
       return;
     case "next-result": {
       const key = `${message.callId}:${message.nextId}`;

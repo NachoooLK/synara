@@ -74,6 +74,8 @@ interface RightDockProps {
   paneIconOverrides?: Record<string, ReactNode | undefined>;
   addMenuKinds: readonly RightDockPaneKind[];
   launcherItems?: readonly RightDockLauncherItem[];
+  /** Items that open themselves (mod dock views), listed after the kinds in the add menu and launcher. */
+  extraLauncherItems?: readonly RightDockLauncherItem[];
   /** A plain "+" for hosts whose only addable thing is one kind (no menu to choose from). */
   addAction?: { label: string; onClick: () => void };
   // Single-pane hosts omit selection so their lone tab label is static; multi-pane chat hosts
@@ -108,14 +110,14 @@ function RightDockLauncher(props: {
       className="flex h-full min-h-0 items-center justify-center overflow-y-auto p-6"
     >
       <div className="flex w-full max-w-sm flex-col gap-1.5">
-        {props.items.map(({ kind, Icon, label }) => (
+        {props.items.map(({ kind, key, Icon, label, onOpen }) => (
           <Button
-            key={kind}
+            key={key ?? kind}
             variant="subtle"
             size="xl"
             className="h-11 w-full justify-start gap-3 rounded-xl px-4 text-ui-lg font-normal"
             aria-label={`Open ${label}`}
-            onClick={() => props.onOpen(kind)}
+            onClick={() => (onOpen ? onOpen() : props.onOpen(kind))}
           >
             <Icon className="size-4 shrink-0" />
             <span>{label}</span>
@@ -331,7 +333,8 @@ export function RightDock(props: RightDockProps) {
                 onClose: () => props.onClosePane(pane.id),
               }))}
             />
-            {props.state.panes.length > 0 && props.addMenuKinds.length > 0 ? (
+            {props.state.panes.length > 0 &&
+            (props.addMenuKinds.length > 0 || (props.extraLauncherItems?.length ?? 0) > 0) ? (
               <Menu modal={false}>
                 <MenuTrigger
                   render={
@@ -356,6 +359,15 @@ export function RightDock(props: RightDockProps) {
                       </MenuItem>
                     );
                   })}
+                  {(props.extraLauncherItems ?? []).map((item) => (
+                    <MenuItem
+                      key={item.key ?? item.kind}
+                      onClick={() => (item.onOpen ? item.onOpen() : props.onAddPane(item.kind))}
+                    >
+                      <item.Icon className="size-3.5 shrink-0" />
+                      <span>{item.label}</span>
+                    </MenuItem>
+                  ))}
                 </ComposerPickerMenuPopup>
               </Menu>
             ) : null}
@@ -404,7 +416,10 @@ export function RightDock(props: RightDockProps) {
           </div>
           <div className="relative min-h-0 flex-1">
             {activePane === null && props.launcherItems ? (
-              <RightDockLauncher items={props.launcherItems} onOpen={props.onAddPane} />
+              <RightDockLauncher
+                items={[...props.launcherItems, ...(props.extraLauncherItems ?? [])]}
+                onOpen={props.onAddPane}
+              />
             ) : null}
             {renderedPanes.map((pane) => {
               const isActive = pane.id === activePane?.id;

@@ -120,6 +120,8 @@ interface ChatHeaderProps {
   diffDisabledReason?: string | null;
   rightDockOpen?: boolean;
   onToggleRightDock?: () => void;
+  /** Buttons mods draw into the header, before the project scripts. */
+  modActions?: React.ReactNode;
   surfaceMode?: "single" | "split";
   isSidechat?: boolean;
   // When provided, the header collapses the
@@ -445,6 +447,7 @@ export function ChatHeader({
   diffDisabledReason: diffDisabledReasonProp,
   rightDockOpen: rightDockOpenProp,
   onToggleRightDock,
+  modActions,
   surfaceMode: surfaceModeProp,
   isSidechat: isSidechatProp,
   environment: environmentProp,
@@ -777,6 +780,7 @@ export function ChatHeader({
             </ComposerPickerMenuPopup>
           </Menu>
         ) : null}
+        {!minimalChrome && modActions ? modActions : null}
         {!minimalChrome && activeProjectScripts ? (
           <ProjectScriptsControl
             scripts={activeProjectScripts}

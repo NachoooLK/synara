@@ -25,6 +25,40 @@ describe("isRightDockPaneKind", () => {
   });
 });
 
+describe("mod pane", () => {
+  it("opens one tab per mod view and refocuses it on reopen", () => {
+    const first = openPaneInState(createDefaultRightDockState(), {
+      paneId: "mod-a",
+      kind: "mod",
+      modId: "pr-demo",
+      modViewId: "prs",
+    });
+    const second = openPaneInState(first, {
+      paneId: "mod-b",
+      kind: "mod",
+      modId: "pr-demo",
+      modViewId: "checks",
+    });
+    const reopened = openPaneInState(second, {
+      paneId: "mod-c",
+      kind: "mod",
+      modId: "pr-demo",
+      modViewId: "prs",
+    });
+    expect(reopened.panes.map((pane) => pane.id)).toEqual(["mod-a", "mod-b"]);
+    expect(reopened.activePaneId).toBe("mod-a");
+  });
+
+  it("keeps the mod view identity through persistence", () => {
+    const state = sanitizeRightDockThreadState({
+      open: true,
+      panes: [{ id: "mod-a", kind: "mod", modId: "pr-demo", modViewId: "prs" }],
+      activePaneId: "mod-a",
+    });
+    expect(state.panes[0]).toMatchObject({ kind: "mod", modId: "pr-demo", modViewId: "prs" });
+  });
+});
+
 describe("pull request pane", () => {
   it("reuses the singleton pane and updates its PR identity", () => {
     const first = openPaneInState(createDefaultRightDockState(), {

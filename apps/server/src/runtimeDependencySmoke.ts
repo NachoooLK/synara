@@ -42,6 +42,7 @@ try {
       root: modRoot,
       entry: join(modRoot, "hooks", "register.tsx"),
       options: {},
+      elements: ["Box"],
     },
     workerUrl: await resolveModWorkerUrl(),
     handleApi: async () => undefined,

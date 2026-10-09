@@ -10,6 +10,12 @@ export const MOD_API_METHODS = [
   "log.error",
   "ui.toast",
   "ui.status",
+  "ui.view",
+  "ui.removeView",
+  "ui.invalidate",
+  "ui.openThread",
+  "ui.openUrl",
+  "ui.openDockView",
   "command.register",
   "command.unregister",
   "threads.list",
@@ -32,6 +38,8 @@ export interface ModWorkerData {
   /** Absolute path of the hooks module. */
   readonly entry: string;
   readonly options: Readonly<Record<string, unknown>>;
+  /** The element names the SDK exports for JSX (`import { Box } from "synara"`). */
+  readonly elements: ReadonlyArray<string>;
 }
 
 export interface ModHookRegistration {
@@ -50,6 +58,12 @@ export type HostToWorkerMessage =
       readonly callId: number;
       readonly hookId: number;
       readonly input: unknown;
+    }
+  | {
+      readonly type: "invoke-handler";
+      readonly callId: number;
+      readonly handlerId: string;
+      readonly payload: unknown;
     }
   | ({
       readonly type: "next-result";
@@ -72,6 +86,8 @@ export type WorkerToHostMessage =
   | {
       readonly type: "api";
       readonly requestId: number;
+      /** The hook or handler call the request came from, when there is one. */
+      readonly callId: number | null;
       readonly method: string;
       readonly args: ReadonlyArray<unknown>;
     }
@@ -93,3 +109,11 @@ export function describeModError(error: unknown): string {
     return String(error);
   }
 }
+
+/** A function in a hook's result travels as this reference; the function stays in the worker. */
+export interface ModHandlerReference {
+  readonly $handler: string;
+}
+
+/** The error a worker answers for a handler from a tree it no longer holds. */
+export const MOD_STALE_HANDLER_ERROR = "This control is out of date; the view is being redrawn.";

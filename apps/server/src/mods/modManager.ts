@@ -8,23 +8,34 @@ import { type FSWatcher, promises as fs, watch } from "node:fs";
 import * as path from "node:path";
 
 import {
+  MOD_UI_ELEMENTS,
   ModCommandName,
   ModToastTone,
+  ModViewId,
+  ModViewRefreshSource,
+  ModViewSite,
+  ThreadId,
   type ModCommand,
   type ModLogEntry,
   type ModLogLevel,
+  type ModsDispatchUiResult,
   type ModsReadLogsResult,
+  type ModsRenderViewResult,
   type ModsRunCommandResult,
   type ModsSnapshot,
   type ModsStreamEvent,
   type ModStatus,
   type ModSummary,
+  type ModUiEffect,
+  type ModView,
+  type ModViewContext,
 } from "@synara/contracts";
 import { Schema } from "effect";
 
 import type { ModProject, ModThread } from "./modApi.ts";
 import { listModFolders, readModDefinition, type ModDefinition } from "./modDiscovery.ts";
 import { ModWorkerHost, resolveModWorkerUrl } from "./modWorkerHost.ts";
+import { normalizeModUiTree } from "./modUiTree.ts";
 
 const MOD_LOG_LIMIT = 200;
 const MOD_LOG_TEXT_LIMIT = 4_000;
@@ -39,10 +50,29 @@ const MOD_THREAD_LIST_MAX = 1_000;
 const MOD_RELOAD_DEBOUNCE_MS = 250;
 const MOD_STOP_HOOK_TIMEOUT_MS = 2_000;
 const MOD_SNAPSHOT_COALESCE_MS = 25;
+const MOD_VIEW_LIMIT = 20;
+const MOD_URL_LIMIT = 2_048;
 const REGISTRY_VERSION = 1;
 
 const isCommandName = Schema.is(ModCommandName);
 const isToastTone = Schema.is(ModToastTone);
+const isViewId = Schema.is(ModViewId);
+const isViewSite = Schema.is(ModViewSite);
+const isRefreshSource = Schema.is(ModViewRefreshSource);
+const isThreadId = Schema.is(ThreadId);
+
+/** What a handler call collects while it runs: the effects it asks of the window. */
+interface ModUiCallContext {
+  readonly effects: ModUiEffect[];
+}
+
+function isUiCallContext(context: unknown): context is ModUiCallContext {
+  return (
+    context !== null &&
+    typeof context === "object" &&
+    Array.isArray((context as ModUiCallContext).effects)
+  );
+}
 
 export interface ModManagerBackend {
   /** Every thread that has not been deleted. */
@@ -65,6 +95,8 @@ export interface ModManagerOptions {
   readonly watch?: boolean;
 }
 
+export type ModViewSource = ModView["refreshOn"][number];
+
 export class ModManagerError extends Error {
   override readonly name = "ModManagerError";
 }
@@ -78,6 +110,7 @@ interface ModRecord {
   /** Bumped on every start and stop, so late answers from an old worker are ignored. */
   generation: number;
   readonly commands: Map<string, ModCommand>;
+  readonly views: Map<string, ModView>;
   statusText: string | null;
   loadedAt: string | null;
   readonly logs: ModLogEntry[];
@@ -174,6 +207,7 @@ export class ModManager {
   private registryWrite: Promise<void> = Promise.resolve();
   private watcher: FSWatcher | null = null;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly pendingInvalidations = new Set<string>();
   private workerUrl: URL | null;
   private started = false;
   private stopped = false;
@@ -292,6 +326,61 @@ export class ModManager {
     return { text: text !== null && text.trim().length > 0 ? text : null };
   }
 
+  /** Draws one of a mod's views for a window: runs its `ui.render` hooks and checks the tree. */
+  async renderView(
+    modId: string,
+    viewId: string,
+    context: ModViewContext,
+  ): Promise<ModsRenderViewResult> {
+    const record = this.requireRunning(modId);
+    const view = record.views.get(viewId);
+    if (!view) throw new ModManagerError(`The mod "${modId}" has no view named "${viewId}".`);
+    const input = { view: view.id, site: view.site, context };
+    const result = await this.runChain(
+      "ui.render",
+      input,
+      this.hooksOf(record, "ui.render", input),
+      async () => null,
+    );
+    try {
+      return { tree: normalizeModUiTree(result) };
+    } catch (error) {
+      const message = `The "${viewId}" view returned a tree Synara cannot draw: ${errorMessage(error)}`;
+      this.appendLog(record, "error", message);
+      throw new ModManagerError(message);
+    }
+  }
+
+  /** Runs the handler a rendered tree referenced and returns what it asked of the window. */
+  async dispatchUi(
+    modId: string,
+    handlerId: string,
+    payload: unknown,
+  ): Promise<ModsDispatchUiResult> {
+    const record = this.requireRunning(modId);
+    const host = record.host;
+    if (host === null) throw new ModManagerError(`The mod "${modId}" is not running.`);
+    const context: ModUiCallContext = { effects: [] };
+    const outcome = await host.invokeHandler(handlerId, payload, context);
+    if (outcome.kind === "error") {
+      this.appendLog(record, "error", `A handler failed: ${outcome.error}`);
+      throw new ModManagerError(outcome.error);
+    }
+    return { effects: context.effects };
+  }
+
+  /** Synara's threads or projects changed; redraws the views that asked to follow them. */
+  notifyDataChanged(source: ModViewSource): void {
+    for (const record of this.records.values()) {
+      if (record.status !== "running") continue;
+      for (const view of record.views.values()) {
+        if (view.refreshOn.includes(source)) {
+          this.emit({ type: "invalidate", modId: record.definition.id, viewId: view.id });
+        }
+      }
+    }
+  }
+
   /**
    * Runs `event` through the matching hooks of every running mod, in mod order,
    * ending with `fallback` (Synara's own behaviour).
@@ -308,6 +397,14 @@ export class ModManager {
   }
 
   // ── Records ────────────────────────────────────────────────────────
+
+  private requireRunning(id: string): ModRecord {
+    const record = this.requireRecord(id);
+    if (record.status !== "running" || record.host === null) {
+      throw new ModManagerError(`The mod "${id}" is not running.`);
+    }
+    return record;
+  }
 
   private requireRecord(id: string): ModRecord {
     const record = this.records.get(id);
@@ -352,6 +449,7 @@ export class ModManager {
         host: null,
         generation: 0,
         commands: new Map(),
+        views: new Map(),
         statusText: null,
         loadedAt: null,
         logs: [],
@@ -376,6 +474,7 @@ export class ModManager {
     record.generation += 1;
     const generation = record.generation;
     record.commands.clear();
+    record.views.clear();
     record.statusText = null;
     record.loadedAt = null;
     record.runtimeError = null;
@@ -400,6 +499,7 @@ export class ModManager {
           root: definition.root,
           entry: definition.entry,
           options: {},
+          elements: MOD_UI_ELEMENTS,
         },
         workerUrl: await this.resolveWorkerUrl(),
         ...(this.options.loadTimeoutMs === undefined
@@ -408,7 +508,8 @@ export class ModManager {
         ...(this.options.hookTimeoutMs === undefined
           ? {}
           : { hookTimeoutMs: this.options.hookTimeoutMs }),
-        handleApi: (method, args) => this.handleApi(record, generation, method, args),
+        handleApi: (method, args, context) =>
+          this.handleApi(record, generation, method, args, context),
         onUncaught: (error) => {
           if (generation === record.generation)
             this.appendLog(record, "error", `Uncaught: ${error}`);
@@ -450,6 +551,7 @@ export class ModManager {
     record.generation += 1;
     record.host = null;
     record.commands.clear();
+    record.views.clear();
     record.statusText = null;
     record.loadedAt = null;
     record.runtimeError = null;
@@ -464,6 +566,7 @@ export class ModManager {
     record.status = "error";
     record.runtimeError = reason;
     record.commands.clear();
+    record.views.clear();
     record.statusText = null;
     this.appendLog(record, "error", reason);
     this.scheduleSnapshot();
@@ -513,6 +616,7 @@ export class ModManager {
     generation: number,
     method: string,
     args: ReadonlyArray<unknown>,
+    context: unknown = null,
   ): Promise<unknown> {
     if (generation !== record.generation) throw new ModManagerError("The mod was stopped.");
     const modId = record.definition.id;
@@ -542,6 +646,84 @@ export class ModManager {
             ? null
             : requireText(value, "$.ui.status(text)", MOD_STATUS_TEXT_LIMIT);
         this.scheduleSnapshot();
+        return undefined;
+      }
+      case "ui.view": {
+        const definition = (args[0] ?? {}) as Partial<
+          Record<"id" | "site" | "title" | "icon" | "refreshOn", unknown>
+        >;
+        if (!isViewId(definition.id)) {
+          throw new ModManagerError(
+            "$.ui.view({ id }): id must be lowercase words joined by dashes, up to 64 characters.",
+          );
+        }
+        if (!isViewSite(definition.site)) {
+          throw new ModManagerError(
+            '$.ui.view({ site }): site must be "sidebar", "dock", "band" or "header".',
+          );
+        }
+        if (!record.views.has(definition.id) && record.views.size >= MOD_VIEW_LIMIT) {
+          throw new ModManagerError(`A mod can register at most ${MOD_VIEW_LIMIT} views.`);
+        }
+        const refreshOn = Array.isArray(definition.refreshOn)
+          ? [...new Set(definition.refreshOn.filter(isRefreshSource))]
+          : [];
+        record.views.set(definition.id, {
+          id: definition.id,
+          site: definition.site,
+          title: requireText(definition.title, "$.ui.view({ title })", 256).trim(),
+          icon:
+            typeof definition.icon === "string" && definition.icon.trim().length > 0
+              ? clampText(definition.icon.trim(), 128)
+              : null,
+          refreshOn,
+        });
+        this.scheduleSnapshot();
+        this.emit({ type: "invalidate", modId, viewId: definition.id });
+        return undefined;
+      }
+      case "ui.removeView": {
+        if (record.views.delete(String(args[0]))) this.scheduleSnapshot();
+        return undefined;
+      }
+      case "ui.invalidate": {
+        const viewId = args[0];
+        if (viewId !== undefined && viewId !== null && !isViewId(viewId)) {
+          throw new ModManagerError(
+            "$.ui.invalidate(viewId): viewId must be a view id or nothing.",
+          );
+        }
+        this.emit({ type: "invalidate", modId, viewId: viewId ?? null });
+        return undefined;
+      }
+      case "ui.openThread":
+      case "ui.openUrl":
+      case "ui.openDockView": {
+        if (!isUiCallContext(context)) {
+          throw new ModManagerError(
+            `$.${method}() works only inside a handler of a view, such as an onPress.`,
+          );
+        }
+        if (method === "ui.openThread") {
+          if (!isThreadId(args[0])) {
+            throw new ModManagerError("$.ui.openThread(threadId): threadId must be a thread id.");
+          }
+          context.effects.push({ type: "openThread", threadId: args[0] });
+        } else if (method === "ui.openUrl") {
+          const url = typeof args[0] === "string" ? args[0] : "";
+          if (!/^https?:\/\//iu.test(url) || url.length > MOD_URL_LIMIT) {
+            throw new ModManagerError("$.ui.openUrl(url): url must be an http or https address.");
+          }
+          context.effects.push({ type: "openUrl", url });
+        } else {
+          const view = record.views.get(String(args[0]));
+          if (!view || view.site !== "dock") {
+            throw new ModManagerError(
+              "$.ui.openDockView(viewId): viewId must name one of this mod's dock views.",
+            );
+          }
+          context.effects.push({ type: "openDockView", modId, viewId: view.id });
+        }
         return undefined;
       }
       case "command.register": {
@@ -617,6 +799,8 @@ export class ModManager {
           }
           values.set(key, args[1]);
         }
+        // Views draw from state, so a change redraws them.
+        this.scheduleInvalidate(modId);
         return undefined;
       }
       case "store.get": {
@@ -777,6 +961,7 @@ export class ModManager {
       error: definition.error ?? record.runtimeError,
       hooks: [...new Set((record.host?.hooks ?? []).map((hook) => hook.event))],
       commands: [...record.commands.values()],
+      views: [...record.views.values()],
       statusText: record.statusText,
       loadedAt: record.loadedAt,
     };
@@ -784,6 +969,15 @@ export class ModManager {
 
   private emit(event: ModsStreamEvent): void {
     for (const listener of this.listeners) listener(event);
+  }
+
+  private scheduleInvalidate(modId: string): void {
+    if (this.pendingInvalidations.has(modId)) return;
+    this.pendingInvalidations.add(modId);
+    queueMicrotask(() => {
+      this.pendingInvalidations.delete(modId);
+      this.emit({ type: "invalidate", modId, viewId: null });
+    });
   }
 
   private scheduleSnapshot(): void {

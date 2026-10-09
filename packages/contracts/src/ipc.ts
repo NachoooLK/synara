@@ -58,9 +58,13 @@ import type {
   TodoUpdateInput,
 } from "./todo";
 import type {
+  ModsDispatchUiInput,
+  ModsDispatchUiResult,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
+  ModsRenderViewInput,
+  ModsRenderViewResult,
   ModsRunCommandInput,
   ModsRunCommandResult,
   ModsSetEnabledInput,
@@ -1497,6 +1501,8 @@ export interface NativeApi {
     reload: (input: ModsReloadInput) => Promise<ModsSnapshot>;
     readLogs: (input: ModsReadLogsInput) => Promise<ModsReadLogsResult>;
     runCommand: (input: ModsRunCommandInput) => Promise<ModsRunCommandResult>;
+    renderView: (input: ModsRenderViewInput) => Promise<ModsRenderViewResult>;
+    dispatchUi: (input: ModsDispatchUiInput) => Promise<ModsDispatchUiResult>;
     /** Opens the mods stream while at least one callback listens. */
     onEvent: (callback: (event: ModsStreamEvent) => void) => () => void;
   };

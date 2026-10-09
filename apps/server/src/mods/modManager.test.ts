@@ -355,4 +355,110 @@ describe("ModManager", () => {
     await manager.whenIdle();
     await expect(manager.runCommand("live", "version", null)).resolves.toEqual({ text: "two" });
   });
+
+  it("draws a view, runs its handlers and asks for redraws", async () => {
+    await writeMod("panel", {
+      "hooks/register.ts": `
+        export const register = (on) => {
+          on("mod.start", async ($) => {
+            await $.ui.view({ id: "threads", site: "sidebar", title: "My threads", icon: "list", refreshOn: ["threads", "bogus"] });
+          });
+          on("ui.render", { view: "threads" }, async ($, e) => {
+            const threads = await $.threads.list();
+            const selected = (await $.state.get("selected")) ?? "none";
+            return [
+              h("Text", { tone: "muted" }, "Selected: ", selected),
+              ...threads.map((thread) =>
+                h("Row", { key: thread.id, onPress: async () => {
+                  await $.state.set("selected", thread.id);
+                  await $.ui.openThread(thread.id);
+                } }, thread.title),
+              ),
+              e.context.threadId,
+            ];
+          });
+        };
+      `,
+    });
+    const manager = makeManager();
+    const summary = await startEnabled(manager, "panel");
+    expect(summary.views).toEqual([
+      { id: "threads", site: "sidebar", title: "My threads", icon: "list", refreshOn: ["threads"] },
+    ]);
+    const events: unknown[] = [];
+    manager.subscribe((event) => events.push(event));
+
+    const { tree } = await manager.renderView("panel", "threads", {
+      threadId: "thread-open" as never,
+      projectId: null,
+    });
+    expect(tree).toMatchObject({
+      type: "Fragment",
+      children: [
+        { type: "Text", props: { tone: "muted" }, children: ["Selected: ", "none"] },
+        { type: "Row", props: { key: "thread-new", onPress: { $handler: expect.any(String) } } },
+        { type: "Row", props: { key: "thread-old" }, children: ["Older chat"] },
+        "thread-open",
+      ],
+    });
+    const handlerId = (tree as { children: Array<{ props?: { onPress?: { $handler: string } } }> })
+      .children[1]?.props?.onPress?.$handler as string;
+
+    await expect(manager.dispatchUi("panel", handlerId, null)).resolves.toEqual({
+      effects: [{ type: "openThread", threadId: "thread-new" }],
+    });
+    await waitFor(() =>
+      events.some(
+        (event) =>
+          (event as { type: string }).type === "invalidate" &&
+          (event as { modId: string }).modId === "panel",
+      ),
+    );
+    const redrawn = await manager.renderView("panel", "threads", {
+      threadId: null,
+      projectId: null,
+    });
+    expect(JSON.stringify(redrawn.tree)).toContain("thread-new");
+
+    events.length = 0;
+    manager.notifyDataChanged("threads");
+    manager.notifyDataChanged("projects");
+    expect(events).toEqual([{ type: "invalidate", modId: "panel", viewId: "threads" }]);
+
+    await manager.reload("panel");
+    await expect(manager.dispatchUi("panel", handlerId, null)).rejects.toThrow(/out of date/u);
+  });
+
+  it("refuses effects outside handlers and trees it cannot draw", async () => {
+    await writeMod("strict", {
+      "hooks/register.ts": `
+        export const register = (on) => {
+          on("mod.start", async ($) => {
+            await $.ui.view({ id: "bad", site: "dock", title: "Bad" });
+            await $.command.register({ name: "open", title: "Open" });
+          });
+          on("ui.render", { view: "bad" }, () => ({ props: {} }));
+          on("command.run", async ($) => {
+            try {
+              await $.ui.openThread("thread-new");
+              return { text: "opened" };
+            } catch (error) {
+              return { text: error.message };
+            }
+          });
+        };
+      `,
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "strict");
+    await expect(
+      manager.renderView("strict", "bad", { threadId: null, projectId: null }),
+    ).rejects.toThrow(/no type/u);
+    await expect(
+      manager.renderView("strict", "missing", { threadId: null, projectId: null }),
+    ).rejects.toThrow(/no view named "missing"/u);
+    await expect(manager.runCommand("strict", "open", null)).resolves.toEqual({
+      text: "$.ui.openThread() works only inside a handler of a view, such as an onPress.",
+    });
+  });
 });

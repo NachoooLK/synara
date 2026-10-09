@@ -36,6 +36,35 @@ export interface ModProject {
 
 export type ModToastTone = "info" | "success" | "warning" | "error";
 
+/** Where a view is drawn: the sidebar panel, a dock tab, a band above the composer, the thread header. */
+export type ModViewSite = "sidebar" | "dock" | "band" | "header";
+
+export interface ModViewDefinition {
+  /** Lowercase words joined by dashes; unique within the mod. */
+  readonly id: string;
+  readonly site: ModViewSite;
+  readonly title: string;
+  /** A Central icon name, such as "calendar-1" or "git-pull-request". */
+  readonly icon?: string;
+  /** Redraw the view on its own when Synara's threads or projects change. */
+  readonly refreshOn?: ReadonlyArray<"threads" | "projects">;
+}
+
+/** What the window drawing a view knows. */
+export interface ModViewContext {
+  readonly threadId: string | null;
+  readonly projectId: string | null;
+}
+
+/** A node of a tree: an element JSX built, text, or nothing. */
+export type ModNode = ModElement | string | number | boolean | null | undefined | ModNode[];
+
+export interface ModElement {
+  readonly type: string;
+  readonly props: Readonly<Record<string, unknown>>;
+  readonly children: ReadonlyArray<ModNode>;
+}
+
 export interface ModCommandDefinition {
   /** Lowercase words joined by dashes; unique within the mod. */
   readonly name: string;
@@ -50,6 +79,15 @@ export interface ModEvents {
   readonly "mod.start": { readonly input: Record<string, never>; readonly result: void };
   /** The mod is about to stop (disabled, reloaded or the server is shutting down). */
   readonly "mod.stop": { readonly input: Record<string, never>; readonly result: void };
+  /** A window needs one of this mod's views drawn; return a tree, or null for nothing. */
+  readonly "ui.render": {
+    readonly input: {
+      readonly view: string;
+      readonly site: ModViewSite;
+      readonly context: ModViewContext;
+    };
+    readonly result: ModNode;
+  };
   /** Someone ran one of this mod's commands from the command palette. */
   readonly "command.run": {
     readonly input: { readonly command: string; readonly threadId: string | null };
@@ -103,6 +141,17 @@ export interface ModApi {
     readonly toast: (text: string, options?: { readonly tone?: ModToastTone }) => Promise<void>;
     /** The mod's status line entry; `undefined` clears it. */
     readonly status: (text: string | undefined) => Promise<void>;
+    /** Adds a view (or updates it); answer it with an `on("ui.render", { view: id }, …)` hook. */
+    readonly view: (view: ModViewDefinition) => Promise<void>;
+    readonly removeView: (viewId: string) => Promise<void>;
+    /** Draws a view again (all of the mod's views without an id). `$.state.set` does this for you. */
+    readonly invalidate: (viewId?: string) => Promise<void>;
+    /** Inside a handler (an onPress): opens a thread in the window that pressed. */
+    readonly openThread: (threadId: string) => Promise<void>;
+    /** Inside a handler: opens an http(s) address in the browser. */
+    readonly openUrl: (url: string) => Promise<void>;
+    /** Inside a handler: opens one of this mod's dock views next to the thread. */
+    readonly openDockView: (viewId: string) => Promise<void>;
   };
   readonly command: {
     /** Adds a command to the palette; answer it with an `on("command.run", { command }, …)` hook. */

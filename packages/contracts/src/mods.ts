@@ -15,6 +15,8 @@ export const MODS_WS_METHODS = {
   reload: "mods.reload",
   readLogs: "mods.readLogs",
   runCommand: "mods.runCommand",
+  renderView: "mods.renderView",
+  dispatchUi: "mods.dispatchUi",
   subscribeEvents: "mods.subscribeEvents",
 } as const;
 
@@ -82,6 +84,91 @@ export const ModCommand = Schema.Struct({
 });
 export type ModCommand = typeof ModCommand.Type;
 
+// ── Views ────────────────────────────────────────────────────────────
+// A mod draws into a site by registering a view and answering `ui.render` for
+// it with an element tree: plain data that the web app draws with Synara's own
+// components. Handlers stay in the mod; the tree carries `{ $handler }` ids.
+
+/** Where a view is drawn. */
+export const ModViewSite = Schema.Literals(["sidebar", "dock", "band", "header"]);
+export type ModViewSite = typeof ModViewSite.Type;
+
+/** What makes Synara redraw a view without the mod asking. */
+export const ModViewRefreshSource = Schema.Literals(["threads", "projects"]);
+export type ModViewRefreshSource = typeof ModViewRefreshSource.Type;
+
+export const ModViewId = ModCommandName;
+export type ModViewId = typeof ModViewId.Type;
+
+export const ModView = Schema.Struct({
+  id: ModViewId,
+  site: ModViewSite,
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  /** A Central icon name; null draws the mod's default glyph. */
+  icon: Schema.NullOr(Schema.String.check(Schema.isMaxLength(128))),
+  refreshOn: Schema.Array(ModViewRefreshSource),
+});
+export type ModView = typeof ModView.Type;
+
+/** What the window drawing a view knows: the open thread and its project. */
+export const ModViewContext = Schema.Struct({
+  threadId: Schema.NullOr(ThreadId),
+  projectId: Schema.NullOr(Schema.String.check(Schema.isMaxLength(128))),
+});
+export type ModViewContext = typeof ModViewContext.Type;
+
+/** The elements a tree may use; the web app draws each with Synara's own components. */
+export const MOD_UI_ELEMENTS = [
+  "Fragment",
+  "Box",
+  "Text",
+  "Heading",
+  "Section",
+  "List",
+  "Row",
+  "Button",
+  "Icon",
+  "Badge",
+  "Markdown",
+  "Code",
+  "Link",
+  "Divider",
+  "Spinner",
+  "Empty",
+  "Input",
+  "Switch",
+] as const;
+export type ModUiElementName = (typeof MOD_UI_ELEMENTS)[number];
+
+/** Size limits of one rendered tree. */
+export const MOD_UI_TREE_LIMITS = {
+  depth: 40,
+  nodes: 5_000,
+  bytes: 512_000,
+} as const;
+
+/**
+ * A rendered tree, checked for shape by the server and drawn defensively by the
+ * web app: `{ type, props, children }` nodes, strings and numbers.
+ */
+export const ModUiTree = Schema.Json;
+export type ModUiTree = typeof ModUiTree.Type;
+
+/** What a handler may ask of the window that triggered it. */
+export const ModUiEffect = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("openThread"), threadId: ThreadId }),
+  Schema.Struct({
+    type: Schema.Literal("openUrl"),
+    url: Schema.String.check(Schema.isMaxLength(2_048)),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("openDockView"),
+    modId: Schema.String,
+    viewId: ModViewId,
+  }),
+]);
+export type ModUiEffect = typeof ModUiEffect.Type;
+
 export const ModSummary = Schema.Struct({
   id: ModId,
   version: Schema.String,
@@ -95,6 +182,7 @@ export const ModSummary = Schema.Struct({
   /** The events the loaded module hooks, in registration order, without duplicates. */
   hooks: Schema.Array(Schema.String),
   commands: Schema.Array(ModCommand),
+  views: Schema.Array(ModView),
   /** The mod's status line entry, set with `$.ui.status`. */
   statusText: Schema.NullOr(Schema.String),
   loadedAt: Schema.NullOr(IsoDateTime),
@@ -138,6 +226,12 @@ export const ModsStreamEvent = Schema.Union([
     type: Schema.Literal("toast"),
     toast: ModToast,
   }),
+  /** A mod's view should be drawn again; `viewId` null means every view of the mod. */
+  Schema.Struct({
+    type: Schema.Literal("invalidate"),
+    modId: ModId,
+    viewId: Schema.NullOr(ModViewId),
+  }),
 ]);
 export type ModsStreamEvent = typeof ModsStreamEvent.Type;
 
@@ -177,3 +271,30 @@ export const ModsRunCommandResult = Schema.Struct({
   text: Schema.NullOr(Schema.String),
 });
 export type ModsRunCommandResult = typeof ModsRunCommandResult.Type;
+
+export const ModsRenderViewInput = Schema.Struct({
+  modId: ModId,
+  viewId: ModViewId,
+  context: ModViewContext,
+});
+export type ModsRenderViewInput = typeof ModsRenderViewInput.Type;
+
+export const ModsRenderViewResult = Schema.Struct({
+  /** Null when the mod drew nothing for this view. */
+  tree: Schema.NullOr(ModUiTree),
+});
+export type ModsRenderViewResult = typeof ModsRenderViewResult.Type;
+
+export const ModsDispatchUiInput = Schema.Struct({
+  modId: ModId,
+  /** The `$handler` id the tree carried. */
+  handlerId: Schema.String.check(Schema.isMaxLength(64)),
+  /** What happened: an input's value, a select's choice; null for a press. */
+  payload: Schema.NullOr(Schema.Json),
+});
+export type ModsDispatchUiInput = typeof ModsDispatchUiInput.Type;
+
+export const ModsDispatchUiResult = Schema.Struct({
+  effects: Schema.Array(ModUiEffect),
+});
+export type ModsDispatchUiResult = typeof ModsDispatchUiResult.Type;

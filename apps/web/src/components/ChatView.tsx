@@ -298,6 +298,7 @@ import { ComposerExtrasTrigger } from "./chat/ComposerExtrasTrigger";
 import { ComposerGoalHeader } from "./chat/ComposerGoalHeader";
 import { ComposerInputBanners } from "./chat/ComposerInputBanners";
 import { ComposerTransportNotice } from "./chat/ComposerTransportNotice";
+import { ModComposerBands, ModHeaderActions } from "~/mods/ModSiteViews";
 import { ComposerLiveChangesHeader } from "./chat/ComposerLiveChangesHeader";
 import {
   ComposerLocalDirectoryMenu,
@@ -5804,6 +5805,7 @@ export default function ChatView({
                 via margin collapse. */}
           <div>
             <ComposerTransportNotice />
+            <ModComposerBands threadId={activeThread.id} projectId={activeProject?.id ?? null} />
             {isSidechatExpired ? (
               <ExpiredSidechatNotice onStartNew={startReplacementSidechat} />
             ) : null}
@@ -6394,6 +6396,11 @@ export default function ChatView({
           diffDisabledReason={diffDisabledReason}
           rightDockOpen={rightDockOpen}
           {...(onToggleRightDock ? { onToggleRightDock } : {})}
+          modActions={
+            isEditorRail ? null : (
+              <ModHeaderActions threadId={activeThread.id} projectId={activeProject?.id ?? null} />
+            )
+          }
           environment={isEditorRail ? null : environmentHeaderState}
           projectPanel={isEditorRail ? null : projectHeaderState}
           libraryPanel={isEditorRail ? null : libraryHeaderState}

@@ -16,6 +16,7 @@ import {
   GitPullRequestIcon,
   GlobeIcon,
   InfoIcon,
+  ModIcon,
   SidechatIcon,
   TerminalIcon,
 } from "~/lib/icons";
@@ -31,6 +32,10 @@ export interface RightDockPaneMeta {
 
 export interface RightDockLauncherItem extends RightDockPaneMeta {
   kind: RightDockPaneKind;
+  /** Distinguishes several items of one kind (each mod dock view); defaults to the kind. */
+  key?: string;
+  /** Opens the item itself instead of asking the host to add a pane of `kind`. */
+  onOpen?: () => void;
 }
 
 export const RIGHT_DOCK_PANE_META: Record<RightDockPaneKind, RightDockPaneMeta> = {
@@ -46,6 +51,7 @@ export const RIGHT_DOCK_PANE_META: Record<RightDockPaneKind, RightDockPaneMeta> 
   sidechat: { label: "Side chats", Icon: SidechatIcon },
   git: { label: "Git", Icon: GitCommitIcon },
   pullRequest: { label: "Pull request", Icon: GitPullRequestIcon },
+  mod: { label: "Mod", Icon: ModIcon },
 };
 
 // Neutral fallback for any pane kind we no longer recognize (e.g. stale
@@ -130,6 +136,7 @@ export function resolveRightDockPaneLabel(
 export function buildRightDockPaneLabelOverrides(
   panes: readonly RightDockPane[],
   threadSummaries: readonly { id: string; title: string }[],
+  modViewTitle?: (modId: string, viewId: string) => string | undefined,
 ): Record<string, string | undefined> | undefined {
   const sidechatTitleByThreadId = new Map(
     threadSummaries.map((thread) => [thread.id, thread.title] as const),
@@ -141,6 +148,11 @@ export function buildRightDockPaneLabelOverrides(
       overrides[pane.id] = basenameOfPath(pane.filePath);
     } else if (pane.kind === "pullRequest" && pane.pullRequestNumber !== null) {
       overrides[pane.id] = pullRequestPaneTabLabel(pane.pullRequestNumber);
+    } else if (pane.kind === "mod" && pane.modId && pane.modViewId) {
+      const title = modViewTitle?.(pane.modId, pane.modViewId);
+      if (title) {
+        overrides[pane.id] = title;
+      }
     } else if (pane.kind === "sidechat" && pane.threadId) {
       const title = sidechatTitleByThreadId.get(pane.threadId)?.trim();
       if (title) {

@@ -21,6 +21,8 @@ const RIGHT_DOCK_PANE_KINDS = [
   "sidechat",
   "git",
   "pullRequest",
+  // A view a mod draws (Beta-only); modId/modViewId name it.
+  "mod",
 ] as const;
 
 export type RightDockPaneKind = (typeof RIGHT_DOCK_PANE_KINDS)[number];
@@ -42,6 +44,9 @@ export interface RightDockPane {
   pullRequestRepository: string | null;
   pullRequestNumber: number | null;
   pullRequestInitialTab: PullRequestInitialTab | null;
+  // mod panes show one view of one mod; absent on every other kind.
+  modId?: string | null;
+  modViewId?: string | null;
 }
 
 /**
@@ -59,7 +64,11 @@ export interface RightDockThreadState {
 }
 
 // Terminals and file previews have independent tabs. Side chats share one destination.
-const MULTI_INSTANCE_PANE_KINDS: ReadonlySet<RightDockPaneKind> = new Set(["file", "terminal"]);
+const MULTI_INSTANCE_PANE_KINDS: ReadonlySet<RightDockPaneKind> = new Set([
+  "file",
+  "terminal",
+  "mod",
+]);
 
 // Kinds that can only ever have one instance per host thread, derived as
 // "every kind that is not multi-instance" so the two sets can never drift.
@@ -120,6 +129,8 @@ function sanitizePersistedPane(value: unknown): RightDockPane | null {
       candidate.pullRequestInitialTab === "code"
         ? candidate.pullRequestInitialTab
         : null,
+    modId: typeof candidate.modId === "string" ? candidate.modId : null,
+    modViewId: typeof candidate.modViewId === "string" ? candidate.modViewId : null,
   };
 }
 
@@ -178,6 +189,8 @@ export interface OpenPaneInput {
   pullRequestRepository?: string | null;
   pullRequestNumber?: number | null;
   pullRequestInitialTab?: PullRequestInitialTab | null;
+  modId?: string | null;
+  modViewId?: string | null;
 }
 
 function createPane(input: OpenPaneInput): RightDockPane {
@@ -192,6 +205,8 @@ function createPane(input: OpenPaneInput): RightDockPane {
     pullRequestRepository: input.pullRequestRepository ?? null,
     pullRequestNumber: input.pullRequestNumber ?? null,
     pullRequestInitialTab: input.pullRequestInitialTab ?? null,
+    modId: input.modId ?? null,
+    modViewId: input.modViewId ?? null,
   };
 }
 
@@ -234,6 +249,14 @@ function findMatchingMultiInstancePane(
   if (input.kind === "file") {
     const filePath = input.filePath ?? null;
     return state.panes.find((pane) => pane.kind === "file" && pane.filePath === filePath);
+  }
+  if (input.kind === "mod") {
+    return state.panes.find(
+      (pane) =>
+        pane.kind === "mod" &&
+        (pane.modId ?? null) === (input.modId ?? null) &&
+        (pane.modViewId ?? null) === (input.modViewId ?? null),
+    );
   }
   return undefined;
 }

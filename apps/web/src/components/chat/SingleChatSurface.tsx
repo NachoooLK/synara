@@ -126,6 +126,8 @@ import {
 import { isShortcutDispatchSuspended, resolveShortcutCommand } from "~/keybindings";
 import { isTerminalFocused } from "~/lib/terminalFocus";
 import { cn } from "~/lib/utils";
+import { ModViewHost } from "~/mods/ModViewHost";
+import { useModDockItems } from "~/mods/useModDockItems";
 
 const PullRequestDockPane = lazy(() => import("../pullRequest/PullRequestDockPane"));
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
@@ -797,9 +799,11 @@ export function SingleChatSurface(props: {
       });
     });
   };
+  const modDockItems = useModDockItems(props.threadId);
   const paneLabelOverrides = useMemo(
-    () => buildRightDockPaneLabelOverrides(dockState.panes, threadSummaries),
-    [dockState.panes, threadSummaries],
+    () =>
+      buildRightDockPaneLabelOverrides(dockState.panes, threadSummaries, modDockItems.viewTitle),
+    [dockState.panes, threadSummaries, modDockItems.viewTitle],
   );
 
   // The pull request pane is a singleton, so at most one tab needs the live state glyph.
@@ -983,6 +987,17 @@ export function SingleChatSurface(props: {
               onCommentInChat={handleCommentInChat}
             />
           </Suspense>
+        );
+      case "mod":
+        return pane.modId && pane.modViewId ? (
+          <ModViewHost
+            modId={pane.modId}
+            viewId={pane.modViewId}
+            context={{ threadId: props.threadId, projectId: props.projectId }}
+            className="h-full overflow-y-auto p-2"
+          />
+        ) : (
+          <RightDockPanePlaceholder kind={pane.kind} />
         );
       case "sidechat":
         return (
@@ -1203,6 +1218,7 @@ export function SingleChatSurface(props: {
           shouldAcceptWidth={shouldAcceptDockWidth}
           addMenuKinds={availableDockPaneKinds}
           launcherItems={dockLauncherItems}
+          extraLauncherItems={modDockItems.launcherItems}
           motionKey={props.threadId}
           activePaneRuntimeMode={
             floatingBrowserVisible && activePane?.kind === "browser"
