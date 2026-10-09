@@ -75,6 +75,7 @@ import {
   SettingsSectionShell,
 } from "../components/settings/SettingsPanelPrimitives";
 import { SkillsSettingsPanel } from "../components/settings/SkillsSettingsPanel";
+import { ModsSettingsPanel } from "~/components/settings/ModsSettingsPanel";
 import { ThemeModePicker } from "../components/settings/ThemeModePicker";
 import { ThemePackEditor } from "../components/ThemePackEditor";
 import {
@@ -1617,6 +1618,8 @@ function SettingsRouteView() {
         return <ProfileSettingsPanel />;
       case "skills":
         return <SkillsSettingsPanel />;
+      case "mods":
+        return <ModsSettingsPanel />;
       case "usage":
         return <ProviderUsageSettingsPanel />;
       default:

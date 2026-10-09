@@ -58,6 +58,16 @@ import type {
   TodoUpdateInput,
 } from "./todo";
 import type {
+  ModsReadLogsInput,
+  ModsReadLogsResult,
+  ModsReloadInput,
+  ModsRunCommandInput,
+  ModsRunCommandResult,
+  ModsSetEnabledInput,
+  ModsSnapshot,
+  ModsStreamEvent,
+} from "./mods";
+import type {
   ProjectAgentConfigureInput,
   ProjectAgentLinkProjectInput,
   ProjectAgentUnlinkProjectInput,
@@ -1479,6 +1489,16 @@ export interface NativeApi {
     update: (input: TodoUpdateInput) => Promise<Todo>;
     delete: (input: TodoDeleteInput) => Promise<void>;
     onEvent: (callback: (event: TodoStreamEvent) => void) => () => void;
+  };
+  // Mods are Beta-only; on Stable the server refuses every method with MODS_UNAVAILABLE.
+  mods: {
+    list: () => Promise<ModsSnapshot>;
+    setEnabled: (input: ModsSetEnabledInput) => Promise<ModsSnapshot>;
+    reload: (input: ModsReloadInput) => Promise<ModsSnapshot>;
+    readLogs: (input: ModsReadLogsInput) => Promise<ModsReadLogsResult>;
+    runCommand: (input: ModsRunCommandInput) => Promise<ModsRunCommandResult>;
+    /** Opens the mods stream while at least one callback listens. */
+    onEvent: (callback: (event: ModsStreamEvent) => void) => () => void;
   };
   browser: BrowserControlMethods & {
     annotations: BrowserAnnotationMethods;

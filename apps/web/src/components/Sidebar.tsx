@@ -385,6 +385,7 @@ import {
   SidebarMenuSubItem,
 } from "./ui/sidebar";
 import { useThreadSelectionStore } from "../threadSelectionStore";
+import { useModPaletteActions } from "~/mods/useModPaletteActions";
 import {
   excludeHiddenProjectAgentCoordinatorThreads,
   buildProjectThreadTree,
@@ -6321,6 +6322,7 @@ export default function Sidebar() {
       })),
     [chatWorkspaceRoot, homeDir, projects, spaces, studioWorkspaceRoot, voidSpace],
   );
+  const modPaletteActions = useModPaletteActions(routeThreadId);
   const searchPaletteActions = useMemo<SidebarSearchAction[]>(
     () => [
       {
@@ -8007,7 +8009,11 @@ export default function Sidebar() {
               setSearchPaletteMode("search");
             }
           }}
-          actions={[...searchPaletteActions, ...searchPaletteNavigationActions]}
+          actions={[
+            ...searchPaletteActions,
+            ...modPaletteActions,
+            ...searchPaletteNavigationActions,
+          ]}
           projects={searchPaletteProjects}
           projectById={projectById}
           onCreateChat={() =>

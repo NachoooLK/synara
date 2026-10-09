@@ -49,6 +49,8 @@ import {
   type TodoStreamEvent,
   DEVICE_WS_CHANNELS,
   DEVICE_WS_METHODS,
+  MODS_WS_CHANNELS,
+  MODS_WS_METHODS,
   type DeviceEvent,
   type ProjectAgentStreamEvent,
   COMPUTER_WS_CHANNELS,
@@ -977,6 +979,18 @@ export function createWsNativeApi(): NativeApi {
       update: (input) => transport.request(WS_METHODS.todoUpdate, input),
       delete: (input) => transport.request(WS_METHODS.todoDelete, input),
       onEvent: todoEventListeners.subscribe,
+    },
+    mods: {
+      list: () => transport.request(MODS_WS_METHODS.list, {}),
+      setEnabled: (input) => transport.request(MODS_WS_METHODS.setEnabled, input),
+      reload: (input) => transport.request(MODS_WS_METHODS.reload, input),
+      readLogs: (input) => transport.request(MODS_WS_METHODS.readLogs, input),
+      // A command waits on the mod's hooks, which may themselves wait on `next`.
+      runCommand: (input) =>
+        transport.request(MODS_WS_METHODS.runCommand, input, { timeoutMs: null }),
+      // Subscribed on demand, not at startup: Stable refuses the stream.
+      onEvent: (callback) =>
+        transport.subscribe(MODS_WS_CHANNELS.event, (message) => callback(message.data)),
     },
     device: {
       list: (input) => transport.request(DEVICE_WS_METHODS.list, input),

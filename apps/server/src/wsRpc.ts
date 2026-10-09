@@ -9,6 +9,8 @@ import {
   TASKS_UNAVAILABLE_ERROR_CODE,
   DEFAULT_TERMINAL_ID,
   DEVICE_WS_METHODS,
+  MODS_UNAVAILABLE_ERROR_CODE,
+  MODS_WS_METHODS,
   ORCHESTRATION_WS_METHODS,
   ORCHESTRATION_STREAM_OVERFLOW_CODE,
   ThreadId,
@@ -22,6 +24,7 @@ import {
   WsComputerRpcGroup,
   WsDeviceRpcGroup,
   WsFeatureRpcGroup,
+  WsModsRpcGroup,
   WsProjectAgentRpcGroup,
   WsRpcError,
   PullRequestsUnavailableError,
@@ -53,6 +56,7 @@ import { RpcMiddleware, RpcSchema, RpcSerialization, RpcServer } from "effect/un
 
 import { AutomationService } from "./automation/Services/AutomationService";
 import { TodoService } from "./todo/Services/TodoService";
+import { ModHost } from "./mods/Services/ModHost";
 import { isServerBetaFeatureEnabled } from "./betaFeatureGate";
 import { ProjectAgentService } from "./projectAgent/Services/ProjectAgentService";
 import { isGroupCoordinatorHostProject } from "./projectAgent/groupCoordinatorHost";
@@ -264,12 +268,13 @@ class WsRequestAdmissionMiddleware extends RpcMiddleware.Service<WsRequestAdmiss
   { error: WsRpcError, requiredForClient: false },
 ) {}
 
-// Optional device, computer, and project-agent link groups are served on the
+// Optional device, computer, project-agent and mods groups are served on the
 // same socket: one connection, one admission middleware, one exhaustive
 // handler map.
 const AdmittedWsFeatureRpcGroup = WsFeatureRpcGroup.merge(WsDeviceRpcGroup)
   .merge(WsComputerRpcGroup)
   .merge(WsProjectAgentRpcGroup)
+  .merge(WsModsRpcGroup)
   .middleware(WsRequestAdmissionMiddleware);
 
 const wsRequestAdmissionMiddlewareLayer = Layer.effect(
@@ -496,6 +501,7 @@ const makeWsRpcHandlersLayer = () =>
       const checkpointDiffQuery = yield* CheckpointDiffQuery;
       const automationService = yield* AutomationService;
       const todoService = yield* TodoService;
+      const modHost = yield* ModHost;
       const projectAgentService = yield* ProjectAgentService;
       const projectAgentRepository = yield* ProjectAgentRepository;
       const config = yield* ServerConfig;
@@ -1186,6 +1192,14 @@ const makeWsRpcHandlersLayer = () =>
         });
       const whenTasksEnabled = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         tasksEnabled ? effect : Effect.fail(tasksUnavailableError());
+
+      // Mods are Beta-only; the ModHost refuses on Stable and the code tells clients why.
+      const toModsRpcError = (cause: { readonly message: string }) =>
+        new WsRpcError({
+          message: cause.message,
+          retryable: false,
+          ...(modHost.available ? {} : { code: MODS_UNAVAILABLE_ERROR_CODE }),
+        });
 
       const toProjectProvisionRpcError = (cause: unknown) =>
         cause instanceof GitHubProjectProvisioningError
@@ -3064,6 +3078,22 @@ const makeWsRpcHandlersLayer = () =>
                 ),
               )
             : Stream.fail(tasksUnavailableError()),
+
+        [MODS_WS_METHODS.list]: () => modHost.list().pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.setEnabled]: (input) =>
+          modHost.setEnabled(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.reload]: (input) =>
+          modHost.reload(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.readLogs]: (input) =>
+          modHost.readLogs(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.runCommand]: (input) =>
+          modHost.runCommand(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.subscribeEvents]: (_, { clientId }) =>
+          streamAdmission.guard(
+            clientId,
+            { key: "mods.events" },
+            modHost.streamEvents.pipe(Stream.mapError(toModsRpcError)),
+          ),
 
         ...makeWsDeviceHandlers(deviceService),
         [DEVICE_WS_METHODS.subscribeEvents]: (_, { clientId }) =>

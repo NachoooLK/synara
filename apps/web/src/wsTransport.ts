@@ -30,6 +30,8 @@ import {
   type OrchestrationSettleTurnDispatchResult,
   DEVICE_WS_CHANNELS,
   DEVICE_WS_METHODS,
+  MODS_WS_CHANNELS,
+  MODS_WS_METHODS,
   COMPUTER_WS_CHANNELS,
   COMPUTER_WS_METHODS,
   WsBootstrapNegotiateResult,
@@ -39,8 +41,10 @@ import {
   WS_METHODS,
   WsCompatibilityError,
   WsFeatureRpcGroup,
+  WsModsRpcGroup,
   WsProjectAgentRpcGroup,
   type AutomationStreamEvent,
+  type ModsStreamEvent,
   type TodoStreamEvent,
   type GitActionProgressEvent,
   type GitCreateDetachedWorktreeResult,
@@ -66,6 +70,7 @@ import {
   type WsPush,
   type WsPushChannel,
   type WsPushMessage,
+  MODS_UNAVAILABLE_ERROR_CODE,
   TASKS_UNAVAILABLE_ERROR_CODE,
   ThreadId,
 } from "@synara/contracts";
@@ -237,7 +242,10 @@ function awaitWithAbort<A>(promise: Promise<A>, signal: AbortSignal | undefined)
 // real RPC error (or an `unsupported-platform` availability) to render its
 // blocked state. Merging here keeps one socket and one client.
 const makeRpcClient = RpcClient.make(
-  WsFeatureRpcGroup.merge(WsDeviceRpcGroup).merge(WsComputerRpcGroup).merge(WsProjectAgentRpcGroup),
+  WsFeatureRpcGroup.merge(WsDeviceRpcGroup)
+    .merge(WsComputerRpcGroup)
+    .merge(WsProjectAgentRpcGroup)
+    .merge(WsModsRpcGroup),
 );
 const makeBootstrapRpcClient = RpcClient.make(WsBootstrapRpcGroup);
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -517,6 +525,8 @@ const STREAM_ADMISSION_ERROR_CODES = new Set([
   // A server that does not offer Tasks refuses its stream for good;
   // reconnecting the socket would only be refused again.
   TASKS_UNAVAILABLE_ERROR_CODE,
+  // Stable refuses the Beta-only mods stream the same way.
+  MODS_UNAVAILABLE_ERROR_CODE,
 ]);
 
 const RESNAPSHOT_REQUIRED_ERROR_CODE = "ORCHESTRATION_RESNAPSHOT_REQUIRED";
@@ -1892,6 +1902,14 @@ export class WsTransport {
             (event: DeviceEvent) => this.emit(DEVICE_WS_CHANNELS.event, event),
             restartChannel,
           );
+        } else if (channel === MODS_WS_CHANNELS.event) {
+          this.startStream(
+            client,
+            "mods.events",
+            client[MODS_WS_METHODS.subscribeEvents]({}),
+            (event: ModsStreamEvent) => this.emit(MODS_WS_CHANNELS.event, event),
+            restartChannel,
+          );
         } else if (channel === COMPUTER_WS_CHANNELS.event) {
           this.startStream(
             client,
@@ -1936,6 +1954,7 @@ export class WsTransport {
     else if (channel === WS_CHANNELS.automationEvent) this.stopStream("automation.events");
     else if (channel === WS_CHANNELS.todoEvent) this.stopStream("todo.events");
     else if (channel === DEVICE_WS_CHANNELS.event) this.stopStream("device.events");
+    else if (channel === MODS_WS_CHANNELS.event) this.stopStream("mods.events");
     else if (channel === COMPUTER_WS_CHANNELS.event) this.stopStream("computer.events");
     else if (channel === ORCHESTRATION_WS_CHANNELS.domainEvent)
       this.stopStream("orchestration.domain");

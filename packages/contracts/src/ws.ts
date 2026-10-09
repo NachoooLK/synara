@@ -139,6 +139,15 @@ import {
 import { StudioListThreadOutputsInput } from "./studio";
 import { FilesystemBrowseInput } from "./filesystem";
 import {
+  MODS_WS_CHANNELS,
+  MODS_WS_METHODS,
+  ModsReadLogsInput,
+  ModsReloadInput,
+  ModsRunCommandInput,
+  ModsSetEnabledInput,
+  ModsStreamEvent,
+} from "./mods";
+import {
   DEVICE_WS_CHANNELS,
   DEVICE_WS_METHODS,
   DeviceAttachInput,
@@ -529,6 +538,14 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(DEVICE_WS_METHODS.scrollToElement, DeviceScrollToElementInput),
   tagRequestBody(DEVICE_WS_METHODS.subscribeEvents, Schema.Struct({})),
 
+  // Mods (Beta-only; the server refuses these on Stable)
+  tagRequestBody(MODS_WS_METHODS.list, Schema.Struct({})),
+  tagRequestBody(MODS_WS_METHODS.setEnabled, ModsSetEnabledInput),
+  tagRequestBody(MODS_WS_METHODS.reload, ModsReloadInput),
+  tagRequestBody(MODS_WS_METHODS.readLogs, ModsReadLogsInput),
+  tagRequestBody(MODS_WS_METHODS.runCommand, ModsRunCommandInput),
+  tagRequestBody(MODS_WS_METHODS.subscribeEvents, Schema.Struct({})),
+
   // Shell methods
   tagRequestBody(WS_METHODS.shellOpenInEditor, OpenInEditorInput),
 
@@ -732,6 +749,7 @@ export interface WsPushPayloadByChannel {
   readonly [WS_CHANNELS.terminalEvent]: typeof TerminalEvent.Type;
   readonly [WS_CHANNELS.projectDevServerEvent]: typeof ProjectDevServerEvent.Type;
   readonly [DEVICE_WS_CHANNELS.event]: typeof DeviceEvent.Type;
+  readonly [MODS_WS_CHANNELS.event]: typeof ModsStreamEvent.Type;
   readonly [COMPUTER_WS_CHANNELS.event]: typeof ComputerEvent.Type;
   readonly [ORCHESTRATION_WS_CHANNELS.domainEvent]: OrchestrationEvent;
   readonly [ORCHESTRATION_WS_CHANNELS.shellEvent]: OrchestrationShellStreamItem;
@@ -800,6 +818,7 @@ export const WsPushProjectDevServerEvent = makeWsPushSchema(
   ProjectDevServerEvent,
 );
 export const WsPushDeviceEvent = makeWsPushSchema(DEVICE_WS_CHANNELS.event, DeviceEvent);
+export const WsPushModsEvent = makeWsPushSchema(MODS_WS_CHANNELS.event, ModsStreamEvent);
 export const WsPushComputerEvent = makeWsPushSchema(COMPUTER_WS_CHANNELS.event, ComputerEvent);
 export const WsPushOrchestrationDomainEvent = makeWsPushSchema(
   ORCHESTRATION_WS_CHANNELS.domainEvent,
@@ -830,6 +849,7 @@ export const WsPushChannelSchema = Schema.Literals([
   WS_CHANNELS.terminalEvent,
   WS_CHANNELS.projectDevServerEvent,
   DEVICE_WS_CHANNELS.event,
+  MODS_WS_CHANNELS.event,
   COMPUTER_WS_CHANNELS.event,
   ORCHESTRATION_WS_CHANNELS.domainEvent,
   ORCHESTRATION_WS_CHANNELS.shellEvent,
@@ -853,6 +873,7 @@ export const WsPush = Schema.Union([
   WsPushTerminalEvent,
   WsPushProjectDevServerEvent,
   WsPushDeviceEvent,
+  WsPushModsEvent,
   WsPushComputerEvent,
   WsPushOrchestrationDomainEvent,
   WsPushOrchestrationShellEvent,

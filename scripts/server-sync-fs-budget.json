@@ -151,6 +151,14 @@
       "readFileSync": 2
     }
   },
+  "apps/server/src/mods/modWorker.ts": {
+    "reason": "Runs inside a mod's worker thread, never on the server's event loop; a mod's modules load synchronously like require().",
+    "references": {
+      "realpathSync": 2,
+      "statSync": 1,
+      "readFileSync": 1
+    }
+  },
   "apps/server/src/open.ts": {
     "reason": "Existing unprofiled boundary; frozen reference budget, no new sync operations.",
     "references": {

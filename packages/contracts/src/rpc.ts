@@ -93,6 +93,17 @@ import {
   ExternalMcpRevokeIntegrationInput,
 } from "./externalMcp";
 import {
+  MODS_WS_METHODS,
+  ModsReadLogsInput,
+  ModsReadLogsResult,
+  ModsReloadInput,
+  ModsRunCommandInput,
+  ModsRunCommandResult,
+  ModsSetEnabledInput,
+  ModsSnapshot,
+  ModsStreamEvent,
+} from "./mods";
+import {
   DEVICE_WS_METHODS,
   DeviceAttachInput,
   DeviceBootInput,
@@ -844,6 +855,57 @@ export const WsDeviceRpcGroup = RpcGroup.make(
   WsDeviceDescribeUiRpc,
   WsDeviceScrollToElementRpc,
   WsSubscribeDeviceEventsRpc,
+);
+
+// ── Mods ─────────────────────────────────────────────────────────────
+// Grouped separately from WsFeatureRpcGroup so its inferred type stays under
+// the declaration emit limit. Mods are Beta-only; the server refuses these
+// methods on Stable.
+
+export const WsModsListRpc = Rpc.make(MODS_WS_METHODS.list, {
+  payload: Schema.Struct({}),
+  success: ModsSnapshot,
+  error: WsRpcError,
+});
+
+export const WsModsSetEnabledRpc = Rpc.make(MODS_WS_METHODS.setEnabled, {
+  payload: ModsSetEnabledInput,
+  success: ModsSnapshot,
+  error: WsRpcError,
+});
+
+export const WsModsReloadRpc = Rpc.make(MODS_WS_METHODS.reload, {
+  payload: ModsReloadInput,
+  success: ModsSnapshot,
+  error: WsRpcError,
+});
+
+export const WsModsReadLogsRpc = Rpc.make(MODS_WS_METHODS.readLogs, {
+  payload: ModsReadLogsInput,
+  success: ModsReadLogsResult,
+  error: WsRpcError,
+});
+
+export const WsModsRunCommandRpc = Rpc.make(MODS_WS_METHODS.runCommand, {
+  payload: ModsRunCommandInput,
+  success: ModsRunCommandResult,
+  error: WsRpcError,
+});
+
+export const WsSubscribeModsEventsRpc = Rpc.make(MODS_WS_METHODS.subscribeEvents, {
+  payload: Schema.Struct({}),
+  success: ModsStreamEvent,
+  error: WsRpcError,
+  stream: true,
+});
+
+export const WsModsRpcGroup = RpcGroup.make(
+  WsModsListRpc,
+  WsModsSetEnabledRpc,
+  WsModsReloadRpc,
+  WsModsReadLogsRpc,
+  WsModsRunCommandRpc,
+  WsSubscribeModsEventsRpc,
 );
 
 // ── Computer control ────────────────────────────────────────────────

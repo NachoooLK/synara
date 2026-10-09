@@ -67,6 +67,7 @@ import {
 } from "~/components/ui/sidebar";
 import type { SidebarResizableOptions } from "~/components/ui/sidebar";
 import { cn, getNavigatorPlatform } from "~/lib/utils";
+import { useModsBridge } from "~/mods/useModsBridge";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
@@ -559,6 +560,7 @@ function ChatRouteGlobalShortcuts() {
 }
 
 function ChatRouteLayout() {
+  useModsBridge();
   const isEditorView = useLocation({
     select: (location) => (location.search as { view?: unknown }).view === "editor",
   });

@@ -60,6 +60,7 @@ import { ServerEnvironmentLive } from "./environment/Layers/ServerEnvironment";
 import { AutomationRepositoryLive } from "./persistence/Layers/AutomationRepository";
 import { TodoRepositoryLive } from "./persistence/Layers/TodoRepository";
 import { TodoServiceLive } from "./todo/Layers/TodoService";
+import { ModHostLive } from "./mods/Layers/ModHost";
 import { ProjectAgentRepositoryLive } from "./persistence/Layers/ProjectAgentRepository";
 import { ProjectAgentReactorLive } from "./projectAgent/Layers/ProjectAgentReactor";
 import { ProjectAgentServiceLive } from "./projectAgent/Layers/ProjectAgentService";
@@ -212,6 +213,7 @@ export function makeServerRuntimeServicesLayer(
     serverAuthLayer,
   );
   const todoServiceLayer = TodoServiceLive.pipe(Layer.provideMerge(TodoRepositoryLive));
+  const modHostLayer = ModHostLive.pipe(Layer.provideMerge(runtimeServicesLayer));
   const automationSchedulerLayer = AutomationSchedulerLive.pipe(
     Layer.provideMerge(automationServiceLayer),
     Layer.provideMerge(AutomationRepositoryLive),
@@ -295,6 +297,7 @@ export function makeServerRuntimeServicesLayer(
     automationSchedulerLayer,
     automationRunReactorLayer,
     todoServiceLayer,
+    modHostLayer,
     ProjectAgentRepositoryLive,
     projectAgentServiceLayer,
     projectAgentReactorLayer,

@@ -8,6 +8,7 @@ import {
   GROUPS_BETA_FEATURE,
   INBOX_BETA_FEATURE,
   isBetaFeatureEnabled,
+  MODS_BETA_FEATURE,
   PULL_REQUEST_AUTO_FIX_BETA_FEATURE,
 } from "@synara/shared/betaFeatures";
 import { PROVIDER_DESCRIPTORS } from "@synara/shared/providerMetadata";
@@ -36,6 +37,12 @@ export const GROUPS_ON = isBetaFeatureOn(GROUPS_BETA_FEATURE);
  * Inbox is available in Stable and Beta. Tasks within it retain their separate gate.
  */
 export const INBOX_ON = isBetaFeatureOn(INBOX_BETA_FEATURE);
+
+/**
+ * Mods are Beta-only. Off, the Mods settings section and mod commands are gone;
+ * the server refuses the mods APIs regardless.
+ */
+export const MODS_ON = isBetaFeatureOn(MODS_BETA_FEATURE);
 
 /**
  * Auto-fix CI is available in Stable and Beta; watching a PR remains opt-in.

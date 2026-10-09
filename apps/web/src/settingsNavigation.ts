@@ -3,6 +3,9 @@
 // Layer: Route/UI support
 // Exports: section ids, nav items, and search normalization helper
 
+import { MODS_BETA_FEATURE } from "@synara/shared/betaFeatures";
+
+import { isBetaFeatureOn } from "~/betaFeatures";
 import { KEYBINDINGS_ICON_NAME } from "~/lib/icons";
 
 export const SETTINGS_SECTION_IDS = [
@@ -21,6 +24,7 @@ export const SETTINGS_SECTION_IDS = [
   "skills",
   "usage",
   "integrations",
+  "mods",
   "advanced",
 ] as const;
 
@@ -52,6 +56,8 @@ export type SettingsNavItem = {
    * places can never disagree about what is still in beta.
    */
   badge?: string;
+  /** A Beta-only feature key; the section is hidden where that feature is off. */
+  betaFeature?: string;
 };
 
 export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
@@ -65,7 +71,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
   { id: "archived", label: "Archived" },
 ] as const;
 
-export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
+const ALL_SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
   {
     id: "general",
     group: "personal",
@@ -148,6 +154,16 @@ export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
     eyebrow: "External agents",
   },
   {
+    id: "mods",
+    group: "integrations",
+    label: "Mods",
+    description: "Load mods that add commands and change how Synara works.",
+    icon: "magic-wand",
+    eyebrow: "Extensions",
+    badge: "Beta",
+    betaFeature: MODS_BETA_FEATURE,
+  },
+  {
     id: "providers",
     group: "coding",
     label: "Agent providers",
@@ -198,6 +214,11 @@ export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = [
   },
 ] as const;
 
+/** The sections this build shows; Beta-only sections drop out on Stable. */
+export const SETTINGS_NAV_ITEMS: readonly SettingsNavItem[] = ALL_SETTINGS_NAV_ITEMS.filter(
+  (item) => item.betaFeature === undefined || isBetaFeatureOn(item.betaFeature),
+);
+
 /**
  * Stable DOM id for a settings row, derived from its (string) title. Shared by the row that
  * renders the anchor and by the search index that deep-links to it via `?target=…`, so the
@@ -216,5 +237,5 @@ export function normalizeSettingsSection(value: unknown): SettingsSectionId {
   if (typeof value !== "string") {
     return "general";
   }
-  return SETTINGS_SECTION_IDS.find((candidate) => candidate === value) ?? "general";
+  return SETTINGS_NAV_ITEMS.find((item) => item.id === value)?.id ?? "general";
 }

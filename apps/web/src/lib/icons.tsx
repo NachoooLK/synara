@@ -219,6 +219,8 @@ export const McpIcon: LucideIcon = (props) => (
   <VscMcp className={props.className} style={props.style} />
 );
 export const PluginIcon: LucideIcon = centralIconWrapper("puzzle");
+// Commands and settings that come from a mod.
+export const ModIcon: LucideIcon = centralIconWrapper("magic-wand");
 // Single hammer/build glyph (tool-call rows, codex provider, "build" scripts).
 // Sourced from the Central set so it matches the other work-row icons (pencil,
 // terminal, skill cube) it sits beside, instead of the Tabler wrench it used to be.
