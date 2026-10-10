@@ -15,6 +15,14 @@ describe("WsRequestAdmission", () => {
     expect(classifyWsRequest(WS_METHODS.serverPrewarmVoice)).toBe("expensive-read");
     expect(classifyWsRequest(MODS_WS_METHODS.renderView)).toBe("mods");
     expect(classifyWsRequest(MODS_WS_METHODS.mcpSignIn)).toBe("mods");
+    for (const method of [
+      MODS_WS_METHODS.pullRequestsList,
+      MODS_WS_METHODS.pullRequestsDetail,
+      MODS_WS_METHODS.pullRequestsDiff,
+      MODS_WS_METHODS.pullRequestsComment,
+      MODS_WS_METHODS.pullRequestsAction,
+    ])
+      expect(classifyWsRequest(method)).toBe("mods");
     expect(classifyWsRequest(MODS_WS_METHODS.list)).toBe("standard");
     expect(classifyWsRequest(WS_METHODS.projectsResolveWorkspaceFileReferences)).toBe(
       "expensive-read",
@@ -102,4 +110,21 @@ describe("WsRequestAdmission", () => {
       }),
     );
   });
+});
+
+it("isolates slow pull request hooks from standard RPC capacity", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const admission = yield* makeWsRequestAdmission;
+      const leases = [];
+      for (let i = 0; i < 4; i++)
+        leases.push(yield* admission.acquire(1, MODS_WS_METHODS.pullRequestsList));
+      expect(
+        (yield* admission.acquire(1, MODS_WS_METHODS.pullRequestsList).pipe(Effect.exit))._tag,
+      ).toBe("Failure");
+      for (let i = 0; i < 12; i++) leases.push(yield* admission.acquire(1, MODS_WS_METHODS.list));
+      for (const lease of leases) yield* admission.release(lease);
+      expect((yield* admission.snapshot).active).toBe(0);
+    }),
+  );
 });

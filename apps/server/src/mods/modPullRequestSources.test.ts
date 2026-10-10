@@ -206,3 +206,60 @@ describe("ModPullRequestSources", () => {
     expect(wasRejected).toBe(true);
   });
 });
+
+it("starts a fresh read generation after authentication changes", async () => {
+  const host = await setup();
+  let release = () => {};
+  let calls = 0;
+  host.register("one", 1, { id: "reviews", title: "Reviews" }, async () => {
+    calls++;
+    if (calls === 1) {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return item;
+    }
+    return { ...item, title: "New account" };
+  });
+  const old = host.detail(input);
+  const oldResult = old.catch((error: unknown) => error);
+  const revision = host.summaries("one")[0]!.revision;
+  host.authenticationChanged("one");
+  const next = host.detail(input);
+  release();
+  expect(await oldResult).toBeInstanceOf(Error);
+  expect((await next).title).toBe("New account");
+  expect(calls).toBe(2);
+  expect(host.summaries("one")[0]!.revision).not.toBe(revision);
+});
+it.each(["cancel", "deadline"])("does not dispatch a queued write after %s", async (mode) => {
+  const host = await setup();
+  let release = () => {};
+  const bodies: string[] = [];
+  host.register(
+    "one",
+    1,
+    { id: "reviews", title: "Reviews", capabilities: { comment: true } },
+    async (_event, value) => {
+      bodies.push((value as { body: string }).body);
+      if (bodies.length === 1)
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      return { ok: true };
+    },
+  );
+  const first = host.comment({ ...input, body: "First" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const controller = new AbortController();
+  const signal = mode === "cancel" ? controller.signal : AbortSignal.timeout(15);
+  const queued = host
+    .comment({ ...input, body: "Cancelled" }, signal)
+    .catch((error: unknown) => error);
+  if (mode === "cancel") controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release();
+  await first;
+  expect(await queued).toBeInstanceOf(Error);
+  expect(bodies).toEqual(["First"]);
+});

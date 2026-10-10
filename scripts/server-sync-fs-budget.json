@@ -156,7 +156,8 @@
     "references": {
       "realpathSync": 2,
       "statSync": 1,
-      "readFileSync": 1
+      "readFileSync": 1,
+      "lstatSync": 1
     }
   },
   "apps/server/src/open.ts": {

@@ -726,3 +726,95 @@ describe("ModManager sign-ins", () => {
     });
   });
 });
+
+it("reuses the resource_metadata challenge when starting sign-in", async () => {
+  const server = await fakeServer();
+  const custom = `${server.origin}/advertised-metadata`;
+  const harness = makeSignIns(undefined, async (url, init) => {
+    if (String(url) === custom)
+      return Response.json({
+        resource: server.url,
+        authorization_servers: [`${server.origin}/tenant`],
+      });
+    if (String(url) === `${server.origin}/.well-known/oauth-authorization-server/tenant`) {
+      const doc = (await (
+        await fetch(`${server.origin}/.well-known/oauth-authorization-server`, init)
+      ).json()) as Record<string, unknown>;
+      return Response.json({ ...doc, issuer: `${server.origin}/tenant` });
+    }
+    if (String(url) === `${server.origin}/.well-known/oauth-authorization-server`)
+      return new Response("{}", { status: 404 });
+    if (String(url).includes("/.well-known/oauth-protected-resource"))
+      return new Response("{}", { status: 404 });
+    return fetch(url, init);
+  });
+  const config = { url: server.url, oauth: { clientId: "known-client" } };
+  await expect(
+    harness.signIns
+      .access("prs", "tracker", config)!
+      .refused({ status: 401, token: null, challenge: `Bearer resource_metadata="${custom}"` }),
+  ).rejects.toBeInstanceOf(ModMcpSignInNeededError);
+  await signIn(harness, config);
+});
+it.each(["sign-out", "forget", "stop", "replace"])(
+  "rejects a sign-in prepared before %s during discovery",
+  async (change) => {
+    const server = await fakeServer();
+    let release = () => {};
+    let entered = () => {};
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let first = true;
+    const harness = makeSignIns(undefined, async (url, init) => {
+      if (first && String(url).includes("oauth-protected-resource")) {
+        first = false;
+        entered();
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return fetch(url, init);
+    });
+    const config = { url: server.url, oauth: { clientId: "known-client" } };
+    const old = harness.signIns.begin("prs", "tracker", config).catch((error: unknown) => error);
+    await waiting;
+    if (change === "sign-out") await harness.signIns.signOut("prs", "tracker");
+    else if (change === "forget") await harness.signIns.forget("prs");
+    else if (change === "stop") await harness.signIns.stop();
+    else await harness.signIns.begin("prs", "tracker", config);
+    release();
+    expect(await old).toBeInstanceOf(Error);
+  },
+);
+it.each(["sign-out", "replace", "stop"])(
+  "does not keep an OAuth exchange completed after %s",
+  async (change) => {
+    const server = await fakeServer();
+    let release = () => {};
+    let entered = () => {};
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const harness = makeSignIns(undefined, async (url, init) => {
+      if (String(url) === `${server.origin}/token`) {
+        entered();
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return fetch(url, init);
+    });
+    const config = { url: server.url, oauth: { clientId: "known-client" } };
+    const page = await harness.signIns.begin("prs", "tracker", config);
+    const returned = finishInBrowser(page);
+    await waiting;
+    if (change === "sign-out") await harness.signIns.signOut("prs", "tracker");
+    else if (change === "stop") await harness.signIns.stop();
+    else await harness.signIns.begin("prs", "tracker", config);
+    release();
+    expect((await returned).status).toBe(400);
+    expect(harness.signIns.summary("prs", { tracker: config })[0]?.state).toBe("needed");
+    expect(await harness.vault.read("prs")).toBeNull();
+  },
+);

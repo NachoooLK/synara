@@ -173,6 +173,29 @@ describe("ModManager", () => {
       }),
     ).rejects.toMatchObject({ code: "mcp_sign_in_needed" });
   });
+  it("rotates source revisions after an MCP sign-out", async () => {
+    await writeMod(
+      "auth-source",
+      {
+        "hooks/register.ts": `export const register = on => {
+        on('mod.start', async $ => $.pullRequests.registerSource({ id: 'reviews', title: 'Reviews' }));
+        on('pullRequests.list', () => ({ items: [] }));
+      };`,
+      },
+      {
+        name: "auth-source",
+        version: "0.1.0",
+        mcpServers: {
+          tracker: { url: "https://example.test/mcp", oauth: { clientId: "fixture" } },
+        },
+      },
+    );
+    const manager = makeManager();
+    const before = await startEnabled(manager, "auth-source");
+    const after = summaryOf(await manager.signOutMcp("auth-source", "tracker"), "auth-source");
+    expect(after.pullRequestSources[0]!.revision).not.toBe(before.pullRequestSources[0]!.revision);
+  });
+
   it("withdraws sources on stop and trust invalidation", async () => {
     const folder = await writeMod("reviews", {
       "hooks/register.ts": `
@@ -254,6 +277,60 @@ describe("ModManager", () => {
     await second.start();
     await second.whenIdle();
     expect(summaryOf(second.snapshot(), "keeper").status).toBe("running");
+  });
+
+  it.each([".hidden/code.ts", "node_modules/dep/code.ts", "linked.ts"])(
+    "rejects untrusted %s as an entry and as an import",
+    async (excluded) => {
+      for (const entry of [false, true]) {
+        const id = entry ? "bad-entry" : "bad-import";
+        const files = {
+          "hooks/register.ts": entry
+            ? "export const register = () => {};"
+            : `import { register } from "../${excluded}"; export { register };`,
+          "trusted.ts":
+            "export const register = (on) => { on('mod.start', async ($) => $.state.set('executed', true)); };",
+          ...(excluded === "linked.ts"
+            ? {}
+            : {
+                [excluded]:
+                  "export const register = (on) => { on('mod.start', async ($) => $.state.set('executed', true)); };",
+              }),
+        };
+        const folder = await writeMod(id, files);
+        if (excluded === "linked.ts") await symlink("trusted.ts", path.join(folder, excluded));
+        if (entry)
+          await writeFile(
+            path.join(folder, "hooks/hooks.json"),
+            JSON.stringify({ modules: [`../${excluded}`] }),
+          );
+        const manager = makeManager();
+        expect((await startEnabled(manager, id)).status).toBe("error");
+      }
+    },
+  );
+
+  it("rejects a handler from a previous worker after the new worker renders", async () => {
+    await writeMod("handler-generation", {
+      "hooks/register.ts": `export const register = (on) => {
+        on('mod.start', async ($) => $.ui.view({ id: 'panel', site: 'sidebar', title: 'Panel' }));
+        on('ui.render', async ($) => h('Button', { onPress: async () => $.state.set('pressed', true) }, 'Press'));
+      };`,
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "handler-generation");
+    const before = await manager.renderView("handler-generation", "panel", {
+      threadId: null,
+      projectId: null,
+    });
+    const handler = (before.tree as { props: { onPress: { $handler: string } } }).props.onPress
+      .$handler;
+    await manager.reload("handler-generation");
+    await manager.whenIdle();
+    await manager.renderView("handler-generation", "panel", { threadId: null, projectId: null });
+    await expect(manager.dispatchUi("handler-generation", handler, null)).rejects.toThrow(
+      /out of date/u,
+    );
   });
 
   it("reports manifest and import errors instead of loading", async () => {

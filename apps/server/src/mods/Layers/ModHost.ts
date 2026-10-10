@@ -339,9 +339,11 @@ export const ModHostLive = Layer.effect(
       );
     }
 
-    const guarded = <A>(run: () => Promise<A> | A): Effect.Effect<A, ModHostError> =>
+    const guarded = <A>(
+      run: (signal: AbortSignal) => Promise<A> | A,
+    ): Effect.Effect<A, ModHostError> =>
       available
-        ? Effect.tryPromise({ try: async () => run(), catch: toModHostError })
+        ? Effect.tryPromise({ try: async (signal) => run(signal), catch: toModHostError })
         : Effect.fail(unavailable());
 
     const streamEvents: ModHostShape["streamEvents"] = available
@@ -366,8 +368,8 @@ export const ModHostLive = Layer.effect(
         list: (input) => guarded(() => manager.pullRequests.list(input)),
         detail: (input) => guarded(() => manager.pullRequests.detail(input)),
         diff: (input) => guarded(() => manager.pullRequests.diff(input)),
-        comment: (input) => guarded(() => manager.pullRequests.comment(input)),
-        action: (input) => guarded(() => manager.pullRequests.action(input)),
+        comment: (input) => guarded((signal) => manager.pullRequests.comment(input, signal)),
+        action: (input) => guarded((signal) => manager.pullRequests.action(input, signal)),
         setPinned: (input) => guarded(() => manager.pullRequests.setPinned(input)),
       },
       setEnabled: (input) =>

@@ -1,8 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import {
-  invalidateModPullRequestCache,
-  reconcileModPullRequestCache,
-} from "~/lib/modPullRequestCache";
+import { invalidateModPullRequestCache } from "~/lib/modPullRequestCache";
 // FILE: useModsBridge.ts
 // Purpose: Keeps the mods store in step with the server and shows mod toasts.
 // Layer: Web feature bridge (mounted once by the chat layout; Beta-only)
@@ -21,6 +18,7 @@ import { toastManager } from "~/components/ui/toast";
 import { readNativeApi } from "~/nativeApi";
 
 import { registerModDockViewOpener } from "./ModViewHost";
+import { applyModsSnapshot } from "./applyModsSnapshot";
 import { useModsStore } from "./modsStore";
 import { findNewlyNeededSignIns, findStoppedMods } from "./modsSnapshot.logic";
 import { openModDockView } from "./useModDockItems";
@@ -84,13 +82,12 @@ export function useModsBridge(): void {
     registerModDockViewOpener((modId, viewId, context) => {
       if (context.threadId) openModDockView(context.threadId, modId, viewId);
     });
-    const { setSnapshot, setUnavailable } = useModsStore.getState();
+    const { setUnavailable } = useModsStore.getState();
     const applySnapshot = (next: ModsSnapshot) => {
       const previous = useModsStore.getState().snapshot;
       const stopped = findStoppedMods(previous, next);
       const signIns = findNewlyNeededSignIns(previous, next);
-      reconcileModPullRequestCache(queryClient, previous, next);
-      setSnapshot(next);
+      applyModsSnapshot(queryClient, next);
       for (const mod of stopped) showModStoppedToast(mod, openModsSettings);
       for (const { modId, signIn } of signIns) {
         showModSignInNeededToast(modId, signIn.host, openModsSettings);

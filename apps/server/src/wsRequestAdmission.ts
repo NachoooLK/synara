@@ -20,6 +20,11 @@ export const WS_REQUEST_CLASS_LIMITS: Readonly<Record<WsRequestClass, number>> =
 
 /** Calls that run a mod's code or wait on a server it chose, which may take seconds. */
 const MOD_METHODS = new Set<string>([
+  MODS_WS_METHODS.pullRequestsList,
+  MODS_WS_METHODS.pullRequestsDetail,
+  MODS_WS_METHODS.pullRequestsDiff,
+  MODS_WS_METHODS.pullRequestsComment,
+  MODS_WS_METHODS.pullRequestsAction,
   MODS_WS_METHODS.renderView,
   MODS_WS_METHODS.dispatchUi,
   MODS_WS_METHODS.runCommand,

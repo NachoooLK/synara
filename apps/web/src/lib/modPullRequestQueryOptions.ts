@@ -8,6 +8,7 @@ import type {
   ModPullRequestSourceRef,
 } from "@synara/contracts";
 import { MODS_ON } from "~/betaFeatures";
+import { scheduleModRead } from "./modReadScheduler";
 import { ensureNativeApi } from "~/nativeApi";
 export const modPullRequestQueryKeys = {
   all: ["mod-pull-requests"] as const,
@@ -76,14 +77,16 @@ export function modPullRequestListQueryOptions(
     enabled: MODS_ON,
     queryKey: modPullRequestQueryKeys.list(source, state, sort, cursor),
     queryFn: async ({ signal }) => {
-      const result = await ensureNativeApi().mods.pullRequests.list({
-        modId: source.source.modId,
-        sourceId: source.source.sourceId,
-        state,
-        sort,
-        cursor,
-        limit: 100,
-      });
+      const result = await scheduleModRead(signal, () =>
+        ensureNativeApi().mods.pullRequests.list({
+          modId: source.source.modId,
+          sourceId: source.source.sourceId,
+          state,
+          sort,
+          cursor,
+          limit: 100,
+        }),
+      );
       signal.throwIfAborted();
       checkRevision(source, result);
       return result;
@@ -100,11 +103,13 @@ export function modPullRequestDetailQueryOptions(
     queryKey: modPullRequestQueryKeys.item(source, "detail", identity),
     queryFn: async ({ signal }) => {
       if (!source || !identity) throw new Error("This mod source is unavailable.");
-      const result = await ensureNativeApi().mods.pullRequests.detail({
-        ...identity,
-        modId: source.source.modId,
-        sourceId: source.source.sourceId,
-      });
+      const result = await scheduleModRead(signal, () =>
+        ensureNativeApi().mods.pullRequests.detail({
+          ...identity,
+          modId: source.source.modId,
+          sourceId: source.source.sourceId,
+        }),
+      );
       signal.throwIfAborted();
       checkRevision(source, result);
       return result;
@@ -122,11 +127,13 @@ export function modPullRequestDiffQueryOptions(
     queryKey: modPullRequestQueryKeys.item(source, "diff", identity),
     queryFn: async ({ signal }) => {
       if (!source || !identity) throw new Error("This mod source is unavailable.");
-      const result = await ensureNativeApi().mods.pullRequests.diff({
-        ...identity,
-        modId: source.source.modId,
-        sourceId: source.source.sourceId,
-      });
+      const result = await scheduleModRead(signal, () =>
+        ensureNativeApi().mods.pullRequests.diff({
+          ...identity,
+          modId: source.source.modId,
+          sourceId: source.source.sourceId,
+        }),
+      );
       signal.throwIfAborted();
       return result;
     },

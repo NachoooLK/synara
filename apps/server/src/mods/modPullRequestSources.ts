@@ -21,6 +21,7 @@ import {
   type ModsPullRequestDetailResult,
   type ModsPullRequestSetPinnedResult,
 } from "@synara/contracts";
+import { MOD_HOOK_DEADLINE_MS } from "./modWorkerHost";
 import type { ModProject } from "./modApi";
 import type { ModPullRequestPins } from "./modPullRequestPins";
 
@@ -90,6 +91,21 @@ export class ModPullRequestSources {
       .filter((source) => source.summary.source.modId === modId)
       .map((source) => source.summary);
   }
+  authenticationChanged(modId: string): void {
+    for (const source of [...this.sources.values()]) {
+      if (source.summary.source.modId !== modId) continue;
+      this.register(
+        modId,
+        source.generation,
+        {
+          id: source.summary.source.sourceId,
+          title: source.summary.title,
+          capabilities: source.summary.capabilities,
+        },
+        source.invoke,
+      );
+    }
+  }
   invalidate(modId: string, sourceId?: string): void {
     if (sourceId !== undefined) this.require({ modId, sourceId });
     this.options.onChange(modId, sourceId ?? null);
@@ -151,12 +167,20 @@ export class ModPullRequestSources {
     source: Source,
     input: { repository: string; itemId: string },
     run: () => Promise<T>,
+    cancelled?: AbortSignal,
   ): Promise<T> {
+    const signal = AbortSignal.any([
+      AbortSignal.timeout(MOD_HOOK_DEADLINE_MS),
+      ...(cancelled ? [cancelled] : []),
+    ]);
+    let dispatched = false;
     const key = JSON.stringify([input.repository, input.itemId]);
     const result = (source.writes.get(key) ?? Promise.resolve())
       .catch(() => undefined)
       .then(() => {
+        signal.throwIfAborted();
         this.current(source);
+        dispatched = true;
         return run();
       });
     source.writes.set(key, result);
@@ -165,7 +189,19 @@ export class ModPullRequestSources {
         if (source.writes.get(key) === result) source.writes.delete(key);
       })
       .catch(() => undefined);
-    return result;
+    return new Promise<T>((resolve, reject) => {
+      const abort = () =>
+        reject(
+          new Error(
+            dispatched
+              ? "The request was cancelled after dispatch. The remote write may have completed; do not retry automatically."
+              : "The queued write was cancelled before dispatch.",
+          ),
+        );
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      result.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    });
   }
   private async decorate<T extends ModPullRequestListEntry>(
     source: Source,
@@ -234,18 +270,28 @@ export class ModPullRequestSources {
       ),
     );
   }
-  async comment(value: ModsPullRequestCommentInput): Promise<ModPullRequestMutationResult> {
+  async comment(
+    value: ModsPullRequestCommentInput,
+    signal?: AbortSignal,
+  ): Promise<ModPullRequestMutationResult> {
     const { modId, ...input } = Schema.decodeUnknownSync(ModsPullRequestCommentInput)(value);
     const source = this.require({ modId, sourceId: input.sourceId });
     if (!source.summary.capabilities.comment)
       throw new Error("Comment is unsupported by this source.");
-    return this.write(source, input, async () =>
-      Schema.decodeUnknownSync(ModPullRequestMutationResult)(
-        await this.invoke(source, "pullRequests.comment", input),
-      ),
+    return this.write(
+      source,
+      input,
+      async () =>
+        Schema.decodeUnknownSync(ModPullRequestMutationResult)(
+          await this.invoke(source, "pullRequests.comment", input),
+        ),
+      signal,
     );
   }
-  async action(value: ModsPullRequestActionInput): Promise<ModPullRequestMutationResult> {
+  async action(
+    value: ModsPullRequestActionInput,
+    signal?: AbortSignal,
+  ): Promise<ModPullRequestMutationResult> {
     const { modId, ...input } = Schema.decodeUnknownSync(ModsPullRequestActionInput)(value);
     const source = this.require({ modId, sourceId: input.sourceId });
     const capabilities = source.summary.capabilities;
@@ -255,10 +301,14 @@ export class ModPullRequestSources {
         (!input.mergeMethod || !capabilities.mergeMethods.includes(input.mergeMethod)))
     )
       throw new Error("This action or merge method is unsupported by the source.");
-    return this.write(source, input, async () =>
-      Schema.decodeUnknownSync(ModPullRequestMutationResult)(
-        await this.invoke(source, "pullRequests.action", input),
-      ),
+    return this.write(
+      source,
+      input,
+      async () =>
+        Schema.decodeUnknownSync(ModPullRequestMutationResult)(
+          await this.invoke(source, "pullRequests.action", input),
+        ),
+      signal,
     );
   }
   async setPinned(value: ModsPullRequestSetPinnedInput): Promise<ModsPullRequestSetPinnedResult> {

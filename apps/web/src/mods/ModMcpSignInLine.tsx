@@ -4,10 +4,12 @@ import { Button } from "~/components/ui/button";
 import { toastManager } from "~/components/ui/toast";
 import { ensureNativeApi } from "~/nativeApi";
 import { startModMcpSignIn } from "./modMcpSignIn";
-import { useModsStore } from "./modsStore";
+import { useQueryClient } from "@tanstack/react-query";
+import { applyModsSnapshot } from "./applyModsSnapshot";
 
 /** One MCP server of the mod that asks for a sign-in, with the button that starts or ends it. */
 export function ModMcpSignInLine({ mod, signIn }: { mod: ModSummary; signIn: ModMcpSignIn }) {
+  const queryClient = useQueryClient();
   const [pending, setPending] = useState(false);
   const [pageOpened, setPageOpened] = useState(false);
 
@@ -23,11 +25,10 @@ export function ModMcpSignInLine({ mod, signIn }: { mod: ModSummary; signIn: Mod
   const signOut = async () => {
     setPending(true);
     try {
-      useModsStore
-        .getState()
-        .setSnapshot(
-          await ensureNativeApi().mods.mcpSignOut({ id: mod.id, server: signIn.server }),
-        );
+      applyModsSnapshot(
+        queryClient,
+        await ensureNativeApi().mods.mcpSignOut({ id: mod.id, server: signIn.server }),
+      );
     } catch (error) {
       toastManager.add({
         type: "error",

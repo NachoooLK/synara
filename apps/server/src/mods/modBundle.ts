@@ -15,11 +15,9 @@ import {
   type ModBundleFile,
 } from "@synara/contracts";
 import { Schema, SchemaIssue } from "effect";
+import { isTrustedModSegments } from "./modFilePolicy.ts";
 
-/** The one hidden folder a mod keeps: its manifest. Every other hidden entry stays behind. */
 const MOD_HIDDEN_FOLDER = ".synara-mod";
-/** Folders that belong to a mod's tooling, not to the mod. */
-const SKIPPED_FOLDERS = new Set(["node_modules"]);
 const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/u;
 /** Names Windows reserves for devices, with or without an extension. */
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com\d|lpt\d)(?:\..*)?$/iu;
@@ -74,11 +72,10 @@ async function listModFiles(root: string, maxFiles: number): Promise<ModFile[]> 
   const visit = async (directory: string, segments: ReadonlyArray<string>): Promise<void> => {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
-      const isManifestFolder = segments.length === 0 && entry.name === MOD_HIDDEN_FOLDER;
-      if (entry.name.startsWith(".") && !isManifestFolder) continue;
+      if (!isTrustedModSegments([...segments, entry.name])) continue;
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIPPED_FOLDERS.has(entry.name)) await visit(absolute, [...segments, entry.name]);
+        await visit(absolute, [...segments, entry.name]);
         continue;
       }
       if (!entry.isFile()) continue;

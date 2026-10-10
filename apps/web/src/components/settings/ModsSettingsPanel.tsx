@@ -15,6 +15,8 @@ import {
   type ModStatus,
   type ModSummary,
 } from "@synara/contracts";
+import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { applyModsSnapshot } from "~/mods/applyModsSnapshot";
 import { type ReactNode, useEffect, useId, useRef, useState } from "react";
 
 import {
@@ -305,6 +307,7 @@ function announceEnabledMod(id: string, enabled: ModSummary | undefined): void {
 }
 
 function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
+  const queryClient = useQueryClient();
   const [pending, setPending] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
 
@@ -341,7 +344,7 @@ function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
       const snapshot = await api.mods.setEnabled(
         enabled ? { id: mod.id, enabled, reloadOnChange } : { id: mod.id, enabled },
       );
-      useModsStore.getState().setSnapshot(snapshot);
+      applyModsSnapshot(queryClient, snapshot);
       if (enabled) {
         announceEnabledMod(
           mod.id,
@@ -362,7 +365,7 @@ function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
   const reload = async () => {
     setPending(true);
     try {
-      useModsStore.getState().setSnapshot(await ensureNativeApi().mods.reload({ id: mod.id }));
+      applyModsSnapshot(queryClient, await ensureNativeApi().mods.reload({ id: mod.id }));
     } catch (error) {
       toastManager.add({
         type: "error",
@@ -503,7 +506,11 @@ function readModName(bundle: unknown): string | null {
 }
 
 /** Imports one exported mod file, asking first when it would replace an installed mod. */
-async function importModFile(file: File, confirm: ModConfirm): Promise<void> {
+async function importModFile(
+  file: File,
+  confirm: ModConfirm,
+  queryClient: QueryClient,
+): Promise<void> {
   const api = ensureNativeApi();
   try {
     let bundle: ModsImportInput["bundle"];
@@ -530,7 +537,7 @@ async function importModFile(file: File, confirm: ModConfirm): Promise<void> {
       if (!confirmed) return;
     }
     const result = await api.mods.import({ bundle, replace: installed });
-    useModsStore.getState().setSnapshot(result.snapshot);
+    applyModsSnapshot(queryClient, result.snapshot);
     toastManager.add({
       type: "success",
       title: result.replaced
@@ -548,11 +555,12 @@ async function importModFile(file: File, confirm: ModConfirm): Promise<void> {
 }
 
 function useModImporter(confirm: ModConfirm) {
+  const queryClient = useQueryClient();
   const [pending, setPending] = useState(false);
   const importFiles = async (files: ReadonlyArray<File>) => {
     setPending(true);
     try {
-      for (const file of files) await importModFile(file, confirm);
+      for (const file of files) await importModFile(file, confirm, queryClient);
     } finally {
       setPending(false);
     }

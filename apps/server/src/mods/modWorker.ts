@@ -2,8 +2,10 @@
 // Purpose: Worker entry that loads one mod's hooks module and runs its hooks on request.
 // Layer: Mods runtime. Runs inside a worker thread under Bun (development) and
 //        Node (tests, packaged app), so it uses only erasable TypeScript syntax
-//        and imports nothing from the server but the protocol.
+//        and imports only the protocol and file policy from the server.
 
+import { randomUUID } from "node:crypto";
+import { trustedModSegments } from "./modFilePolicy.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -103,7 +105,7 @@ function isInsideRoot(file: string): boolean {
 
 function existingFile(candidate: string): string | null {
   try {
-    return fs.statSync(candidate).isFile() ? fs.realpathSync(candidate) : null;
+    return fs.statSync(candidate).isFile() ? candidate : null;
   } catch {
     return null;
   }
@@ -259,7 +261,18 @@ function compile(file: string, source: string): string {
   }
 }
 
-function loadModule(file: string): Record<string, unknown> {
+function loadModule(namedFile: string): Record<string, unknown> {
+  // The top-level mod folder may be linked for development; links beneath it cannot run.
+  const file = isInsideRoot(namedFile)
+    ? namedFile
+    : path.resolve(modRoot, path.relative(data.root, namedFile));
+  let current = modRoot;
+  for (const segment of trustedModSegments(modRoot, file)) {
+    current = path.join(current, segment);
+    if (fs.lstatSync(current).isSymbolicLink())
+      throw new Error("Links are not part of the mod's trusted files.");
+  }
+  trustedModSegments(modRoot, fs.realpathSync(file));
   const cached = moduleCache.get(file);
   if (cached) return cached.exports;
   const source = fs.readFileSync(file, "utf8");
@@ -451,13 +464,14 @@ const pendingNext = new Map<string, Pending>();
 
 // ── Handlers ─────────────────────────────────────────────────────────
 // Functions in a hook's result (a tree's onPress) stay here; the result carries
-// `{ $handler: "<render>.<index>" }`. The handlers of the latest renders are kept.
+// `{ $handler: "<worker>.<render>.<index>" }`. The handlers of the latest renders are kept.
 
 type UiHandler = (payload: unknown) => unknown;
 
 const HANDLER_RENDERS_KEPT = 128;
 const RESULT_MAX_DEPTH = 64;
 const handlerRenders = new Map<number, UiHandler[]>();
+const handlerGeneration = randomUUID();
 let nextRenderSeq = 1;
 
 function withHandlerReferences(value: unknown): unknown {
@@ -466,7 +480,7 @@ function withHandlerReferences(value: unknown): unknown {
   const visit = (current: unknown, depth: number): unknown => {
     if (typeof current === "function") {
       handlers.push(current as UiHandler);
-      return { $handler: `${renderSeq}.${handlers.length - 1}` };
+      return { $handler: `${handlerGeneration}.${renderSeq}.${handlers.length - 1}` };
     }
     if (current === null || typeof current !== "object") return current;
     if (depth > RESULT_MAX_DEPTH) {
@@ -490,8 +504,11 @@ function withHandlerReferences(value: unknown): unknown {
 }
 
 function findHandler(handlerId: string): UiHandler | null {
-  const [renderSeq, index] = handlerId.split(".").map(Number);
-  if (renderSeq === undefined || index === undefined) return null;
+  const [generation, render, offset, extra] = handlerId.split(".");
+  if (generation !== handlerGeneration || extra !== undefined) return null;
+  const renderSeq = Number(render);
+  const index = Number(offset);
+  if (!Number.isInteger(renderSeq) || !Number.isInteger(index) || index < 0) return null;
   return handlerRenders.get(renderSeq)?.[index] ?? null;
 }
 
@@ -619,7 +636,7 @@ process.on("uncaughtException", (error) => {
 
 async function start(): Promise<void> {
   try {
-    const entry = existingFile(data.entry);
+    const entry = existingFile(path.resolve(modRoot, path.relative(data.root, data.entry)));
     if (entry === null || !isInsideRoot(entry)) {
       throw new Error("The hooks module named in hooks/hooks.json is missing or outside the mod.");
     }

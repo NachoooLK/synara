@@ -1,6 +1,8 @@
 import { QueryClient } from "@tanstack/react-query";
 import { Schema } from "effect";
 import { ModsSnapshot } from "@synara/contracts";
+import { useModsStore } from "~/mods/modsStore";
+import { applyModsSnapshot } from "~/mods/applyModsSnapshot";
 import { expect, it } from "vitest";
 import { reconcileModPullRequestCache, invalidateModPullRequestCache } from "./modPullRequestCache";
 function snapshot(revision: string) {
@@ -63,4 +65,37 @@ it("invalidates inactive source reads without fetching", async () => {
   expect(calls).toBe(1);
   expect(client.getQueryState(key)?.isInvalidated).toBe(true);
   client.clear();
+});
+
+it.each(["rpc-first", "stream-first"])("reconciles private caches when sign-out is %s", (order) => {
+  const client = new QueryClient();
+  const before = snapshot("current");
+  const signedIn = {
+    ...before,
+    mods: before.mods.map((mod) => ({
+      ...mod,
+      mcpSignIns: [
+        { server: "tracker", host: "example.test", state: "signed-in" as const, detail: null },
+      ],
+    })),
+  };
+  const signedOut = {
+    ...signedIn,
+    mods: signedIn.mods.map((mod) => ({
+      ...mod,
+      mcpSignIns: [{ ...mod.mcpSignIns[0]!, state: "needed" as const }],
+    })),
+  };
+  useModsStore.setState({ snapshot: null });
+  applyModsSnapshot(client, signedIn);
+  const key = ["mod-pull-requests", "demo", "reviews", "detail", "current"];
+  client.setQueryData(key, "private");
+  const responses =
+    order === "rpc-first"
+      ? [signedOut, structuredClone(signedOut)]
+      : [structuredClone(signedOut), signedOut];
+  for (const response of responses) applyModsSnapshot(client, response);
+  expect(client.getQueryData(key)).toBeUndefined();
+  client.clear();
+  useModsStore.setState({ snapshot: null });
 });

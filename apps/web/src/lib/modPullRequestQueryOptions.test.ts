@@ -27,3 +27,34 @@ it("rejects a reply from a different source revision before caching", async () =
   expect(list.mock.calls[0]![0]).toMatchObject({ cursor: "cursor/A", sourceId: "reviews" });
   client.clear();
 });
+
+it("queues more sources than available mod RPC slots without rejecting them", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  let active = 0,
+    maximum = 0;
+  list.mockImplementation(async (input) => {
+    active++;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    active--;
+    if (maximum > 3) throw new Error("Mod read capacity exceeded");
+    return Schema.decodeUnknownSync(ModsPullRequestListResult)({
+      source: { kind: "mod", modId: "demo", sourceId: input.sourceId },
+      revision: "current",
+      items: [],
+    });
+  });
+  const reads = Array.from({ length: 8 }, (_, index) => {
+    const source = Schema.decodeUnknownSync(ModPullRequestSourceSummary)({
+      source: { kind: "mod", modId: "demo", sourceId: `source-${index}` },
+      title: "Reviews",
+      revision: "current",
+      capabilities: {},
+    });
+    return client.fetchQuery(modPullRequestListQueryOptions(source, "open", "updated"));
+  });
+  const results = await Promise.allSettled(reads);
+  expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+  expect(maximum).toBeLessThanOrEqual(3);
+  client.clear();
+});

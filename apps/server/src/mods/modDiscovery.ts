@@ -13,6 +13,7 @@ import {
   ModManifest,
 } from "@synara/contracts";
 import { Schema, SchemaIssue } from "effect";
+import { assertTrustedModFile } from "./modFilePolicy.ts";
 
 export interface ModDefinition {
   readonly id: string;
@@ -47,10 +48,12 @@ const decodeManifest = Schema.decodeUnknownSync(ModManifest);
 const decodeHooksFile = Schema.decodeUnknownSync(ModHooksFile);
 
 async function readJson(
+  root: string,
   file: string,
 ): Promise<{ readonly found: boolean; readonly value?: unknown; readonly error?: string }> {
   let text: string;
   try {
+    await assertTrustedModFile(root, file);
     text = await fs.readFile(file, "utf8");
   } catch (error) {
     // A file where a folder should be (a README next to the mods) is not a mod either.
@@ -71,8 +74,8 @@ export async function readModDefinition(root: string): Promise<ModDefinition | n
   const manifestFile = path.join(root, MOD_MANIFEST_PATH);
   const hooksFile = path.join(root, MOD_HOOKS_PATH);
   const [manifestJson, hooksJson] = await Promise.all([
-    readJson(manifestFile),
-    readJson(hooksFile),
+    readJson(root, manifestFile),
+    readJson(root, hooksFile),
   ]);
   if (!manifestJson.found && !hooksJson.found) return null;
 
@@ -111,9 +114,13 @@ export async function readModDefinition(root: string): Promise<ModDefinition | n
     return failed(`${MOD_HOOKS_PATH} names a module outside the mod's folder.`, manifest);
   }
   try {
+    await assertTrustedModFile(root, entry);
     if (!(await fs.stat(entry)).isFile()) throw new Error("not a file");
-  } catch {
-    return failed(`${MOD_HOOKS_PATH} names ${modulePath}, which does not exist.`, manifest);
+  } catch (error) {
+    return failed(
+      `${MOD_HOOKS_PATH} names ${modulePath}, which cannot load: ${(error as Error).message}`,
+      manifest,
+    );
   }
   return { id, root, manifest, entry, error: null };
 }

@@ -93,12 +93,14 @@ interface ServerState {
   openUntil: number;
   renewal: Promise<string> | null;
   discovery: Promise<boolean> | null;
+  challenge: { readonly serverUrl: string; readonly value: string | null } | null;
 }
 
 interface PendingSignIn {
   readonly modId: string;
   /** The mod's sign-ins as of the start; a mod forgotten since gets no token. */
   readonly epoch: number;
+  readonly serverEpoch: number;
   readonly server: string;
   readonly serverUrl: string;
   readonly authorization: ModMcpAuthorization;
@@ -188,6 +190,7 @@ export class ModMcpSignIns {
   private readonly listeners = new Map<number, CallbackListener>();
   /** Bumped when a mod's sign-ins are forgotten, so one in flight is not kept after. */
   private readonly epochs = new Map<string, number>();
+  private readonly serverEpochs = new Map<string, number>();
   /** Listeners open one after another, so two sign-ins starting together share one. */
   private opening: Promise<unknown> = Promise.resolve();
   private stopped = false;
@@ -208,7 +211,14 @@ export class ModMcpSignIns {
     }
     let state = servers.get(server);
     if (!state) {
-      state = { session: null, needed: null, openUntil: 0, renewal: null, discovery: null };
+      state = {
+        session: null,
+        needed: null,
+        openUntil: 0,
+        renewal: null,
+        discovery: null,
+        challenge: null,
+      };
       servers.set(server, state);
     }
     return state;
@@ -218,10 +228,11 @@ export class ModMcpSignIns {
   load(modId: string): Promise<void> {
     let load = this.loads.get(modId);
     if (!load) {
+      const epoch = this.epochOf(modId);
       load = this.options.vault
         .read(modId)
         .then((stored) => {
-          if (stored === null) return;
+          if (stored === null || this.stopped || this.epochOf(modId) !== epoch) return;
           const parsed = JSON.parse(stored) as { version?: unknown; servers?: unknown };
           if (parsed.version !== STORE_VERSION || parsed.servers === null) return;
           for (const [server, session] of Object.entries(parsed.servers ?? {})) {
@@ -369,6 +380,9 @@ export class ModMcpSignIns {
         throw this.signInNeeded(server, host);
       }
       if (state.openUntil > this.now()) return false;
+      state.challenge = { serverUrl, value: refusal.challenge };
+      const epoch = this.epochOf(modId);
+      const serverEpoch = this.serverEpochOf(modId, server);
       state.discovery ??= discoverModMcpAuthorization({
         serverUrl,
         challenge: refusal.challenge,
@@ -376,6 +390,7 @@ export class ModMcpSignIns {
       })
         .then(
           (authorization) => {
+            this.assertCurrent(modId, server, epoch, serverEpoch);
             if (authorization === null) {
               state.openUntil = this.now() + NOT_SIGN_IN_TTL_MS;
               return false;
@@ -384,6 +399,7 @@ export class ModMcpSignIns {
             return true;
           },
           (error: unknown) => {
+            this.assertCurrent(modId, server, epoch, serverEpoch);
             // Nothing learned: this call fails as it would have, and the next one asks again.
             if (error instanceof ModMcpOAuthUnreachableError) return false;
             // It asks for a sign-in Synara will not do; the row says why.
@@ -439,6 +455,7 @@ export class ModMcpSignIns {
     for (const state of this.states.get(modId)?.values() ?? []) {
       state.needed = null;
       state.openUntil = 0;
+      state.challenge = null;
     }
   }
 
@@ -578,7 +595,7 @@ export class ModMcpSignIns {
       await this.keep(pending, tokens);
       respond(200, SIGNED_IN_PAGE);
     } catch (error) {
-      if (this.epochOf(pending.modId) === pending.epoch) {
+      if (this.isCurrent(pending.modId, pending.server, pending.epoch, pending.serverEpoch)) {
         const message = errorMessage(error);
         this.options.log(pending.modId, "error", `The sign-in did not finish: ${message}`);
         this.needSignIn(pending.modId, pending.server, message);
@@ -591,6 +608,27 @@ export class ModMcpSignIns {
 
   private epochOf(modId: string): number {
     return this.epochs.get(modId) ?? 0;
+  }
+
+  private serverEpochOf(modId: string, server: string): number {
+    return this.serverEpochs.get(JSON.stringify([modId, server])) ?? 0;
+  }
+  private replaceFlow(modId: string, server: string): number {
+    const epoch = this.serverEpochOf(modId, server) + 1;
+    this.serverEpochs.set(JSON.stringify([modId, server]), epoch);
+    this.cancel((pending) => pending.modId === modId && pending.server === server);
+    return epoch;
+  }
+  private isCurrent(modId: string, server: string, epoch: number, serverEpoch: number): boolean {
+    return (
+      !this.stopped &&
+      this.epochOf(modId) === epoch &&
+      this.serverEpochOf(modId, server) === serverEpoch
+    );
+  }
+  private assertCurrent(modId: string, server: string, epoch: number, serverEpoch: number): void {
+    if (!this.isCurrent(modId, server, epoch, serverEpoch))
+      throw new ModMcpOAuthError("The sign-in changed while it was running.");
   }
 
   private async finish(pending: PendingSignIn, answer: URLSearchParams): Promise<ModMcpTokens> {
@@ -625,9 +663,7 @@ export class ModMcpSignIns {
 
   private async keep(pending: PendingSignIn, tokens: ModMcpTokens): Promise<void> {
     // The mod was removed or replaced while the person was signing in.
-    if (this.epochOf(pending.modId) !== pending.epoch) {
-      throw new ModMcpOAuthError("The mod changed while you were signing in.");
-    }
+    this.assertCurrent(pending.modId, pending.server, pending.epoch, pending.serverEpoch);
     const state = this.state(pending.modId, pending.server);
     state.session = {
       serverUrl: pending.serverUrl,
@@ -642,6 +678,7 @@ export class ModMcpSignIns {
     };
     state.needed = null;
     await this.save(pending.modId);
+    this.assertCurrent(pending.modId, pending.server, pending.epoch, pending.serverEpoch);
     this.options.log(
       pending.modId,
       "info",
@@ -657,9 +694,12 @@ export class ModMcpSignIns {
    * the mod reads it.
    */
   async begin(modId: string, server: string, config: ModMcpServerConfig): Promise<string> {
+    const epoch = this.epochOf(modId);
+    const serverEpoch = this.replaceFlow(modId, server);
     try {
-      return await this.start(modId, server, config);
+      return await this.start(modId, server, config, epoch, serverEpoch);
     } catch (error) {
+      if (!this.isCurrent(modId, server, epoch, serverEpoch)) throw error;
       const message = errorMessage(error);
       this.options.log(modId, "error", `The sign-in to "${server}" could not start: ${message}`);
       this.needSignIn(modId, server, message);
@@ -667,7 +707,13 @@ export class ModMcpSignIns {
     }
   }
 
-  private async start(modId: string, server: string, config: ModMcpServerConfig): Promise<string> {
+  private async start(
+    modId: string,
+    server: string,
+    config: ModMcpServerConfig,
+    epoch: number,
+    serverEpoch: number,
+  ): Promise<string> {
     if (this.stopped) throw new ModMcpOAuthError("Synara is closing.");
     if (!("url" in config)) {
       throw new ModMcpOAuthError(`"${server}" is a local MCP server; it has no sign-in.`);
@@ -677,25 +723,26 @@ export class ModMcpSignIns {
       throw new ModMcpOAuthError("Sign-in works only with an https server.");
     }
     await this.load(modId);
-    // One sign-in per server: starting again replaces the page opened before.
-    this.cancel((pending) => pending.modId === modId && pending.server === server);
+    this.assertCurrent(modId, server, epoch, serverEpoch);
     if (this.pendingCount() >= SIGN_IN_PENDING_LIMIT) {
       throw new ModMcpOAuthError(
         "Too many sign-ins are waiting for the browser. Finish one first.",
       );
     }
     const host = new URL(serverUrl).host;
+    const hint = this.state(modId, server).challenge;
     const authorization = await discoverModMcpAuthorization({
       serverUrl,
-      challenge: null,
+      challenge: hint?.serverUrl === serverUrl ? hint.value : null,
       fetch: this.options.fetch,
     });
+    this.assertCurrent(modId, server, epoch, serverEpoch);
     if (authorization === null) {
       throw new ModMcpOAuthError(`${host} does not say how to sign in to it.`);
     }
-    const epoch = this.epochOf(modId);
     const listener = await this.hold(modId, config.oauth?.callbackPort);
     try {
+      this.assertCurrent(modId, server, epoch, serverEpoch);
       const redirectUri = `http://127.0.0.1:${listener.port}${MOD_MCP_SIGN_IN_PATH}`;
       const client = await resolveModMcpClient({
         authorization,
@@ -704,11 +751,13 @@ export class ModMcpSignIns {
         modId,
         fetch: this.options.fetch,
       });
+      this.assertCurrent(modId, server, epoch, serverEpoch);
       const pkce = createModMcpPkce();
       const state = createModMcpState();
       listener.pending.set(state, {
         modId,
         epoch,
+        serverEpoch,
         server,
         serverUrl,
         authorization,
@@ -736,8 +785,8 @@ export class ModMcpSignIns {
 
   /** Forgets a mod's sign-in to one server; its calls are refused until the next one. */
   async signOut(modId: string, server: string): Promise<void> {
+    this.replaceFlow(modId, server);
     await this.load(modId);
-    this.cancel((pending) => pending.modId === modId && pending.server === server);
     const state = this.state(modId, server);
     state.session = null;
     state.needed = { detail: null };
@@ -747,8 +796,8 @@ export class ModMcpSignIns {
 
   /** Forgets every sign-in of a mod: its folder is gone, or its code was replaced by an import. */
   async forget(modId: string): Promise<void> {
-    this.cancel((pending) => pending.modId === modId);
     this.epochs.set(modId, this.epochOf(modId) + 1);
+    this.cancel((pending) => pending.modId === modId);
     const had = [...(this.states.get(modId)?.values() ?? [])].some(
       (state) => state.session !== null,
     );

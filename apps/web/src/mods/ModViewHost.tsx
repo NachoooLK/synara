@@ -134,6 +134,11 @@ export function ModViewHost(props: {
   const renderLatest = useRef<() => void>(() => undefined);
   const lastTreeJson = useRef<string | null>(null);
 
+  useLayoutEffect(() => {
+    lastTreeJson.current = null;
+    setState({ tree: null, error: null, loaded: false });
+  }, [modId, viewId, loadedAt, status]);
+
   useEffect(() => {
     if (status !== "running") return;
     let current = true;

@@ -377,6 +377,7 @@ export class ModManager {
       port: options.signInPort,
       onChange: (modId, redraw) => {
         if (this.stopped) return;
+        this.pullRequests.authenticationChanged(modId);
         this.scheduleSnapshot();
         // After a sign-in the views can draw what the server refused before.
         if (redraw && this.records.has(modId)) this.scheduleInvalidate(modId, null);
