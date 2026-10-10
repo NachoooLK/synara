@@ -46,7 +46,7 @@ import { getRevealInFolderLabel } from "~/lib/fileReferenceContextMenu";
 import { FolderOpenIcon } from "~/lib/icons";
 import { revealFolderInShell } from "~/lib/revealFolder";
 import { cn, getNavigatorPlatform } from "~/lib/utils";
-import { startModMcpSignIn } from "~/mods/modMcpSignIn";
+import { ModMcpSignInLine } from "~/mods/ModMcpSignInLine";
 import { useModsStore } from "~/mods/modsStore";
 import { describeModAdditions, describeModViews } from "~/mods/modsSnapshot.logic";
 import { useModFileDrop } from "~/mods/useModFileDrop";
@@ -304,81 +304,6 @@ function announceEnabledMod(id: string, enabled: ModSummary | undefined): void {
   }
 }
 
-/** One MCP server of the mod that asks for a sign-in, with the button that starts or ends it. */
-function ModMcpSignInLine({ mod, signIn }: { mod: ModSummary; signIn: ModMcpSignIn }) {
-  const [pending, setPending] = useState(false);
-  const [pageOpened, setPageOpened] = useState(false);
-
-  const start = async () => {
-    setPending(true);
-    try {
-      if (await startModMcpSignIn(mod.id, signIn.server)) setPageOpened(true);
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const signOut = async () => {
-    setPending(true);
-    try {
-      useModsStore
-        .getState()
-        .setSnapshot(
-          await ensureNativeApi().mods.mcpSignOut({ id: mod.id, server: signIn.server }),
-        );
-    } catch (error) {
-      toastManager.add({
-        type: "error",
-        title: "Could not sign out",
-        description: errorText(error, "The server did not answer."),
-      });
-    } finally {
-      setPending(false);
-    }
-  };
-
-  if (signIn.state === "signed-in") {
-    const text = `Signed in to ${signIn.host}`;
-    return (
-      <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-        <span title={text} className="line-clamp-2 min-w-0 break-words">
-          {text}
-        </span>
-        <Button size="xs" variant="outline" disabled={pending} onClick={() => void signOut()}>
-          Sign out
-        </Button>
-      </span>
-    );
-  }
-
-  // The server starts a sign-in only for a mod that is on.
-  const blockedReason = !mod.enabled
-    ? "Turn the mod on first."
-    : mod.status === "changed"
-      ? "Trust the mod's changes first."
-      : null;
-  const text = `Needs you to sign in to ${signIn.host}${signIn.detail === null ? "" : `: ${signIn.detail}`}`;
-  return (
-    <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-      <span title={text} className="line-clamp-2 min-w-0 break-words">
-        {text}
-      </span>
-      {/* A disabled button takes no hover, so the reason sits on its wrapper. */}
-      <span title={blockedReason ?? undefined} className="inline-flex shrink-0">
-        <Button
-          size="xs"
-          variant="outline"
-          disabled={pending || blockedReason !== null}
-          onClick={() => void start()}
-        >
-          {pageOpened ? "Open the page again" : "Sign in"}
-        </Button>
-      </span>
-      {pageOpened ? <span>Finish signing in in your browser.</span> : null}
-    </span>
-  );
-}
-
 function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
   const [pending, setPending] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
@@ -482,6 +407,9 @@ function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
       ? `Commands: ${mod.commands.map((command) => command.title).join(", ")}`
       : null,
     mod.views.length > 0 ? `Views: ${describeModViews(mod)}` : null,
+    mod.pullRequestSources.length > 0
+      ? `Code review sources: ${mod.pullRequestSources.map((source) => `${source.title} (${source.source.sourceId})`).join(", ")}`
+      : null,
     mod.mcpServers.length > 0 ? `MCP: ${mod.mcpServers.join(", ")}` : null,
     mod.tools.length > 0
       ? `Tools for agents: ${mod.tools.map((tool) => tool.servedName).join(", ")}`

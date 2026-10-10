@@ -5,8 +5,12 @@
 // Layer: Pull request presentation
 // Exports: PullRequestCodeTab (default export for React.lazy)
 
-import type { PullRequestDetail, PullRequestDetailInput } from "@synara/contracts";
-import { useQuery } from "@tanstack/react-query";
+import type {
+  PullRequestDetail,
+  PullRequestDetailInput,
+  PullRequestDiffResult,
+} from "@synara/contracts";
+import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
 import { DiffPanelPatchViewport } from "~/components/DiffPanelPatchViewport";
@@ -32,17 +36,38 @@ export function PullRequestCodeTab({
   input: PullRequestDetailInput;
   detail: PullRequestDetail;
 }) {
+  const diffQuery = useQuery(pullRequestDiffQueryOptions(input));
+  return (
+    <PullRequestDiffBody
+      identityKey={`pull-request:${input.projectId}:${input.number}`}
+      workspaceRoot={detail.workspaceRoot}
+      diffQuery={diffQuery}
+    />
+  );
+}
+
+export function PullRequestDiffBody({
+  identityKey,
+  workspaceRoot,
+  diffQuery,
+}: {
+  identityKey: string;
+  workspaceRoot: string | null;
+  diffQuery: Pick<
+    UseQueryResult<PullRequestDiffResult>,
+    "data" | "isPending" | "isFetching" | "isSuccess" | "isError" | "error"
+  >;
+}) {
   const { resolvedTheme } = useTheme();
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(() => new Set());
-  const diffQuery = useQuery(pullRequestDiffQueryOptions(input));
 
   // Parse once per distinct patch (mirroring DiffPanel): every collapse toggle
   // and theme change re-renders this tab, and the patch can be up to 8 MiB.
   // Totals come from the parsed result rather than a second full parse.
   const patch = diffQuery.data?.patch;
   const renderablePatch = useMemo(
-    () => getRenderablePatch(patch, `pull-request:${input.projectId}:${input.number}`),
-    [input.number, input.projectId, patch],
+    () => getRenderablePatch(patch, identityKey),
+    [identityKey, patch],
   );
   const renderableFiles = useMemo(
     () => (renderablePatch?.kind === "files" ? sortFileDiffsByPath(renderablePatch.files) : []),
@@ -85,7 +110,7 @@ export function PullRequestCodeTab({
             resolvedTheme={resolvedTheme}
             diffRenderMode="split"
             diffWordWrap
-            workspaceRoot={detail.workspaceRoot}
+            workspaceRoot={workspaceRoot}
             collapsedFiles={collapsedFiles}
             onToggleFileCollapsed={(key) =>
               setCollapsedFiles((current) => {

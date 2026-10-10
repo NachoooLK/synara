@@ -169,7 +169,9 @@ export function GitHubItemPageIconActions({
   url,
   itemLabel,
   pin,
+  externalLabel = "Open on GitHub",
 }: {
+  externalLabel?: string;
   url: string;
   /** "pull request #12", for the pin control's accessible name. */
   itemLabel: string;
@@ -203,8 +205,8 @@ export function GitHubItemPageIconActions({
       <IconButton
         variant="ghost"
         size="icon-sm"
-        label="Open on GitHub"
-        tooltip="Open on GitHub"
+        label={externalLabel}
+        tooltip={externalLabel}
         tooltipSide="bottom"
         onClick={() => void ensureNativeApi().shell.openExternal(url)}
       >

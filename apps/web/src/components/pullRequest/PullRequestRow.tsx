@@ -6,7 +6,12 @@
 // Layer: Pull request presentation
 // Exports: PullRequestRow, githubInboxItemLabel
 
-import type { GitHubInboxItem, GitHubInboxSort } from "@synara/contracts";
+import type {
+  GitHubInboxItem,
+  GitHubInboxSort,
+  ModsPullRequestListEntry,
+  ProjectId,
+} from "@synara/contracts";
 import { pullRequestListProjectContexts } from "@synara/shared/githubRepository";
 import type { ReactNode } from "react";
 
@@ -20,7 +25,7 @@ import {
   PR_QUIET_INK_CLASS_NAME,
 } from "./pullRequestText";
 import { PullRequestActorLabel } from "./PullRequestActorLabel";
-import { GitHubItemStateGlyph } from "./PullRequestStateGlyph";
+import { GitHubItemStateGlyph, PullRequestStateGlyph } from "./PullRequestStateGlyph";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 
 /** How a row names its item in accessible labels: "pull request #42", "issue #7". */
@@ -28,7 +33,15 @@ export function githubInboxItemLabel(item: Pick<GitHubInboxItem, "kind" | "numbe
   return `${item.kind === "issue" ? "issue" : "pull request"} #${item.number}`;
 }
 
-export const PullRequestRow = function PullRequestRow({
+export type NativePullRequestRow = ModsPullRequestListEntry & {
+  kind: "pullRequest";
+  number: number | null;
+  projectId?: ProjectId | undefined;
+  projectTitle: string;
+  sourceKey: string;
+};
+export type PullRequestRowEntry = GitHubInboxItem | NativePullRequestRow;
+export const PullRequestRow = function PullRequestRow<T extends PullRequestRowEntry>({
   entry,
   sort = "created",
   selected,
@@ -37,24 +50,27 @@ export const PullRequestRow = function PullRequestRow({
   onClick,
   onTogglePinned,
 }: {
-  entry: GitHubInboxItem;
+  entry: T;
   sort?: GitHubInboxSort;
   selected: boolean;
   /** Several projects in view: adds the preferred local context to the second line. */
   showProjectTitle?: boolean;
   /** The preferred project's glyph, shown before its name when the project title is shown. */
   projectIcon?: ReactNode;
-  onClick: (entry: GitHubInboxItem) => void;
-  onTogglePinned: (entry: GitHubInboxItem) => void;
+  onClick: (entry: T) => void;
+  onTogglePinned: (entry: T) => void;
 }) {
   const showProjectTitle = showProjectTitleProp ?? false;
   const timestamp = sort === "created" ? entry.createdAt : entry.updatedAt;
   const isPinned = entry.isPinned === true;
-  const projectContexts = pullRequestListProjectContexts(entry);
+  const projectContexts =
+    "sourceKey" in entry ? entry.projectContexts : pullRequestListProjectContexts(entry);
   const projectLabel =
     projectContexts.length > 1 ? `${projectContexts.length} projects` : entry.projectTitle;
   const projectTitle = projectContexts.map((context) => context.projectTitle).join(", ");
-  const itemLabel = githubInboxItemLabel(entry);
+  const numberLabel =
+    entry.number === null && "itemId" in entry ? entry.itemId : `#${entry.number}`;
+  const itemLabel = `${entry.kind === "issue" ? "issue" : "pull request"} ${numberLabel}`;
   const pinLabel = pinActionLabel(
     showProjectTitle ? `${itemLabel} in ${projectLabel}` : itemLabel,
     isPinned,
@@ -77,8 +93,10 @@ export const PullRequestRow = function PullRequestRow({
         data-project-id={entry.projectId}
         data-repository={entry.repository}
         data-pull-request-number={entry.number}
+        data-source={"sourceKey" in entry ? entry.sourceKey : "github"}
+        data-item-id={"itemId" in entry ? entry.itemId : String(entry.number)}
         aria-current={selected ? "true" : undefined}
-        title={`${entry.title} #${entry.number}`}
+        title={`${entry.title} ${numberLabel}`}
         onClick={() => onClick(entry)}
         className="flex min-w-0 flex-1 flex-col gap-1 rounded-lg py-2 pl-3 pr-1 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       >
@@ -97,7 +115,15 @@ export const PullRequestRow = function PullRequestRow({
             "flex min-w-0 items-center gap-1.5",
           )}
         >
-          <GitHubItemStateGlyph item={entry} size="sm" className="size-3.5" />
+          {"sourceKey" in entry ? (
+            <PullRequestStateGlyph
+              state={entry.state}
+              isDraft={entry.isDraft === true}
+              className="size-3.5"
+            />
+          ) : (
+            <GitHubItemStateGlyph item={entry} size="sm" className="size-3.5" />
+          )}
           {showProjectTitle ? (
             <span
               className="flex min-w-0 max-w-[6rem] shrink-0 items-center gap-1"
@@ -108,17 +134,26 @@ export const PullRequestRow = function PullRequestRow({
             </span>
           ) : null}
           <PullRequestActorLabel actor={entry.author} />
-          <span aria-hidden className="shrink-0">
-            ·
-          </span>
-          <time
-            dateTime={timestamp}
-            title={sort === "created" ? "Opened" : "Updated"}
-            className="shrink-0 tabular-nums"
+          {timestamp ? (
+            <>
+              <span aria-hidden className="shrink-0">
+                ·
+              </span>
+              <time
+                dateTime={timestamp}
+                title={sort === "created" ? "Opened" : "Updated"}
+                className="shrink-0 tabular-nums"
+              >
+                {formatRelativeTime(timestamp)}
+              </time>
+            </>
+          ) : null}
+          <span
+            className="ml-auto max-w-[8rem] truncate pl-1 tabular-nums opacity-80"
+            title={numberLabel}
           >
-            {formatRelativeTime(timestamp)}
-          </time>
-          <span className="ml-auto shrink-0 pl-1 tabular-nums opacity-80">#{entry.number}</span>
+            {numberLabel}
+          </span>
         </span>
       </button>
       <Tooltip>

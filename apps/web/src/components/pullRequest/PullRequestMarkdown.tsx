@@ -33,7 +33,7 @@ function DetailsSection({
 }: {
   summary: string;
   body: string;
-  cwd: string;
+  cwd: string | undefined;
   onImageExpand: ImageExpandHandler;
 }) {
   // Closed by default, matching GitHub: these blocks are boilerplate by convention.
@@ -74,7 +74,7 @@ export function PullRequestMarkdown({
   text: string;
   /** Rendered (as markdown) when the prepared body is empty. */
   fallback: string;
-  cwd: string;
+  cwd: string | undefined;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const { expandedImage, setExpandedImage, closeExpandedImage, navigateExpandedImage } =

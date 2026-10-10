@@ -68,17 +68,25 @@ export function GitHubItemPageSummary({
   commentCount,
   children,
 }: {
-  body: string;
-  workspaceRoot: string;
-  commentCount: number;
+  body: string | null;
+  workspaceRoot: string | undefined;
+  commentCount: number | null;
   /** The comments section's content, usually a GitHubItemComments. */
   children: ReactNode;
 }) {
   return (
     <div>
-      <PullRequestMarkdown text={body} fallback="_No description provided._" cwd={workspaceRoot} />
+      <PullRequestMarkdown
+        text={body ?? ""}
+        fallback={body === null ? "_Description unavailable._" : "_No description provided._"}
+        cwd={workspaceRoot}
+      />
       <div className="mt-6">
-        <PullRequestDisclosureSection flush label="Comments" count={commentCount}>
+        <PullRequestDisclosureSection
+          flush
+          label="Comments"
+          {...(commentCount === null ? {} : { count: commentCount })}
+        >
           {children}
         </PullRequestDisclosureSection>
       </div>

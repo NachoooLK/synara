@@ -49,7 +49,19 @@ export type GitHubItemHeaderItem =
   | ({
       kind: "pullRequest";
       mergeability?: GitPullRequestMergeability | undefined;
-    } & Pick<PullRequestDetail, HeaderFields | "state" | "isDraft" | "headBranch" | "baseBranch">)
+    } & Omit<
+      Pick<PullRequestDetail, HeaderFields | "state" | "isDraft" | "headBranch" | "baseBranch">,
+      "number" | "createdAt" | "updatedAt" | "isDraft" | "headBranch" | "baseBranch" | "labels"
+    > & {
+        number: number | null;
+        itemId?: string;
+        createdAt: string | null;
+        updatedAt: string | null;
+        isDraft: boolean | null;
+        headBranch: string | null;
+        baseBranch: string | null;
+        labels: PullRequestDetail["labels"] | null;
+      })
   | ({ kind: "issue" } & Pick<
       GitHubIssueDetail,
       HeaderFields | "state" | "stateReason" | "assignees"
@@ -94,12 +106,13 @@ export function GitHubItemHeader({
   const state =
     item.kind === "pullRequest"
       ? {
-          word: pullRequestStateLabel(item.state, item.isDraft, item.mergeability),
-          colorClass: resolvePrStatePresentation(item).colorClass,
+          word: pullRequestStateLabel(item.state, item.isDraft === true, item.mergeability),
+          colorClass: resolvePrStatePresentation({ ...item, isDraft: item.isDraft === true })
+            .colorClass,
           glyph: (
             <PullRequestStateGlyph
               state={item.state}
-              isDraft={item.isDraft}
+              isDraft={item.isDraft === true}
               mergeability={item.mergeability}
               className="size-3.5"
             />
@@ -116,7 +129,9 @@ export function GitHubItemHeader({
             />
           ),
         };
-  const repositoryName = item.repository.split("/").pop() ?? item.repository;
+  const repositoryName =
+    "itemId" in item ? item.repository : (item.repository.split("/").pop() ?? item.repository);
+  const identifier = item.number === null && "itemId" in item ? item.itemId : `#${item.number}`;
   const pillClassName = cn(
     PR_META_TEXT_CLASS_NAME,
     "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full px-2.5 font-medium",
@@ -155,7 +170,7 @@ export function GitHubItemHeader({
           className={cn(PR_META_TEXT_CLASS_NAME, "min-w-0 truncate text-muted-foreground")}
           title={item.repository}
         >
-          {repositoryName} #{item.number}
+          {repositoryName} {identifier}
         </span>
       </div>
       {/* Large heading: one of the two places a fixed size is allowed. */}
@@ -166,10 +181,12 @@ export function GitHubItemHeader({
         className={cn(PR_META_TEXT_CLASS_NAME, "mt-3 flex-wrap text-muted-foreground")}
       >
         <PullRequestActorLabel actor={item.author} className="font-medium text-foreground" />
-        <span title={new Date(item.createdAt).toLocaleString()}>
-          {relativeTimeAgo(item.createdAt)}
-        </span>
-        {item.kind === "pullRequest" ? (
+        {item.createdAt ? (
+          <span title={new Date(item.createdAt).toLocaleString()}>
+            {relativeTimeAgo(item.createdAt)}
+          </span>
+        ) : null}
+        {item.kind === "pullRequest" && item.headBranch && item.baseBranch ? (
           <span className="flex min-w-0 items-center gap-1.5">
             <span
               className={cn(PR_FINE_TEXT_CLASS_NAME, "min-w-0 truncate")}
@@ -182,7 +199,7 @@ export function GitHubItemHeader({
           </span>
         ) : null}
       </PullRequestMetaLine>
-      {item.kind === "pullRequest" && item.labels.length > 0 ? (
+      {item.kind === "pullRequest" && item.labels && item.labels.length > 0 ? (
         <GitHubLabelChips labels={item.labels} className="mt-3 flex-wrap" />
       ) : null}
     </header>

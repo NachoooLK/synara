@@ -84,37 +84,33 @@ it("fetches on demand and follows opaque pagination", async () => {
       },
     },
   } as unknown as NativeApi;
-  useModsStore
-    .getState()
-    .setSnapshot(
-      Schema.decodeUnknownSync(ModsSnapshot)({
-        modsDir: "/mods",
-        mods: [
-          {
-            id: "demo",
-            version: "1",
-            description: null,
-            path: "/mods/demo",
-            enabled: true,
-            status: "running",
-            error: null,
-            hooks: [],
-            commands: [],
-            tools: [],
-            views: [],
-            mcpServers: [],
-            mcpSignIns: [],
-            permissions: [],
-            reloadsOnChange: false,
-            statusText: null,
-            loadedAt: null,
-            pullRequestSources: [
-              { source, title: "Reviews", revision: "current", capabilities: {} },
-            ],
-          },
-        ],
-      }),
-    );
+  useModsStore.getState().setSnapshot(
+    Schema.decodeUnknownSync(ModsSnapshot)({
+      modsDir: "/mods",
+      mods: [
+        {
+          id: "demo",
+          version: "1",
+          description: null,
+          path: "/mods/demo",
+          enabled: true,
+          status: "running",
+          error: null,
+          hooks: [],
+          commands: [],
+          tools: [],
+          views: [],
+          mcpServers: [],
+          mcpSignIns: [],
+          permissions: [],
+          reloadsOnChange: false,
+          statusText: null,
+          loadedAt: null,
+          pullRequestSources: [{ source, title: "Reviews", revision: "current", capabilities: {} }],
+        },
+      ],
+    }),
+  );
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   clients.push(client);
   await render(

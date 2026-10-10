@@ -200,7 +200,13 @@ export function GitHubInboxFilterBar({
   onClearFilters,
   onRefresh,
   onPasteReference,
+  origin = "all",
+  originOptions = [],
+  onOriginChange,
 }: {
+  origin?: string;
+  originOptions?: ReadonlyArray<{ value: string; label: string }>;
+  onOriginChange?: (value: string) => void;
   filters: GitHubInboxFilters;
   sort: GitHubInboxSort;
   onSortChange: (sort: GitHubInboxSort) => void;
@@ -295,6 +301,21 @@ export function GitHubInboxFilterBar({
             ) : null}
           </MenuTrigger>
           <ComposerPickerMenuPopup align="end" className="min-w-48">
+            {originOptions.length > 0 ? (
+              <>
+                <MenuGroup>
+                  <MenuGroupLabel>Source</MenuGroupLabel>
+                  <MenuRadioGroup value={origin} onValueChange={(value) => onOriginChange?.(value)}>
+                    {originOptions.map((option) => (
+                      <MenuRadioItem key={option.value} value={option.value}>
+                        {option.label}
+                      </MenuRadioItem>
+                    ))}
+                  </MenuRadioGroup>
+                </MenuGroup>
+                <MenuSeparator />
+              </>
+            ) : null}
             <MenuGroup>
               <MenuGroupLabel>Status</MenuGroupLabel>
               <MenuRadioGroup

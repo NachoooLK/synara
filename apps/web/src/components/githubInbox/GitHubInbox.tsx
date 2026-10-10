@@ -10,7 +10,7 @@
 // Exports: GitHubInbox
 
 import type { GitHubInboxItem, GitHubInboxListError, ProjectId, ThreadId } from "@synara/contracts";
-import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -60,15 +60,28 @@ import {
   removePanelResizeOverlay,
 } from "~/lib/panelResize";
 import {
-  githubInboxListQueryOptions,
   pullRequestMutationKeys,
   pullRequestQueryErrorState,
-  pullRequestsForceRefreshMutationOptions,
   pullRequestSetPinnedMutationOptions,
 } from "~/lib/pullRequestReactQuery";
 import { cn } from "~/lib/utils";
 import { useStore } from "~/store";
 import { formatShortTimestamp } from "~/timestampFormat";
+import { MODS_ON } from "~/betaFeatures";
+import { useModsStore } from "~/mods/modsStore";
+import { ModMcpSignInLine } from "~/mods/ModMcpSignInLine";
+import { ModPullRequestDetailPanel } from "../codeReview/ModPullRequestDetailPanel";
+import { useCodeReviewSources } from "../codeReview/useCodeReviewSources";
+import {
+  codeReviewSourceKey,
+  codeReviewItemKey,
+  modCodeReviewSelection,
+  modCodeReviewSelectionForItem,
+  visibleModCodeReviewRows,
+  sortCodeReviewRows,
+} from "../codeReview/codeReview.logic";
+import { groupPullRequestEntriesPinnedThenAll } from "../pullRequest/pullRequestList.logic";
+import type { NativePullRequestRow, PullRequestRowEntry } from "../pullRequest/PullRequestRow";
 import { GitHubInboxFilterBar } from "./GitHubInboxFilterBar";
 import { GitHubIssueDetailPanel } from "./GitHubIssueDetailPanel";
 import {
@@ -85,7 +98,6 @@ import {
   githubInboxSelection,
   githubInboxSelectionForItem,
   githubInboxSendTargets,
-  groupVisibleInboxItems,
   inboxErrorsInScope,
   isGitHubInboxItemSelected,
   resolveInboxItemReference,
@@ -323,18 +335,31 @@ export function GitHubInbox({
   );
   const filters = resolveGitHubInboxFilters(search, settings, existingProjectIds);
   const selection = githubInboxSelection(search);
+  const modSelection = modCodeReviewSelection(search);
   const listState = githubInboxListState(filters.state);
 
   // One list per state and sort; kind, project, involvement, label, and text filters apply below, so
   // switching them never reaches GitHub.
-  const listQuery = useQuery(githubInboxListQueryOptions(listState, settings.githubInboxSort));
-  const refreshMutation = useMutation(pullRequestsForceRefreshMutationOptions(queryClient));
+  const origin = MODS_ON ? (search.origin ?? "all") : "github";
+  const sourceData = useCodeReviewSources({
+    state: listState,
+    sort: settings.githubInboxSort,
+    origin,
+  });
+  const listQuery = sourceData.githubQuery;
+  const modsSnapshot = useModsStore((store) => store.snapshot);
+  const selectedSource =
+    sourceData.sources.find(
+      (source) =>
+        modSelection &&
+        codeReviewSourceKey(source.source) === codeReviewSourceKey(modSelection.source),
+    ) ?? null;
   const pinMutation = useMutation(pullRequestSetPinnedMutationOptions(queryClient));
   const activeActionCount = useIsMutating({
     mutationKey: pullRequestMutationKeys.action,
   });
   const { initialError, backgroundError } = pullRequestQueryErrorState(listQuery);
-  const listData = listQuery.data;
+  const listData = origin === "all" || origin === "github" ? listQuery.data : undefined;
 
   // Large result sets: keep typing responsive while React catches the rows up in a
   // lower-priority render. Virtualization can wait for measured need.
@@ -346,7 +371,35 @@ export function GitHubInbox({
     normalizedQuery: deferredQuery,
     preferredProjectId: selection?.projectId,
   });
-  const groups = groupVisibleInboxItems(entries);
+  const modRows = visibleModCodeReviewRows(
+    sourceData.rows,
+    filters,
+    deferredQuery,
+    settings.githubInboxSort,
+  );
+  const modEntries: NativePullRequestRow[] = modRows.map((row) => ({
+    ...row.item,
+    kind: "pullRequest",
+    number: row.item.displayNumber,
+    projectId: row.item.projectContexts[0]?.projectId,
+    projectTitle:
+      sourceData.sources.find(
+        (source) => codeReviewSourceKey(source.source) === codeReviewSourceKey(row.source),
+      )?.title ?? row.source.modId,
+    sourceKey: codeReviewSourceKey(row.source),
+  }));
+  const combinedEntries: PullRequestRowEntry[] = sortCodeReviewRows(
+    [...entries, ...modEntries].map((item) => ({ item })),
+    settings.githubInboxSort,
+  ).map((row) => row.item);
+  const groups = groupPullRequestEntriesPinnedThenAll(combinedEntries);
+  const rowKey = (item: PullRequestRowEntry) =>
+    "sourceKey" in item
+      ? JSON.stringify([item.sourceKey, item.repository, item.itemId])
+      : codeReviewItemKey(
+          { kind: "github" },
+          { repository: item.repository, itemId: String(item.number) },
+        );
   // While searching, every section opens so a match is never hidden behind a fold.
   const expandedSections: ReadonlyArray<PullRequestListGroupKey> =
     settings.githubInboxExpandedSections ?? DEFAULT_EXPANDED_INBOX_SECTIONS;
@@ -365,6 +418,20 @@ export function GitHubInbox({
     });
   };
   const labelOptions = collectInboxLabelOptions(listData?.items ?? [], filters);
+  const modLabelRows = visibleModCodeReviewRows(
+    sourceData.rows,
+    { ...filters, labels: [] },
+    "",
+    settings.githubInboxSort,
+  );
+  for (const row of modLabelRows)
+    for (const label of row.item.labels ?? []) {
+      const existing = labelOptions.find(
+        (option) => option.name.toLowerCase() === label.name.toLowerCase(),
+      );
+      if (existing) existing.count++;
+      else labelOptions.push({ name: label.name, color: label.color, count: 1 });
+    }
   const activeFilterCount = countActiveGitHubInboxFilters(filters, query);
   const truncatedRepositoryCount = countTruncatedInboxRepositories(
     listData?.repositoryBatches ?? [],
@@ -422,25 +489,14 @@ export function GitHubInbox({
       });
     }
   };
-  const refreshBlockedReason = refreshMutation.isPending
+  const refreshBlockedReason = sourceData.refreshing
     ? "Refreshing…"
     : activeActionCount > 0
       ? "Wait for the pull request action to finish"
       : null;
   const refresh = () => {
     if (refreshBlockedReason !== null) return;
-    refreshMutation.mutate(
-      { state: listState, sort: settings.githubInboxSort },
-      {
-        onError: (error) =>
-          toastManager.add({
-            type: "error",
-            title: "Could not refresh code review",
-            description:
-              error instanceof Error ? error.message : "Code review could not be refreshed.",
-          }),
-      },
-    );
+    void sourceData.refresh();
   };
   const projectById = new Map(repositoryProjects.map((project) => [project.id, project] as const));
   const projectIconFor = (projectId: ProjectId) => {
@@ -463,12 +519,24 @@ export function GitHubInbox({
   // A drag holds only for the dock state it happened in: opening or closing the chat returns the
   // columns to their fractions, as the dock itself re-pins to its share on open.
   const draggedListWidth = draggedList?.dockOpen === dockOpen ? draggedList : null;
-  const showList = !isMobile || selection === null;
-  const showDetail = !isMobile || selection !== null;
+  const showList = !isMobile || (selection === null && modSelection === null);
+  const showDetail = !isMobile || selection !== null || modSelection !== null;
   // Narrow windows swap the list for the detail; going back returns focus to the row it opened.
   const goBackToList = () => {
     const rowToRestore = selection;
+    const modRowToRestore = modSelection;
     onSearchChange(CLEARED_GITHUB_INBOX_SELECTION);
+    if (modRowToRestore)
+      requestAnimationFrame(() => {
+        Array.from(document.querySelectorAll<HTMLElement>("[data-pull-request-row]"))
+          .find(
+            (row) =>
+              row.dataset.source === codeReviewSourceKey(modRowToRestore.source) &&
+              row.dataset.repository === modRowToRestore.identity.repository &&
+              row.dataset.itemId === modRowToRestore.identity.itemId,
+          )
+          ?.focus();
+      });
     if (rowToRestore) {
       requestAnimationFrame(() => {
         focusPullRequestRow(document, rowToRestore);
@@ -525,21 +593,48 @@ export function GitHubInbox({
           <div className="shrink-0">
             <GitHubInboxFilterBar
               filters={filters}
+              origin={origin}
+              originOptions={
+                MODS_ON
+                  ? [
+                      { value: "all", label: "All sources" },
+                      { value: "github", label: "GitHub" },
+                      ...sourceData.sources.map((source) => ({
+                        value: codeReviewSourceKey(source.source),
+                        label: source.title,
+                      })),
+                    ]
+                  : []
+              }
+              onOriginChange={(value) =>
+                onSearchChange({ origin: value === "all" ? undefined : value })
+              }
               sort={settings.githubInboxSort}
               onSortChange={(sort) => updateSettings({ githubInboxSort: sort })}
               query={query}
-              kindCounts={
-                listData
+              kindCounts={(() => {
+                const counts = listData
                   ? countInboxItemsByKind(listData.items, filters, {
                       viewer: listData.viewer,
                       normalizedQuery: deferredQuery,
                       repositoryBatches: listData.repositoryBatches,
                     })
-                  : null
-              }
+                  : { all: 0, pullRequest: 0, issue: 0 };
+                const modCount = visibleModCodeReviewRows(
+                  sourceData.rows,
+                  { ...filters, kind: "all" },
+                  deferredQuery,
+                  settings.githubInboxSort,
+                ).length;
+                return {
+                  ...counts,
+                  all: counts.all + modCount,
+                  pullRequest: counts.pullRequest + modCount,
+                };
+              })()}
               projectOptions={projectOptions}
               labelOptions={labelOptions}
-              refreshing={refreshMutation.isPending}
+              refreshing={sourceData.refreshing}
               refreshBlockedReason={refreshBlockedReason}
               onQueryChange={(value) => onSearchChange({ q: value || undefined })}
               onKindChange={setKind}
@@ -554,26 +649,28 @@ export function GitHubInbox({
           </div>
           <div className="@container/list min-h-0 flex-1 overflow-y-auto px-6 pt-2 pb-8">
             <div className="flex flex-col gap-3">
-              {listQuery.isPending ? (
+              {sourceData.loading && combinedEntries.length === 0 ? (
                 <ListSkeleton />
-              ) : initialError ? (
+              ) : initialError &&
+                combinedEntries.length === 0 &&
+                (origin === "github" || (origin === "all" && sourceData.sources.length === 0)) ? (
                 <PullRequestsUnavailableState
                   error={initialError}
                   subject="Pull requests and issues"
                   onRetry={() => void listQuery.refetch()}
                 />
-              ) : entries.length === 0 ? (
+              ) : combinedEntries.length === 0 ? (
                 <Empty className="py-12">
                   <EmptyHeader>
                     <EmptyTitle>
-                      {repositoryProjects.length === 0
+                      {repositoryProjects.length === 0 && sourceData.sources.length === 0
                         ? "No projects yet"
                         : reviewRequestsOnlyOpen
                           ? "Review requests only apply to open pull requests"
                           : `No ${noun} found`}
                     </EmptyTitle>
                     <EmptyDescription>
-                      {repositoryProjects.length === 0
+                      {repositoryProjects.length === 0 && sourceData.sources.length === 0
                         ? "Code review lists pull requests and issues from the GitHub repositories of your projects."
                         : reviewRequestsOnlyOpen
                           ? "Select Open to see pull requests awaiting your review."
@@ -596,15 +693,99 @@ export function GitHubInbox({
                   groups={groups}
                   isSectionOpen={isSectionOpen}
                   onToggleSection={toggleSection}
-                  isSelected={(item) => isGitHubInboxItemSelected(item, selection)}
+                  isSelected={(item) =>
+                    "sourceKey" in item
+                      ? modSelection !== null &&
+                        rowKey(item) ===
+                          codeReviewItemKey(modSelection.source, modSelection.identity)
+                      : isGitHubInboxItemSelected(item, selection)
+                  }
+                  entryKey={rowKey}
                   showProjectTitle={
-                    filters.projectIds.length !== 1 && repositoryProjects.length > 1
+                    sourceData.sources.length > 0 ||
+                    (filters.projectIds.length !== 1 && repositoryProjects.length > 1)
                   }
                   projectIconFor={projectIconFor}
-                  onSelect={selectItem}
-                  onTogglePinned={togglePinned}
+                  onSelect={(item) =>
+                    "sourceKey" in item
+                      ? onSearchChange(
+                          modCodeReviewSelectionForItem(
+                            modRows.find(
+                              (row) => codeReviewSourceKey(row.source) === item.sourceKey,
+                            )!.source,
+                            { repository: item.repository, itemId: item.itemId },
+                          ),
+                        )
+                      : selectItem(item)
+                  }
+                  onTogglePinned={(item) => {
+                    if (!("sourceKey" in item)) togglePinned(item);
+                  }}
                 />
               )}
+              {sourceData.notices.map((notice) => (
+                <PullRequestWarningNote key={codeReviewSourceKey(notice.source)} shape="callout">
+                  {notice.title}:{" "}
+                  {notice.error instanceof Error
+                    ? notice.error.message
+                    : "Could not load this source."}
+                  {notice.cached ? " Showing the last loaded items." : ""}
+                </PullRequestWarningNote>
+              ))}
+              {(modsSnapshot?.mods ?? [])
+                .filter(
+                  (mod) =>
+                    MODS_ON &&
+                    (origin === "all" ||
+                      sourceData.sources.some(
+                        (source) =>
+                          source.source.modId === mod.id &&
+                          codeReviewSourceKey(source.source) === origin,
+                      )),
+                )
+                .flatMap((mod) =>
+                  mod.mcpSignIns
+                    .filter((signIn) => signIn.state !== "signed-in")
+                    .map((signIn) => (
+                      <ModMcpSignInLine
+                        key={`${mod.id}:${signIn.server}`}
+                        mod={mod}
+                        signIn={signIn}
+                      />
+                    )),
+                )}
+              {sourceData.pagination.map((next) => (
+                <Button
+                  key={next.key}
+                  variant="subtle"
+                  size="sm"
+                  disabled={next.pending}
+                  onClick={() =>
+                    void next
+                      .loadMore()
+                      .catch((error) =>
+                        toastManager.add({
+                          type: "error",
+                          title: `Could not load more from ${next.title}`,
+                          description: error instanceof Error ? error.message : "Try again.",
+                        }),
+                      )
+                  }
+                >
+                  Load more · {next.title}
+                  {next.totalCount === null ? "" : ` (${next.totalCount} total)`}
+                </Button>
+              ))}
+              {initialError &&
+              combinedEntries.length > 0 &&
+              (origin === "all" || origin === "github") ? (
+                <PullRequestWarningNote shape="callout">
+                  GitHub:{" "}
+                  {initialError instanceof Error
+                    ? initialError.message
+                    : "Could not load this source."}
+                </PullRequestWarningNote>
+              ) : null}
               {truncatedRepositoryCount > 0 ? (
                 <p className={cn(PR_FINE_TEXT_CLASS_NAME, "text-muted-foreground")}>
                   {filters.state === "merged"
@@ -651,7 +832,14 @@ export function GitHubInbox({
           // The detail's own parts pad for the chat dock; the page gives them more room.
           className={cn("flex min-h-0 min-w-0 flex-1 flex-col", !isMobile && "px-3 pt-2")}
         >
-          {selection ? (
+          {modSelection ? (
+            <ModPullRequestDetailPanel
+              key={JSON.stringify([modSelection, selectedSource?.revision])}
+              source={selectedSource}
+              identity={modSelection.identity}
+              onBack={isMobile ? goBackToList : undefined}
+            />
+          ) : selection ? (
             <GitHubInboxDetail
               selection={selection}
               sendTargets={githubInboxSendTargets(listData?.items ?? [], selection, filters)}

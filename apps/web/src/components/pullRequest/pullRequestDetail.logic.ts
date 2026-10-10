@@ -78,11 +78,12 @@ export function githubActorName(
 }
 
 /** A pull request's timeline source; issues have no commits and no merge. */
-export type GitHubItemTimelineSource = Pick<
-  PullRequestDetail,
-  "createdAt" | "author" | "comments" | "closedAt"
-> &
-  Partial<Pick<PullRequestDetail, "commits" | "mergedAt">>;
+export type GitHubItemTimelineSource = Pick<PullRequestDetail, "author" | "closedAt"> &
+  Partial<Pick<PullRequestDetail, "mergedAt">> & {
+    createdAt: string | null;
+    comments: PullRequestDetail["comments"] | null;
+    commits?: PullRequestDetail["commits"] | null;
+  };
 
 /** Flattens creation, commits, comments/reviews, and the terminal merge/close event into one
  *  chronologically sorted list. Merged wins over closed: GitHub sets both timestamps on a
@@ -95,12 +96,16 @@ export function buildPullRequestTimelineEvents(
   const ItemNoun = itemNoun === "issue" ? "Issue" : "Pull request";
   const mergedAt = detail.mergedAt ?? null;
   const events: PullRequestTimelineEvent[] = [
-    {
-      id: "created",
-      at: detail.createdAt,
-      title: `${githubActorName(detail.author) ?? "Someone"} opened this ${itemNoun}`,
-      body: null,
-    },
+    ...(detail.createdAt
+      ? [
+          {
+            id: "created",
+            at: detail.createdAt,
+            title: `${githubActorName(detail.author) ?? "Someone"} opened this ${itemNoun}`,
+            body: null,
+          },
+        ]
+      : []),
     ...(detail.commits ?? []).map((commit) => {
       const authorLabel = commit.authors.map(githubActorName).find((name) => name !== null);
       return {
@@ -112,7 +117,7 @@ export function buildPullRequestTimelineEvents(
         body: commit.messageHeadline || "No commit message.",
       };
     }),
-    ...detail.comments.map((comment) => ({
+    ...(detail.comments ?? []).map((comment) => ({
       id: comment.id,
       at: comment.createdAt,
       title: `${githubActorName(comment.author) ?? "Someone"} ${comment.kind === "review" ? "reviewed" : "commented"}`,

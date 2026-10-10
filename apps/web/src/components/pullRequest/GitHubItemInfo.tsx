@@ -7,7 +7,12 @@
 // Layer: Pull request presentation
 // Exports: PullRequestInfo, IssueInfo, GitHubItemInfoThread, GitHubItemInfoVariant
 
-import type { GitHubIssueDetail, PullRequestDetail, ThreadId } from "@synara/contracts";
+import type {
+  GitHubIssueDetail,
+  PullRequestDetail,
+  ModsPullRequestDetailResult,
+  ThreadId,
+} from "@synara/contracts";
 import { useState, type ReactNode } from "react";
 
 import { Button } from "~/components/ui/button";
@@ -48,6 +53,18 @@ const CHECKS_VISIBLE_LIMIT = 6;
 
 export type GitHubItemInfoVariant = "column" | "rows";
 type InfoVariant = GitHubItemInfoVariant;
+type PullRequestInfoDetail = Pick<
+  PullRequestDetail | ModsPullRequestDetailResult,
+  | "state"
+  | "isDraft"
+  | "mergeability"
+  | "baseBranch"
+  | "comments"
+  | "reviewers"
+  | "reviewDecision"
+  | "checks"
+  | "url"
+>;
 
 function InfoSection({
   variant,
@@ -123,18 +140,26 @@ function ThreadsSection({
   );
 }
 
-function CommentsSection({ variant, count }: { variant: InfoVariant; count: number }) {
+function CommentsSection({ variant, count }: { variant: InfoVariant; count: number | null }) {
   return (
     <InfoSection variant={variant} label="Comments" icon={<ChatBubbleIcon className="size-4" />}>
       <span className={count === 0 ? "text-muted-foreground" : undefined}>
-        {count === 0 ? "No comments" : `${count} ${count === 1 ? "comment" : "comments"}`}
+        {count === null
+          ? "Unknown"
+          : count === 0
+            ? "No comments"
+            : `${count} ${count === 1 ? "comment" : "comments"}`}
       </span>
     </InfoSection>
   );
 }
 
-function MergeStatusSection({ detail }: { detail: PullRequestDetail }) {
-  const status = describePullRequestMergeStatus(detail);
+function MergeStatusSection({ detail }: { detail: PullRequestInfoDetail }) {
+  const status = describePullRequestMergeStatus({
+    ...detail,
+    isDraft: detail.isDraft === true,
+    baseBranch: detail.baseBranch ?? "base branch",
+  });
   return (
     <InfoSection variant="column" label="Merge status">
       <span className="flex items-center gap-2">
@@ -143,7 +168,7 @@ function MergeStatusSection({ detail }: { detail: PullRequestDetail }) {
         ) : status.tone === "conflict" ? (
           <PullRequestConflictIcon className="size-4" />
         ) : (
-          <PullRequestStateGlyph state={detail.state} isDraft={detail.isDraft} />
+          <PullRequestStateGlyph state={detail.state} isDraft={detail.isDraft === true} />
         )}
         {status.label}
       </span>
@@ -151,10 +176,19 @@ function MergeStatusSection({ detail }: { detail: PullRequestDetail }) {
   );
 }
 
-function ReviewsSection({ variant, detail }: { variant: InfoVariant; detail: PullRequestDetail }) {
-  const requestable = detail.state === "open";
-  const reviewCount = detail.comments.filter((comment) => comment.kind === "review").length;
-  const hasReviews = detail.reviewers.length > 0 || reviewCount > 0 || detail.reviewDecision;
+function ReviewsSection({
+  variant,
+  detail,
+  requestReview,
+}: {
+  variant: InfoVariant;
+  detail: PullRequestInfoDetail;
+  requestReview: boolean;
+}) {
+  const requestable = requestReview && detail.state === "open";
+  const reviewCount = detail.comments?.filter((comment) => comment.kind === "review").length ?? 0;
+  const hasReviews =
+    (detail.reviewers?.length ?? 0) > 0 || reviewCount > 0 || detail.reviewDecision;
   const decision =
     detail.reviewDecision === "APPROVED"
       ? "Approved"
@@ -173,12 +207,14 @@ function ReviewsSection({ variant, detail }: { variant: InfoVariant; detail: Pul
       {hasReviews ? (
         <>
           {decision ? <span>{decision}</span> : null}
-          {detail.reviewers.map((actor) => (
+          {detail.reviewers?.map((actor) => (
             <PullRequestActorLabel key={actor.login} actor={actor} className="max-w-full" />
           ))}
         </>
       ) : (
-        <span className="text-muted-foreground">No reviews</span>
+        <span className="text-muted-foreground">
+          {detail.reviewers === null ? "Unknown" : "No reviews"}
+        </span>
       )}
       {variant === "rows" ? request : null}
     </InfoSection>
@@ -219,8 +255,20 @@ function CheckRows({ checks }: { checks: PullRequestDetail["checks"] }) {
   );
 }
 
-function ChecksSection({ variant, detail }: { variant: InfoVariant; detail: PullRequestDetail }) {
+function ChecksSection({
+  variant,
+  detail,
+}: {
+  variant: InfoVariant;
+  detail: PullRequestInfoDetail;
+}) {
   const [open, setOpen] = useState(false);
+  if (detail.checks === null)
+    return (
+      <InfoSection variant={variant} label="Checks">
+        <span className="text-muted-foreground">Unknown</span>
+      </InfoSection>
+    );
   const brief = describePullRequestChecksBrief(detail.checks);
   if (variant === "column") {
     return (
@@ -268,11 +316,13 @@ function ChecksSection({ variant, detail }: { variant: InfoVariant; detail: Pull
 
 export function PullRequestInfo({
   detail,
+  requestReview = true,
   variant,
   threads,
   onOpenThread,
 }: {
-  detail: PullRequestDetail;
+  detail: PullRequestInfoDetail;
+  requestReview?: boolean;
   variant: InfoVariant;
   threads: ReadonlyArray<GitHubItemInfoThread>;
   onOpenThread?: ((id: ThreadId) => void) | undefined;
@@ -284,8 +334,8 @@ export function PullRequestInfo({
     >
       {variant === "column" ? <MergeStatusSection detail={detail} /> : null}
       <ThreadsSection variant={variant} threads={threads} onOpenThread={onOpenThread} />
-      <CommentsSection variant={variant} count={detail.comments.length} />
-      <ReviewsSection variant={variant} detail={detail} />
+      <CommentsSection variant={variant} count={detail.comments?.length ?? null} />
+      <ReviewsSection variant={variant} detail={detail} requestReview={requestReview} />
       <ChecksSection variant={variant} detail={detail} />
     </div>
   );

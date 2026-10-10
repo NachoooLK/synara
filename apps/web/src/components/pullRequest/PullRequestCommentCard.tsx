@@ -39,7 +39,7 @@ export function PullRequestCommentCard({
 }: {
   comment: PullRequestComment;
   prUrl: string;
-  workspaceRoot: string;
+  workspaceRoot: string | undefined;
   /** Long threads start older comments collapsed so the tab doesn't eagerly render
    *  dozens of markdown trees. */
   defaultOpen?: boolean;

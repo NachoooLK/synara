@@ -86,11 +86,10 @@ export function toCodeReviewRows(
     }
   return [...rows.values()];
 }
-export function sortCodeReviewRows(
-  rows: readonly CodeReviewRow[],
-  sort: GitHubInboxSort,
-): CodeReviewRow[] {
-  const date = (row: CodeReviewRow) => {
+export function sortCodeReviewRows<
+  T extends { item: { createdAt: string | null; updatedAt: string | null } },
+>(rows: readonly T[], sort: GitHubInboxSort): T[] {
+  const date = (row: T) => {
     const value = sort === "created" ? row.item.createdAt : row.item.updatedAt;
     return value ? Date.parse(value) : null;
   };

@@ -22,7 +22,7 @@ import {
   type PullRequestListGroup,
   type PullRequestListGroupKey,
 } from "./pullRequestList.logic";
-import { PullRequestRow } from "./PullRequestRow";
+import { PullRequestRow, type PullRequestRowEntry } from "./PullRequestRow";
 
 /** Rows a section shows first, and how many each "Show more" adds. */
 const SECTION_PAGE_SIZE = 10;
@@ -34,7 +34,9 @@ const SECTION_PAGE_SIZE = 10;
 const LIST_BLEED_CLASS_NAME = "-mx-3";
 const LIST_INSET_CLASS_NAME = "px-3";
 
-export const PullRequestList = function PullRequestList({
+export const PullRequestList = function PullRequestList<
+  T extends PullRequestRowEntry = GitHubInboxItem,
+>({
   groups,
   sort,
   isSelected,
@@ -44,19 +46,23 @@ export const PullRequestList = function PullRequestList({
   projectIconFor,
   onSelect,
   onTogglePinned,
+  entryKey: entryKeyProp,
 }: {
-  groups: ReadonlyArray<PullRequestListGroup>;
+  groups: ReadonlyArray<Omit<PullRequestListGroup, "entries"> & { entries: readonly T[] }>;
   sort: GitHubInboxSort;
-  isSelected: (entry: GitHubInboxItem) => boolean;
+  isSelected: (entry: T) => boolean;
   /** Whether a collapsible section is expanded. Pinned and All are always open. */
   isSectionOpen: (key: PullRequestListGroupKey) => boolean;
   onToggleSection: (key: PullRequestListGroupKey) => void;
   showProjectTitle?: boolean;
   projectIconFor?: (projectId: ProjectId) => ReactNode;
-  onSelect: (entry: GitHubInboxItem) => void;
-  onTogglePinned: (entry: GitHubInboxItem) => void;
+  onSelect: (entry: T) => void;
+  onTogglePinned: (entry: T) => void;
+  entryKey?: (entry: T) => string;
 }) {
   const showProjectTitle = showProjectTitleProp ?? false;
+  const entryKey = (entry: T) =>
+    entryKeyProp ? entryKeyProp(entry) : pullRequestListEntryKey(entry as GitHubInboxItem);
   // Extra pages each section has revealed. Not persisted: a fresh visit starts at the first page.
   const [extraPages, setExtraPages] = useState<Partial<Record<PullRequestListGroupKey, number>>>(
     {},
@@ -72,23 +78,32 @@ export const PullRequestList = function PullRequestList({
     const pin = Array.from(
       containerRef.current?.querySelectorAll<HTMLElement>("[data-pull-request-row]") ?? [],
     )
-      .find((row) => `${row.dataset.repository}#${row.dataset.pullRequestNumber}` === key)
+      .find(
+        (row) =>
+          (row.dataset.source === "github"
+            ? `${row.dataset.repository}#${row.dataset.pullRequestNumber}`
+            : JSON.stringify([row.dataset.source, row.dataset.repository, row.dataset.itemId])) ===
+          key,
+      )
       ?.parentElement?.querySelector<HTMLElement>("button[aria-pressed]");
     pin?.focus();
   });
-  const renderEntry = (entry: GitHubInboxItem) => (
+  const renderEntry = (entry: T) => (
     <PullRequestRow
-      key={pullRequestListEntryKey(entry)}
+      key={entryKey(entry)}
       entry={entry}
       sort={sort}
       showProjectTitle={showProjectTitle}
-      {...(showProjectTitle && projectIconFor
+      {...(showProjectTitle && projectIconFor && entry.projectId
         ? { projectIcon: projectIconFor(entry.projectId) }
         : {})}
       selected={isSelected(entry)}
       onClick={onSelect}
       onTogglePinned={(current) => {
-        pinFocusKey.current = `${current.repository}#${current.number}`;
+        pinFocusKey.current =
+          "sourceKey" in current
+            ? JSON.stringify([current.sourceKey, current.repository, current.itemId])
+            : `${current.repository}#${current.number}`;
         onTogglePinned(current);
       }}
     />
