@@ -10,6 +10,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import ts from "typescript";
+import { Schema } from "effect";
+import { ModsPullRequestListInput } from "@synara/contracts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { ModProject, ModThread } from "./modApi.ts";
@@ -98,6 +100,71 @@ describe("installModSkill", () => {
 });
 
 describe("example mods", () => {
+  it("loads and queries the native source example", async () => {
+    const modsDir = path.join(root, "mods");
+    await cp(
+      path.join(await skillSourceDir(), "examples", "native-pr-source"),
+      path.join(modsDir, "native-pr-source"),
+      { recursive: true },
+    );
+    const manager = new ModManager({
+      modsDir,
+      dataDir: path.join(root, "state"),
+      watch: false,
+      backend: {
+        listThreads: async () => [],
+        listProjects: async () => [PROJECT],
+        log: () => undefined,
+      },
+    });
+    managers.push(manager);
+    await manager.start();
+    await manager.setEnabled("native-pr-source", true);
+    await manager.whenIdle();
+    const mod = manager.snapshot().mods[0]!;
+    expect([mod.status, mod.error, mod.views]).toEqual(["running", null, []]);
+    expect(mod.pullRequestSources.map((source) => source.source.sourceId)).toEqual([
+      "team-reviews",
+    ]);
+    const source = { modId: mod.id, sourceId: "team-reviews" };
+    const page = await manager.pullRequests.list(
+      Schema.decodeUnknownSync(ModsPullRequestListInput)({
+        ...source,
+        state: "open",
+        sort: "updated",
+        limit: 1,
+      }),
+    );
+    expect(page.items).toHaveLength(1);
+    expect(page.nextCursor).not.toBeNull();
+    const second = await manager.pullRequests.list(
+      Schema.decodeUnknownSync(ModsPullRequestListInput)({
+        ...source,
+        state: "open",
+        sort: "updated",
+        limit: 1,
+        cursor: page.nextCursor,
+      }),
+    );
+    expect(second.items[0]?.itemId).not.toBe(page.items[0]?.itemId);
+    const identity = {
+      ...source,
+      repository: page.items[0]!.repository,
+      itemId: page.items[0]!.itemId,
+    };
+    const detail = await manager.pullRequests.detail(identity);
+    expect(detail.body).toContain("fixture");
+    expect((await manager.pullRequests.diff(identity)).patch).toContain("diff --git");
+    await expect(
+      manager.pullRequests.comment({ ...identity, body: "Looks good." }),
+    ).resolves.toMatchObject({ ok: true });
+    expect((await manager.pullRequests.detail(identity)).comments?.at(-1)?.body).toBe(
+      "Looks good.",
+    );
+    await manager.pullRequests.action({ ...identity, action: "close" });
+    expect((await manager.pullRequests.detail(identity)).state).toBe("closed");
+  });
+
   it("type-check against the published types", async () => {
     const sourceDir = await skillSourceDir();
     const examples = await readdir(path.join(sourceDir, "examples"));

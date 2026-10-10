@@ -902,42 +902,40 @@ const MOD_ENTRY = {
   isPinned: false,
 };
 it("hands mod Ask and Send to agent full context without GitHub checkout", async () => {
-  useModsStore
-    .getState()
-    .setSnapshot(
-      Schema.decodeUnknownSync(ModsSnapshot)({
-        modsDir: "/mods",
-        mods: [
-          {
-            id: "fixture",
-            version: "1",
-            description: null,
-            path: "/mods/fixture",
-            enabled: true,
-            status: "running",
-            error: null,
-            hooks: [],
-            commands: [],
-            tools: [],
-            views: [],
-            mcpServers: [],
-            mcpSignIns: [],
-            permissions: [],
-            reloadsOnChange: false,
-            statusText: null,
-            loadedAt: null,
-            pullRequestSources: [
-              {
-                source: MOD_SOURCE,
-                title: "Fixture reviews",
-                revision: "current",
-                capabilities: {},
-              },
-            ],
-          },
-        ],
-      }),
-    );
+  useModsStore.getState().setSnapshot(
+    Schema.decodeUnknownSync(ModsSnapshot)({
+      modsDir: "/mods",
+      mods: [
+        {
+          id: "fixture",
+          version: "1",
+          description: null,
+          path: "/mods/fixture",
+          enabled: true,
+          status: "running",
+          error: null,
+          hooks: [],
+          commands: [],
+          tools: [],
+          views: [],
+          mcpServers: [],
+          mcpSignIns: [],
+          permissions: [],
+          reloadsOnChange: false,
+          statusText: null,
+          loadedAt: null,
+          pullRequestSources: [
+            {
+              source: MOD_SOURCE,
+              title: "Fixture reviews",
+              revision: "current",
+              capabilities: {},
+            },
+          ],
+        },
+      ],
+    }),
+  );
   window.nativeApi!.mods = {
     pullRequests: {
       list: async () =>

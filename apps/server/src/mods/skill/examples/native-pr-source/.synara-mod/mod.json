@@ -1,0 +1,5 @@
+{
+  "name": "native-pr-source",
+  "version": "0.1.0",
+  "description": "Fixture PRs in native Code review, with no custom view or external service."
+}

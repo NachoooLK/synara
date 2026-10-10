@@ -167,6 +167,7 @@ it("shows mod rows without GitHub authentication and opens opaque native detail"
     .element(page.getByText("Review A", { exact: true }), { timeout: 1500 })
     .toBeVisible();
   await expect.element(page.getByText("Review B", { exact: true })).toBeVisible();
+  await expect.element(page.getByText("ghost", { exact: true }).first()).not.toBeInTheDocument();
   expect(detailCalls).not.toHaveBeenCalled();
   await page.getByRole("button", { name: /^Filter/ }).click();
   await page.getByRole("menuitemradio", { name: "alpha reviews", exact: true }).click();
@@ -197,6 +198,7 @@ it("hides unsupported tabs and preserves narrow list-detail navigation", async (
     .toBeVisible();
   await page.getByText("Review B", { exact: true }).click();
   await expect.element(page.getByRole("heading", { name: "Review B" })).toBeVisible();
+  await expect.element(page.getByText("ghost", { exact: true }).first()).not.toBeInTheDocument();
   await expect
     .element(page.getByRole("button", { name: "Changes", exact: true }))
     .not.toBeInTheDocument();

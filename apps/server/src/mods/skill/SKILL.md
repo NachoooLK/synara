@@ -1,6 +1,6 @@
 ---
 name: synara-mods
-description: Write, load, debug and explain Synara mods, small TypeScript modules that customize Synara itself with sidebar views, dock panels, bands above the composer, thread header buttons and palette commands. Use when the person asks to build, change or fix a Synara mod or plugin, to add something to Synara's interface, or to show their own data (pull requests, tickets, notes) inside Synara; and when they ask what mods are, where they run, or how to enable, share, export or import one.
+description: Use when building, changing, debugging or explaining Synara mods or plugins, supplying pull requests to native Code review, adding custom views or commands, or enabling, importing and exporting mods.
 ---
 
 # Synara mods
@@ -19,7 +19,7 @@ When the person asks about mods rather than for one, answer from this:
 
 - **What it is.** A folder of TypeScript that adds to Synara's interface: a
   sidebar view, a dock panel, a band above the composer, buttons in the thread
-  header, palette commands, notices and a status line. It can read the thread
+  header, native Code review sources, palette commands, notices and a status line. It can read the thread
   and project lists and call MCP servers its manifest declares.
 - **Agents.** A mod can watch when turns and tools start and end. With a
   permission the enable dialog names, it can also change the messages the
@@ -34,7 +34,7 @@ When the person asks about mods rather than for one, answer from this:
   they change, the mod stops, shows **Changed**, and waits for **Trust
   changes**, unless the person ticked **Keep reloading it when its files
   change** for a mod being written. The same page shows each mod's state, log,
-  commands and views, and reloads it.
+  commands, views and registered PR sources, and reloads it.
 - **Sharing.** **Export** next to a mod in Settings → Mods saves one
   `<name>.synara-mod.json` file; **Import…** on the same page, or dropping
   the file onto it, installs one, turned off. Hidden files such as `.env`, `node_modules`, what the mod saved
@@ -74,11 +74,14 @@ only runs for that command.
 | `ui.render`   | `{ view, site, context: { threadId, projectId } }` | a JSX tree, or `null` to draw nothing      |
 | `command.run` | `{ command, threadId }`                            | `{ text }` to show a toast, or nothing     |
 
-The agent events are in [Agents](#agents) below.
+Native PR hooks are in [Native Code review](#native-code-review); agent events
+are in [Agents](#agents).
 
 A hook has 10 seconds to finish, not counting time spent in `next`. A hook
 that throws is skipped and its error goes to the mod's log. A hook that blocks
 its worker with synchronous code for 10 seconds stops the mod.
+Native PR request hooks propagate errors to their source's native UI instead
+of falling through to another mod.
 
 ## The `$` object
 
@@ -90,6 +93,8 @@ its worker with synchronous code for 10 seconds stops the mod.
 | `$.ui.openThread(id)`, `$.ui.openUrl(url)`, `$.ui.openDockView(viewId)`                   | Only inside a handler such as `onPress`. They act on the window that pressed.                                                                                                                                                                                   |
 | `$.tool.register({ name, description, inputSchema? })`                                    | Gives agents a tool (needs the `tools` permission). Answer it with a `tool.call` hook. See Agents.                                                                                                                                                              |
 | `$.command.register({ name, title, description? })`                                       | Adds a command to the palette (⌘K). Answer it with a `command.run` hook.                                                                                                                                                                                        |
+| `$.pullRequests.registerSource({ id, title, capabilities? })`                             | Publishes a source in native Code review. Register metadata in `mod.start`; answer list/detail hooks on demand.                                                                                                                                                 |
+| `$.pullRequests.unregisterSource(id)`, `$.pullRequests.invalidate(id?)`                   | Removes a source; or refreshes its active native queries (all owned sources when omitted).                                                                                                                                                                      |
 | `$.threads.list({ projectId?, includeArchived?, limit? })`, `$.threads.get(id)`           | Threads, newest first. Fields: `id`, `projectId`, `title`, `provider`, `model`, `branch`, `worktreePath`, `parentThreadId`, `isPinned`, `latestTurnState`, `hasPendingApprovals`, `hasPendingUserInput`, `createdAt`, `updatedAt`, `archivedAt`. No transcript. |
 | `$.projects.list()`                                                                       | Projects: `id`, `title`, `workspaceRoot`, `kind`, `isPinned`, `createdAt`, `updatedAt`. `kind === "project"` are the folders in the sidebar.                                                                                                                    |
 | `$.mcp.tools(server)`, `$.mcp.call(server, tool, args)`, `$.mcp.json(server, tool, args)` | Calls an MCP server the manifest declares (see below). `json` returns the structured result or the text parsed as JSON.                                                                                                                                         |
@@ -99,6 +104,151 @@ its worker with synchronous code for 10 seconds stops the mod.
 | `$.log(msg)`, `$.log.warn/error`, `console.log`                                           | The mod's log in Settings → Mods.                                                                                                                                                                                                                               |
 
 Every call returns a promise. `types/synara.d.ts` has the exact signatures.
+
+## Native Code review
+
+When PRs should appear in Synara's existing **Code review**, register a native
+source with `$.pullRequests.registerSource`. Use `$.ui.view` for a custom
+sidebar or dock interface. A native source needs no `ui.render`, rail button
+or custom tab. The host supplies the list, summary, diff, timeline, pinning,
+comment composer and supported action controls.
+
+Start from `examples/native-pr-source/`: a working fixture source called
+`team-reviews`, with pagination, detail, diff, comments and close/reopen hooks.
+It registers no views and requires no accounts. Copy the folder under the
+same name, or rename both its folder and manifest `name`.
+
+```ts
+import type { Register } from "synara";
+
+export const register: Register = (on) => {
+  on("mod.start", async ($) => {
+    await $.pullRequests.registerSource({
+      id: "team-reviews",
+      title: "Team reviews",
+      capabilities: { diff: true, comment: true, actions: ["close", "reopen"] },
+    });
+  });
+  // Add list/detail and every advertised optional hook as in the example.
+};
+```
+
+Hooks are matched with `{ sourceId: "team-reviews" }` and dispatched only to
+the owning mod. `types/synara.d.ts` defines the complete inputs and results:
+
+| Hook                   | Input after `sourceId`                                                                         | Result                                                        |
+| ---------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `pullRequests.list`    | `state: "open" \| "closed"`, `sort: "created" \| "updated"`, `cursor: string \| null`, `limit` | `{ items, nextCursor?, totalCount?, viewer? }`                |
+| `pullRequests.detail`  | `repository`, `itemId`, `forceRefresh: boolean`                                                | `ModPullRequestDetail`                                        |
+| `pullRequests.diff`    | `repository`, `itemId`                                                                         | `{ patch, truncated }`                                        |
+| `pullRequests.comment` | `repository`, `itemId`, `body`                                                                 | `{ ok: true }` after acknowledgement                          |
+| `pullRequests.action`  | `repository`, `itemId`, `action`, optional `mergeMethod`                                       | `{ ok: true, mergeOutcome?: "merged" \| "enqueued" \| null }` |
+
+- **Required:** list and detail. Minimum item: `repository`, `itemId`, `title`,
+  HTTP(S) `url`, `state` (`open`, `closed`, `merged`). Detail must return the
+  requested identity. `closed` listings include closed and merged PRs.
+- **Identity:** `(modId, sourceId, repository, itemId)`. Repository and item
+  IDs are opaque, case-sensitive strings: preserve them unchanged. `url` is a
+  display link; it never chooses the service. `displayNumber` is optional.
+- **Capabilities:** `diff`, `timeline`, `comment` default false; `actions`
+  and `mergeMethods` default empty. Advertise only implemented operations.
+  Actions are `merge`, `ready`, `draft`, `close`, `reopen`; methods are `merge`,
+  `squash`, `rebase`. A detail's `mergeMethods` further restricts source
+  methods; omission allows none. State and draft metadata restrict controls
+  too. The backing service must authorize and validate every write.
+- **Unknown data:** omit it or use `null`: dates, authors, counts, body,
+  branches, labels, checks, reviewers, comments and commits. Use empty arrays
+  only when the service confirms there are none. Synara shows unavailable
+  metadata without inventing GitHub fields. A timeline uses the detail's
+  comments and commits; there is no separate timeline hook.
+- **Paging:** respect `limit` (at most 500), requested state and sort. Forward
+  an upstream cursor unchanged; return `nextCursor: null` when finished.
+  `viewer` belongs to this source. Don't substitute another source's login.
+- **Projects:** optional `projectIds` may name existing Synara projects.
+  Discover them with `$.projects.list()` and associate only genuine matches.
+  Synara resolves paths and titles; the mod must not invent a workspace path.
+- **Demand and refresh:** `mod.start` only registers metadata. Reads begin
+  when Code review is open, detail when selected, diff when **Changes** is
+  opened. No background PR polling is added. Explicit refresh and
+  `$.pullRequests.invalidate(sourceId?)` refresh active queries; inactive
+  views stay idle. `$.ui.invalidate` is for custom views, not native sources.
+  `forceRefresh` lets detail adapters bypass their own cache when requested.
+- **Lifecycle/errors:** disabling, unregistering, reloading or losing trust
+  withdraws the source and its stale results. Throw source errors; other
+  sources remain usable. Let `mcp_sign_in_needed` propagate: Code review
+  shows the owning mod's **Sign in** button. Signing in refreshes its reads;
+  signing out clears its cached data. Never turn a failed read into an empty
+  successful list.
+- **Writes:** return `ok: true` only after the service acknowledges the write.
+  Synara sends once, without automatic retries. A later refresh failure is
+  reported separately. On an uncertain write outcome, check the service
+  before retrying. Call `invalidate` when the mod learns data changed.
+- **Agents:** **Ask** and **Send to agent** attach a reference with the full
+  source identity. A mod PR does not run GitHub checkout/branch preparation.
+  Cards remain readable when the source is unavailable.
+
+### Adapting an MCP service
+
+Keep service-specific tool names, arguments and mapping inside the mod. First
+inspect `await $.mcp.tools("reviews")` in a command or request hook to learn
+the real schemas. Registration alone must not call the service. This
+illustrative list adapter assumes tool `list_reviews` and the exact payload
+below; replace them with the discovered schema and validate external data:
+
+```ts
+import type { Register } from "synara";
+type RemotePage = {
+  reviews: Array<{
+    repo: string;
+    key: string;
+    subject: string;
+    link: string;
+    state: "open" | "closed" | "merged";
+  }>;
+  cursor: string | null;
+};
+
+export const register: Register = (on) => {
+  on("mod.start", async ($) => {
+    await $.pullRequests.registerSource({ id: "team-reviews", title: "Team reviews" });
+  });
+  on("pullRequests.list", { sourceId: "team-reviews" }, async ($, e) => {
+    const page = await $.mcp.json<RemotePage>("reviews", "list_reviews", {
+      state: e.state,
+      sort: e.sort,
+      cursor: e.cursor,
+      limit: e.limit,
+    });
+    return {
+      items: page.reviews.map((r) => ({
+        repository: r.repo,
+        itemId: r.key,
+        title: r.subject,
+        url: r.link,
+        state: r.state,
+      })),
+      nextCursor: page.cursor,
+    };
+  });
+  // Required: add pullRequests.detail using the service's real tool/schema.
+};
+```
+
+The host validates the normalized result. Map service states, dates, nested
+comments, checks and diff results to the published types. Do not advertise
+diff, timeline, comments or actions until the adapter supplies their data or
+hooks. Return an acknowledged mutation rather than fabricating success.
+
+### Migrating an existing PR mod
+
+Keep its `name`, `mcpServers`, environment placeholders and OAuth configuration
+unchanged. Replace its redundant PR sidebar/dock registration with a native
+source in `mod.start`; move reads from `ui.render` into list/detail/diff hooks.
+Keep unrelated views and commands. Preserve upstream identifiers and cursors,
+map only known metadata, and declare the capabilities its service supports.
+After edits, reload and accept **Trust changes** in Settings → Mods when
+required. Open Code review, select the source, exercise summary/Changes and
+inspect its log. Test writes only when the person explicitly requests them.
 
 ## Agents
 
@@ -190,8 +340,8 @@ in Settings → Mods, keeps the token itself and sends it with every call.
   error whose `code` is `"mcp_sign_in_needed"`. Let it escape from `ui.render`:
   Synara then draws its sign-in card in place of the view. Catch it only to
   draw the rest of a view; Synara shows the button above what you drew.
-- **After the sign-in** Synara draws the mod's views again. Load the data when
-  the view draws or in a handler, not once in `mod.start`: a `mod.start` that
+- **After the sign-in** Synara draws the mod's views and refreshes active native
+  PR reads. Load data in a render, handler or native PR request, not once in `mod.start`: a `mod.start` that
   ran before the sign-in does not run again.
 - **Declare it when you know it,** so the person is told before the first call:
 
@@ -280,6 +430,7 @@ native. Props take fixed values, not CSS or class names.
    - `threads-by-day`: a sidebar view
    - `thread-notes`: a band with an input
    - `pr-panel`: a header button and a dock view
+   - `native-pr-source`: data in native Code review, no custom view
    - `agent-hooks`: prompt rules, denied approvals, a tool for agents
 2. A new mod starts disabled. Only the person can enable it, in
    **Settings → Mods**, because a mod runs with Synara's own access. Ask them to
@@ -290,13 +441,16 @@ native. Props take fixed values, not CSS or class names.
    run yet, so `synara_mods_list` cannot show its load errors until it is on:
    do not report it as working before that.
 3. Check it with Synara's tools:
-   - `synara_mods_list`: status, load error, views and commands.
+   - `synara_mods_list`: status, load error, views, commands and PR sources.
    - `synara_mod_logs`: its log and console output.
    - `synara_mod_render`: draw a view as a JSON tree without opening the window.
    - `synara_mod_reload`: reload it.
 
-   A load error names the file and the line. Once the mod is on, draw every view
-   with `synara_mod_render` and read the log before saying it works.
+   A load error names the file and the line. Once the mod is on, draw every
+   custom view with `synara_mod_render` and read the log. For a native source,
+   open Code review and validate list, selected detail and advertised operations;
+   `synara_mod_render` does not test native PR hooks. A registered source alone
+   proves neither authentication nor its data mapping works.
 
 4. Optional type check:
    1. Copy `{{SKILL_DIR}}/reference/tsconfig.json` into the mod folder. Its `paths` already point at this skill's types.

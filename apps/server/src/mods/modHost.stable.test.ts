@@ -9,6 +9,7 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine";
 import { ModHost } from "./Services/ModHost";
 import { ModHostLive } from "./Layers/ModHost";
+import type { ModHostError } from "./Errors";
 
 vi.mock("../betaFeatureGate", () => ({ isServerBetaFeatureEnabled: () => false }));
 
@@ -27,7 +28,7 @@ it("refuses all native source calls on Stable without reading or creating mod st
         const host = yield* ModHost;
         expect(host.available).toBe(false);
         const item = { modId: "demo", sourceId: "reviews", repository: "Repo", itemId: "42" };
-        const calls = [
+        const calls: Array<Effect.Effect<unknown, ModHostError>> = [
           host.pullRequests.list({
             ...item,
             state: "open",

@@ -133,7 +133,9 @@ export const PullRequestRow = function PullRequestRow<T extends PullRequestRowEn
               <span className="truncate">{projectLabel}</span>
             </span>
           ) : null}
-          <PullRequestActorLabel actor={entry.author} />
+          {entry.author !== null || !("sourceKey" in entry) ? (
+            <PullRequestActorLabel actor={entry.author} />
+          ) : null}
           {timestamp ? (
             <>
               <span aria-hidden className="shrink-0">

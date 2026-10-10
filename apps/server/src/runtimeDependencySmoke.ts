@@ -33,8 +33,18 @@ try {
   await mkdir(join(modRoot, "hooks"), { recursive: true });
   await writeFile(
     join(modRoot, "hooks", "register.tsx"),
-    'export const register = (on: (event: string, hook: () => unknown) => void) => { on("mod.start", () => <box />); };',
+    `export const register = (on) => {
+      on("mod.start", async ($) => {
+        await $.pullRequests.registerSource({ id: "reviews", title: "Smoke reviews" });
+        return <box />;
+      });
+      on("pullRequests.list", { sourceId: "reviews" }, () => ({ items: [{
+        repository: "Team/Repo", itemId: "review/A", title: "Smoke review",
+        url: "https://reviews.example.test/A", state: "open"
+      }], nextCursor: null }));
+    };`,
   );
+  let registeredSource: unknown;
   const host = await ModWorkerHost.start({
     data: {
       modId: "smoke",
@@ -45,12 +55,45 @@ try {
       elements: ["Box"],
     },
     workerUrl: await resolveModWorkerUrl(),
-    handleApi: async () => undefined,
+    handleApi: async (method, args) => {
+      assert.equal(method, "pullRequests.registerSource");
+      registeredSource = args[0];
+    },
     onUncaught: () => undefined,
     onExit: () => undefined,
   });
-  assert.equal(host.hooks[0]?.event, "mod.start");
-  await host.stop();
+  try {
+    const startHook = host.hooks.find((hook) => hook.event === "mod.start");
+    const listHook = host.hooks.find((hook) => hook.event === "pullRequests.list");
+    assert.ok(startHook && listHook);
+    const next = async () => {
+      throw new Error("The smoke hook must answer directly.");
+    };
+    assert.equal((await host.invoke(startHook.hookId, {}, next)).kind, "result");
+    assert.deepEqual(registeredSource, { id: "reviews", title: "Smoke reviews" });
+    const page = await host.invoke(
+      listHook.hookId,
+      { sourceId: "reviews", state: "open", sort: "updated", cursor: null, limit: 100 },
+      next,
+    );
+    assert.deepEqual(page, {
+      kind: "result",
+      value: {
+        items: [
+          {
+            repository: "Team/Repo",
+            itemId: "review/A",
+            title: "Smoke review",
+            url: "https://reviews.example.test/A",
+            state: "open",
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+  } finally {
+    await host.stop();
+  }
 } finally {
   await rm(modRoot, { recursive: true, force: true });
 }

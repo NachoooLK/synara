@@ -2,7 +2,7 @@
 
 A mod is a small TypeScript module that changes Synara itself. It can add a view to the
 sidebar, a panel to the dock, a band above the composer, buttons to the thread header, and
-commands to the palette, and it can show notices and a status line. Mods have the same shape as
+commands to the palette, supply pull requests to native Code review, and show notices and a status line. Mods have the same shape as
 Claude Code's mods: a folder with a module that registers hooks.
 
 > **Synara Beta only.** Mods ship in Synara Beta. Stable ignores the mods folder, refuses the
@@ -25,7 +25,7 @@ Claude Code's mods: a folder with a module that registers hooks.
 
 Open **Settings → Mods**. The page shows the mods folder, how many mods are running, and one
 row per mod with its state (**Off**, **Starting**, **Running** or **Error**), description,
-version, the commands and views it registered, and any load error.
+version, the commands, views and PR sources it registered, and any load error.
 
 A new mod starts **Off**. Turn on its switch and confirm **Enable the "<name>" mod?** to run it.
 Each row also has **Reload**, **Export**, and a **Log** with what the mod wrote and why it
@@ -46,6 +46,7 @@ that dialog; the mod then reloads on every save until Synara restarts or you tur
 | `band` view        | A strip above the composer of the open thread                              |
 | `header` view      | One or two buttons in the thread header                                    |
 | Commands           | Entries in the command palette (⌘K)                                        |
+| Native PR source   | PRs in the existing Code review list and detail, without a custom tab      |
 | Notices and status | Toasts in every window, and a status line in Settings → Mods               |
 
 A mod can also work with agents; see [Mods and agents](#mods-and-agents).
@@ -108,9 +109,45 @@ export const register: Register = (on) => {
   A service that wants your own account signs you in instead; see
   [Sign in to a mod's server](#sign-in-to-a-mods-server).
 
-The complete reference, with every event, `$` call, view element and four examples, is the
+The complete reference, with every event, `$` call, view element and runnable examples, is the
 `synara-mods` skill in [`apps/server/src/mods/skill/`](../apps/server/src/mods/skill/). Synara
 installs it under `builtin-skills/synara-mods` in its home folder.
+
+## Pull requests in native Code review
+
+A mod can supply PR data to the existing **Code review** screen. Register a
+source with `$.pullRequests.registerSource({ id, title, capabilities? })` in
+`mod.start`, then answer `pullRequests.list` and `pullRequests.detail` hooks
+matched by `sourceId`. The runnable
+[`native-pr-source` example](../apps/server/src/mods/skill/examples/native-pr-source/)
+needs neither an MCP service nor an account and registers no custom view.
+
+- Code review's source menu combines GitHub and running mod sources, or lets
+  you select one. Source failures leave the others usable.
+- Reads are on demand: list when Code review is open, detail when selected,
+  diff when **Changes** opens. Explicit refresh and source invalidation refresh
+  active queries; Synara does not add PR polling in the background.
+- Declare optional `diff`, `timeline`, `comment`, `actions` and `mergeMethods`
+  only when supported. Synara reuses its native controls, and hides unavailable
+  ones. Each item can further restrict merge methods. Writes require an
+  acknowledgement and are not automatically retried.
+- IDs are `(modId, sourceId, repository, itemId)`. Repository and item IDs stay
+  opaque and case-sensitive; an optional display number is only presentation.
+  Unknown dates, counts and metadata stay unknown. Pagination cursors belong
+  to the service, and `closed` includes closed and merged PRs.
+- Pins are local to the full source identity. Optional project associations
+  refer to existing Synara projects. **Ask** and **Send to agent** attach a
+  source reference; they do not prepare a GitHub branch for a mod PR.
+- Disabling or reloading a mod withdraws its source and stale queries. Stable
+  leaves saved mod references readable as unavailable, without calling mods.
+
+MCP tool discovery, payload mapping and OAuth configuration belong to the
+authored mod. To migrate an existing PR sidebar, keep its MCP/OAuth manifest,
+replace the redundant view registration with a source, and move reads into the
+typed hooks. The [authoring skill](../apps/server/src/mods/skill/SKILL.md#native-code-review)
+documents the inputs, capability rules and an illustrative MCP adapter.
+After trusting changes, validate the actual list, detail and supported operations
+inside Code review; a successful registration alone does not validate the service.
 
 ## Sign in to a mod's server
 
@@ -118,7 +155,7 @@ A mod can use an outside service that wants your own account, such as your compa
 requests. Synara does that sign-in itself; the mod never sees your password or your token.
 
 - When the service asks, the mod's view shows **Sign in**, and so does the mod's row in
-  Settings → Mods. The button opens the service's own sign-in page in your browser. When you
+  Settings → Mods (and Code review for a native PR source). The button opens the service's own sign-in page in your browser. When you
   finish there, the view fills in.
 - **Each sign-in belongs to one mod and one server address.** Another mod that uses the same
   service asks you again. The button names the server's host: that is where your token goes,

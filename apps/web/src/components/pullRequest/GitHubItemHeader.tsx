@@ -180,7 +180,9 @@ export function GitHubItemHeader({
       <PullRequestMetaLine
         className={cn(PR_META_TEXT_CLASS_NAME, "mt-3 flex-wrap text-muted-foreground")}
       >
-        <PullRequestActorLabel actor={item.author} className="font-medium text-foreground" />
+        {item.author !== null || !("itemId" in item) ? (
+          <PullRequestActorLabel actor={item.author} className="font-medium text-foreground" />
+        ) : null}
         {item.createdAt ? (
           <span title={new Date(item.createdAt).toLocaleString()}>
             {relativeTimeAgo(item.createdAt)}

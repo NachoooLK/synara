@@ -84,6 +84,7 @@ export interface ModPullRequestSourceDefinition {
 export interface ModPullRequestIdentity {
   /** Opaque and case-sensitive; never parsed as a GitHub repository. */
   readonly repository: string;
+  /** Opaque and case-sensitive; displayNumber is separate. */
   readonly itemId: string;
 }
 export interface ModPullRequestActor {
@@ -166,7 +167,9 @@ export interface ModPullRequestDetail extends ModPullRequestListEntry {
   readonly mergeMethods?: ReadonlyArray<ModPullRequestMergeMethod>;
 }
 export interface ModPullRequestListResult {
+  /** Respect the requested limit, state (closed includes merged), and sort. */
   readonly items: ReadonlyArray<ModPullRequestListEntry>;
+  /** Forward the service's opaque cursor unchanged; null means no next page. */
   readonly nextCursor?: string | null;
   readonly totalCount?: number | null;
   /** This source's viewer, never another source's login. */
@@ -426,6 +429,7 @@ export interface ModLog {
 export interface ModApi {
   /** Supply data to native Code review without registering a custom view. */
   readonly pullRequests: {
+    /** Register metadata in mod.start; fetch data in the matching request hooks. */
     readonly registerSource: (definition: ModPullRequestSourceDefinition) => Promise<void>;
     readonly unregisterSource: (sourceId: string) => Promise<void>;
     /** Redraw visible native queries; inactive pages do not fetch. */
