@@ -1,4 +1,4 @@
-# Mods in Environment, Tasks and Inbox
+# Native mod authoring and contributions to Environment, Tasks and Inbox
 
 Status: proposed design, awaiting review. No product implementation has started.
 
@@ -15,14 +15,20 @@ tasks and notices in their native lists. Custom panels alone do not satisfy this
 request. The API must be useful to any mod, independent of Paraty, Bitbucket,
 Codex or a particular MCP service.
 
-This is three independently deliverable parts:
+Nacho also wants mod creation to be a Synara tool rather than requiring the
+`synara-mods` skill. Native authoring is the primary entry point and supplies
+the version-matched reference, examples and validation the skill currently
+provides.
 
+This is four independently deliverable parts:
+
+0. Native authoring tools, replacing skill invocation for creation/editing.
 1. Native view slots in Environment, Tasks and Inbox.
 2. Registered sources of tasks in Tasks and the existing Inbox to-do section.
 3. Registered sources of notices in Inbox.
 
 Each part gets its own implementation plan and validation. The complete request
-is finished when all three parts and their authoring examples are validated.
+is finished when all four parts and their authoring examples are validated.
 
 ## Current behavior and integration points
 
@@ -41,6 +47,105 @@ is finished when all three parts and their authoring examples are validated.
 - Code review already has registered sources with generation boundaries,
   on-demand reads, opaque identities, capabilities and explicit invalidation.
   The new sources follow that established ownership model.
+- The agent gateway currently offers `synara_mods_list`, `synara_mod_logs`,
+  `synara_mod_render` and `synara_mod_reload`. Creation still requires an agent
+  to read the skill and write the mod's files directly. The built-in authoring
+  assets already contain its reference, published types and runnable examples.
+
+## Part 0: native authoring tools
+
+### User flow and responsibility
+
+The person asks an agent to create or change a mod in ordinary language. The
+agent obtains the current contract through a Synara tool, generates the
+TypeScript/JSX and submits it to Synara. Synara validates and writes the files
+on the server that owns the mods folder. Synara does not invoke an additional
+model to turn a free-text description into code.
+
+Creation/editing works through the gateway for every provider offering those
+tools, including a client connected to a remote Synara server. It does not
+require the agent's filesystem to contain the server's mods folder or an
+installed skill. The existing list/render/log/reload tools remain the runtime
+inspection interface.
+
+### Proposed tool contracts
+
+| Tool                   | Purpose and principal input                                                                                                                                      |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `synara_mod_reference` | Read-only reference by topic, including an overview, current `$` signatures, UI components/sites, source hooks, MCP configuration, types, or a named example.    |
+| `synara_mod_create`    | Create a new mod from `name`, `description`, and either a shipped `templateId` or UTF-8 `files: [{ path, content }]`.                                            |
+| `synara_mod_edit`      | Read an existing mod, validate a proposed edit, or apply an edit using `operation: read/validate/apply`, `modId`, `expectedRevision` and file upserts/deletions. |
+
+Reference responses carry the authoring API revision, capabilities actually
+available in this build, valid topic/template IDs and bounded content with
+explicit continuation. The overview gives a short authoring recipe and tells
+the agent how to request the exact types/example needed. Tool descriptions
+remain compact; the whole former skill is not injected into every tool listing.
+
+`create` does not overwrite an existing name. Its generated manifest name
+matches the target folder, and it returns the real mod ID, path, content
+revision, initial disabled state, files created and validation diagnostics.
+Custom files include the manifest and hook registration files; template
+creation substitutes the supplied name in the template's manifest/metadata.
+
+`edit` returns a file inventory and current content revision for reads. File
+contents are requested by relative path and bounded continuation. Validate and
+apply both require the expected revision and refuse concurrent edits without
+overwriting them. Validation checks the proposed final file set without saving
+or running it. Apply returns the new revision and the real post-edit mod state,
+including trust pending or runtime errors when observable.
+
+The mixed read/write edit tool requires write capability and an active caller
+turn; it is annotated as potentially mutating. The dedicated reference tool
+remains read-only. All validation results distinguish structural/syntax/import
+checks from semantic TypeScript or runtime checks that were actually performed.
+A static validation never claims that an inactive mod's views or hooks ran.
+
+### Storage, lifecycle and authority
+
+Reuse the existing mod bundle/path policy and async filesystem infrastructure.
+Names and relative file paths must stay inside the intended mod folder. Reject
+absolute/traversing paths, duplicate paths, symlinks and excluded hidden paths;
+the documented `.synara-mod` metadata folder is allowed. Reuse bundle byte/file
+limits and validate the required manifest/hook layout and supported imports.
+
+Stage and validate the complete file set before publication. Serialize changes
+per mod and check the content revision again before committing the staged
+files. Reuse the existing directory-swap/backup conventions so failure cannot
+leave a half-written mod, and reconcile watcher events into one discovery/load
+cycle. An update stops a running worker before publishing changed executable
+files, then applies the existing trust/reload-on-change policy. Preserve the
+mod's saved data and its MCP sign-ins as the current edit flow does.
+
+Mutating authoring operations require an active authenticated provider turn
+with owner-origin mod-authoring authority. Capture that authority from the
+server's trusted turn/session context rather than accepting an `owner` field
+or treating generic `thread:write` as owner authority. Paired/external clients
+do not gain file-install authority by invoking the tool. The same checks apply
+if the authoring service is later exposed through another transport.
+
+Creating files leaves the new mod disabled. File creation/edit authorization
+does not silently enable a mod or accept changed-code trust; those operations
+continue to follow the actual management contract. Tool responses name any
+remaining action rather than inventing successful activation. Stable refuses
+authoring because mods are Beta-only.
+
+### Replacing the skill entry point
+
+Move the reference, types, icons and examples into one versioned product-owned
+authoring asset source shared by the tools, documentation and example tests.
+Update packaging, runtime asset checks and icon loading together. The reference
+remains documentation; tools replace requiring a skill to access it and write
+files.
+
+Stop advertising/injecting/installing the built-in `synara-mods` skill as the
+primary creation flow. Retire only the Synara-managed installed copy identified
+by its generated-version marker and a matching content hash. Preserve modified
+copies, personal skills and user-owned folders. Update provider catalog/injection tests so authoring tools are
+discoverable and new sessions do not depend on an obsolete installed skill.
+
+Later parts extend the same reference/templates with their new contracts when
+they are implemented. A pending design is never advertised as an available API.
 
 ## Chosen approach
 
@@ -304,10 +409,11 @@ That prevents refresh/reload from resurrecting the same dismissed notice.
 
 ## Documentation and examples
 
-Update `docs/mods.md`, the shipped `synara-mods` skill, its types/globals and
-the mod tools' source summaries in the part that introduces each capability.
-The existing skill is a product-owned asset and stays in the repository; this
-task does not create a separate personal skill.
+Update `docs/mods.md`, the tool-served authoring reference, its types/globals
+and the mod tools' source summaries in the part that introduces each
+capability. The versioned authoring assets stay in the repository; this task
+does not create a separate personal skill. The guide teaches the native tool
+flow rather than telling people to invoke `$synara-mods`.
 
 Add small standalone examples using `$.store` for demo data and no credentials:
 
@@ -319,7 +425,8 @@ Add small standalone examples using `$.store` for demo data and no credentials:
    target references and one acknowledged fixture action.
 
 Use English fixture content for screenshots. Clearly label demo items. Extend
-the existing example typecheck/load tests instead of adding a new harness.
+the existing example typecheck/load tests, adapted to the authoring asset
+location, instead of adding a new harness.
 
 ## Verification and acceptance
 
@@ -330,6 +437,17 @@ existing Vitest/Playwright fixtures; real provider calls are unnecessary.
 
 Required acceptance cases:
 
+- Discover the authoring contract, create a custom/template mod, inspect its
+  real disabled state, and edit it through tools without installing a skill or
+  accessing the mods folder from the agent's filesystem.
+- Path/size/import/layout and syntax failures leave files unchanged; duplicate
+  creation and stale edit revisions do not overwrite another person's work.
+- Reference pagination is bounded and returns the build's actual API; old
+  managed skill retirement preserves personal/user-owned skills.
+- Authoring writes require active owner-origin authority. Read-only reference
+  remains available under read capability; Stable refuses the authoring tools.
+- Editing a running mod preserves saved data and sign-ins, follows trust policy
+  and never evaluates untrusted code merely to validate or create files.
 - Valid/invalid site, source, identity, cursor and action payloads.
 - Environment closed versus open; empty results leave no chrome; multiple
   mods and disclosure keyboard/focus behavior; narrow layouts and configured
@@ -356,6 +474,7 @@ separately from any later live MCP adapter validation.
 ## Review checkpoint
 
 Approve or amend this design before writing the first part's implementation
-plan. Implement Environment/view slots first, task sources second, and notice
-sources third. This ordering produces reviewable changes while retaining the
-complete agreed scope.
+plan. Implement native authoring first, Environment/view slots second, task
+sources third, and notice sources fourth. This ordering gives every new
+capability the same authoring entry point while retaining the complete agreed
+scope.
