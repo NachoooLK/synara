@@ -6,6 +6,13 @@
 
 export type {
   ModApi,
+  ModPullRequestCapabilities,
+  ModPullRequestSourceDefinition,
+  ModPullRequestIdentity,
+  ModPullRequestListEntry,
+  ModPullRequestDetail,
+  ModPullRequestListResult,
+  ModPullRequestMutationResult,
   ModCommandDefinition,
   ModElement,
   ModEventInput,

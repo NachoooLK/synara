@@ -63,6 +63,120 @@ export interface ModMcpCallResult {
   readonly isError: boolean;
 }
 
+// ── Native Code review sources ───────────────────────────────────────
+
+export type ModPullRequestAction = "merge" | "ready" | "draft" | "close" | "reopen";
+export type ModPullRequestMergeMethod = "merge" | "squash" | "rebase";
+export interface ModPullRequestCapabilities {
+  readonly diff?: boolean;
+  readonly timeline?: boolean;
+  readonly comment?: boolean;
+  readonly actions?: ReadonlyArray<ModPullRequestAction>;
+  readonly mergeMethods?: ReadonlyArray<ModPullRequestMergeMethod>;
+}
+export interface ModPullRequestSourceDefinition {
+  /** Lowercase words joined by dashes, at most 64 characters; up to ten sources per mod. */
+  readonly id: string;
+  readonly title: string;
+  /** Omitted operations are unsupported; list and detail are always required. */
+  readonly capabilities?: ModPullRequestCapabilities;
+}
+export interface ModPullRequestIdentity {
+  /** Opaque and case-sensitive; never parsed as a GitHub repository. */
+  readonly repository: string;
+  readonly itemId: string;
+}
+export interface ModPullRequestActor {
+  readonly login: string;
+  readonly name: string | null;
+  readonly avatarUrl?: string | null;
+  readonly url?: string | null;
+}
+export interface ModPullRequestListEntry extends ModPullRequestIdentity {
+  readonly title: string;
+  /** HTTP(S) display link; it never determines the source to call. */
+  readonly url: string;
+  readonly state: "open" | "closed" | "merged";
+  readonly displayNumber?: number | null;
+  readonly isDraft?: boolean | null;
+  readonly author?: ModPullRequestActor | null;
+  readonly headBranch?: string | null;
+  readonly baseBranch?: string | null;
+  readonly additions?: number | null;
+  readonly deletions?: number | null;
+  readonly commentCount?: number | null;
+  readonly createdAt?: string | null;
+  readonly updatedAt?: string | null;
+  readonly reviewDecision?: string | null;
+  readonly viewerReviewRequested?: boolean | null;
+  readonly viewerInvolvement?: {
+    readonly authored: boolean;
+    readonly assigned: boolean;
+    readonly involved: boolean;
+  } | null;
+  readonly labels?: ReadonlyArray<{ readonly name: string; readonly color: string | null }> | null;
+  readonly assignees?: ReadonlyArray<ModPullRequestActor> | null;
+  /** Only IDs of existing Synara projects. The host resolves paths and titles. */
+  readonly projectIds?: ReadonlyArray<string>;
+}
+export interface ModPullRequestComment {
+  readonly id: string;
+  readonly kind: "issue-comment" | "review-comment" | "review";
+  readonly author?: ModPullRequestActor | null;
+  readonly body: string;
+  readonly createdAt: string;
+  readonly updatedAt: string | null;
+  readonly url?: string | null;
+  readonly path: string | null;
+  readonly reviewState: string | null;
+}
+export interface ModPullRequestCommit {
+  readonly oid: string;
+  readonly messageHeadline: string;
+  readonly messageBody: string;
+  readonly committedDate: string;
+  readonly authors: ReadonlyArray<{
+    readonly login: string | null;
+    readonly name: string | null;
+    readonly avatarUrl?: string | null;
+    readonly url?: string | null;
+  }>;
+}
+export interface ModPullRequestDetail extends ModPullRequestListEntry {
+  readonly body?: string | null;
+  readonly changedFiles?: number | null;
+  readonly mergedAt?: string | null;
+  readonly closedAt?: string | null;
+  readonly mergeability?: "mergeable" | "conflicting" | "unknown";
+  readonly mergeStateStatus?: string | null;
+  readonly reviewers?: ReadonlyArray<ModPullRequestActor> | null;
+  readonly checks?: ReadonlyArray<{
+    readonly name: string;
+    readonly status: "pending" | "success" | "failure" | "skipped" | "neutral" | "cancelled";
+    readonly description: string | null;
+    readonly url?: string | null;
+    readonly startedAt: string | null;
+    readonly completedAt: string | null;
+  }> | null;
+  readonly comments?: ReadonlyArray<ModPullRequestComment> | null;
+  readonly commits?: ReadonlyArray<ModPullRequestCommit> | null;
+  readonly commentsTruncated?: boolean;
+  readonly commentsIncomplete?: boolean;
+  /** Further restricts the source's methods for this item. Omission permits none. */
+  readonly mergeMethods?: ReadonlyArray<ModPullRequestMergeMethod>;
+}
+export interface ModPullRequestListResult {
+  readonly items: ReadonlyArray<ModPullRequestListEntry>;
+  readonly nextCursor?: string | null;
+  readonly totalCount?: number | null;
+  /** This source's viewer, never another source's login. */
+  readonly viewer?: string | null;
+}
+export interface ModPullRequestMutationResult {
+  readonly ok: true;
+  readonly mergeOutcome?: "merged" | "enqueued" | null;
+}
+
 // ── Views ────────────────────────────────────────────────────────────
 
 /** Where a view is drawn: the sidebar panel, a dock tab, a band above the composer, the thread header. */
@@ -98,6 +212,41 @@ export interface ModElement {
 
 /** Each event's input (`e`) and the result its chain resolves to. */
 export interface ModEvents {
+  /** Requests are dispatched only to the mod that owns this source. */
+  readonly "pullRequests.list": {
+    readonly input: {
+      readonly sourceId: string;
+      readonly state: "open" | "closed";
+      readonly sort: "created" | "updated";
+      readonly cursor: string | null;
+      readonly limit: number;
+    };
+    readonly result: ModPullRequestListResult;
+  };
+  readonly "pullRequests.detail": {
+    readonly input: ModPullRequestIdentity & {
+      readonly sourceId: string;
+      readonly forceRefresh: boolean;
+    };
+    readonly result: ModPullRequestDetail;
+  };
+  readonly "pullRequests.diff": {
+    readonly input: ModPullRequestIdentity & { readonly sourceId: string };
+    readonly result: { readonly patch: string; readonly truncated: boolean };
+  };
+  readonly "pullRequests.comment": {
+    readonly input: ModPullRequestIdentity & { readonly sourceId: string; readonly body: string };
+    readonly result: ModPullRequestMutationResult;
+  };
+  readonly "pullRequests.action": {
+    readonly input: ModPullRequestIdentity & {
+      readonly sourceId: string;
+      readonly action: ModPullRequestAction;
+      readonly mergeMethod?: ModPullRequestMergeMethod;
+    };
+    readonly result: ModPullRequestMutationResult;
+  };
+
   /** The mod was loaded (at startup, when enabled, and after every reload). */
   readonly "mod.start": { readonly input: Record<string, never>; readonly result: void };
   /** The mod is about to stop (disabled, reloaded or the server is shutting down). */
@@ -275,6 +424,14 @@ export interface ModLog {
 
 /** Everything a mod can reach. Every call crosses into Synara and resolves when it is done. */
 export interface ModApi {
+  /** Supply data to native Code review without registering a custom view. */
+  readonly pullRequests: {
+    readonly registerSource: (definition: ModPullRequestSourceDefinition) => Promise<void>;
+    readonly unregisterSource: (sourceId: string) => Promise<void>;
+    /** Redraw visible native queries; inactive pages do not fetch. */
+    readonly invalidate: (sourceId?: string) => Promise<void>;
+  };
+
   readonly mod: { readonly id: string; readonly version: string };
   /** Also where console.log, console.warn and console.error go. */
   readonly log: ModLog;
