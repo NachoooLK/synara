@@ -587,3 +587,38 @@ describe("resolveInboxItemReference", () => {
     expect(resolveInboxItemReference("widgets", list)).toBeNull();
   });
 });
+
+it("round-trips opaque selections and preserves legacy GitHub links", () => {
+  const search = parseGitHubInboxSearch({
+    selectedSource: "mod:demo:reviews",
+    selectedRepo: "Team/Repo/α",
+    selectedItemId: "review/A-α",
+    origin: "mod:demo:reviews",
+  });
+  expect(search).toMatchObject({
+    selectedSource: "mod:demo:reviews",
+    selectedRepo: "Team/Repo/α",
+    selectedItemId: "review/A-α",
+    origin: "mod:demo:reviews",
+  });
+  expect(githubInboxSelection(search)).toBeNull();
+  expect(
+    githubInboxSelection(
+      parseGitHubInboxSearch({
+        selectedProjectId: "project-a",
+        selectedRepo: "acme/widgets",
+        number: 42,
+      }),
+    ),
+  ).toMatchObject({ repository: "acme/widgets", number: 42 });
+  expect(
+    githubInboxSelection(
+      parseGitHubInboxSearch({
+        selectedSource: "mod:bad:source",
+        selectedProjectId: "project-a",
+        selectedRepo: "acme/widgets",
+        number: 42,
+      }),
+    ),
+  ).toBeNull();
+});

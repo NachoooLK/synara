@@ -1,3 +1,8 @@
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  invalidateModPullRequestCache,
+  reconcileModPullRequestCache,
+} from "~/lib/modPullRequestCache";
 // FILE: useModsBridge.ts
 // Purpose: Keeps the mods store in step with the server and shows mod toasts.
 // Layer: Web feature bridge (mounted once by the chat layout; Beta-only)
@@ -69,6 +74,7 @@ function showModSignInNeededToast(modId: string, host: string, openModsSettings:
 
 export function useModsBridge(): void {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   useEffect(() => {
     if (!MODS_ON) return;
     const api = readNativeApi();
@@ -83,6 +89,7 @@ export function useModsBridge(): void {
       const previous = useModsStore.getState().snapshot;
       const stopped = findStoppedMods(previous, next);
       const signIns = findNewlyNeededSignIns(previous, next);
+      reconcileModPullRequestCache(queryClient, previous, next);
       setSnapshot(next);
       for (const mod of stopped) showModStoppedToast(mod, openModsSettings);
       for (const { modId, signIn } of signIns) {
@@ -95,6 +102,8 @@ export function useModsBridge(): void {
       unsubscribe = api.mods.onEvent((event) => {
         if (event.type === "snapshot") applySnapshot(event.snapshot);
         else if (event.type === "toast") showModToast(event.toast);
+        else if (event.type === "pullRequestsInvalidated")
+          void invalidateModPullRequestCache(queryClient, event.modId, event.sourceId);
         else useModsStore.getState().invalidate(event.modId, event.viewId);
       });
     };
@@ -121,5 +130,5 @@ export function useModsBridge(): void {
       unsubscribe?.();
       registerModDockViewOpener(null);
     };
-  }, [navigate]);
+  }, [navigate, queryClient]);
 }

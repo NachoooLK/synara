@@ -1,3 +1,4 @@
+import { parseCodeReviewSourceKey } from "../codeReview/codeReview.logic";
 // FILE: githubInbox.logic.ts
 // Purpose: Pure logic behind the GitHub inbox page: URL search parsing (including links from the
 //          older pull request page), the effective filters (URL overrides over persisted
@@ -46,6 +47,9 @@ import {
  * the sidebar's per-project button); selection fields keep an open item linkable.
  */
 export interface GitHubInboxSearch {
+  origin?: string;
+  selectedSource?: string;
+  selectedItemId?: string;
   type?: GitHubInboxKindFilter;
   state?: GitHubInboxStateFilter;
   involvement?: GitHubInboxInvolvementFilter;
@@ -94,15 +98,27 @@ export function parseGitHubInboxSearch(raw: Record<string, unknown>): GitHubInbo
   const q = nonEmptyString(raw.q)?.slice(0, SEARCH_QUERY_MAX_LENGTH);
   const kind = raw.kind === "pullRequest" || raw.kind === "issue" ? raw.kind : undefined;
   const selectedProjectId = nonEmptyString(raw.selectedProjectId) as ProjectId | undefined;
-  const selectedRepo =
-    typeof raw.selectedRepo === "string" && isValidGitHubRepositoryNameWithOwner(raw.selectedRepo)
-      ? raw.selectedRepo.trim()
+  const selectedSource = nonEmptyString(raw.selectedSource)?.slice(0, 140);
+  const selectedItemId = nonEmptyString(raw.selectedItemId)?.slice(0, 4096);
+  const origin =
+    raw.origin === "all" || parseCodeReviewSourceKey(raw.origin)
+      ? (raw.origin as string)
       : undefined;
+  const selectedRepo =
+    selectedSource && selectedSource !== "github"
+      ? nonEmptyString(raw.selectedRepo)?.slice(0, 4096)
+      : typeof raw.selectedRepo === "string" &&
+          isValidGitHubRepositoryNameWithOwner(raw.selectedRepo)
+        ? raw.selectedRepo.trim()
+        : undefined;
   const number =
     typeof raw.number === "number" && Number.isInteger(raw.number) && raw.number > 0
       ? raw.number
       : undefined;
   return compactGitHubInboxSearch({
+    origin,
+    selectedSource,
+    selectedItemId,
     type,
     state,
     involvement,
@@ -135,6 +151,8 @@ export function mergeGitHubInboxSearch(
 
 /** Closing the detail (or going back on a narrow window) drops every selection field. */
 export const CLEARED_GITHUB_INBOX_SELECTION = {
+  selectedSource: undefined,
+  selectedItemId: undefined,
   kind: undefined,
   selectedProjectId: undefined,
   selectedRepo: undefined,
@@ -154,6 +172,7 @@ export interface GitHubInboxSelection extends Pick<
  * so a project override in the URL also scopes the selection.
  */
 export function githubInboxSelection(search: GitHubInboxSearch): GitHubInboxSelection | null {
+  if (search.selectedSource && search.selectedSource !== "github") return null;
   if (!search.selectedProjectId || !search.selectedRepo || !search.number) return null;
   if (search.projectId !== undefined && search.selectedProjectId !== search.projectId) return null;
   return {
@@ -168,6 +187,7 @@ export function githubInboxSelectionForItem(
   item: Pick<GitHubInboxItem, "kind" | "projectId" | "repository" | "number">,
 ): GitHubInboxSearchPatch {
   return {
+    ...CLEARED_GITHUB_INBOX_SELECTION,
     kind: item.kind,
     selectedProjectId: item.projectId,
     selectedRepo: item.repository,
@@ -255,6 +275,7 @@ export const CLEARED_GITHUB_INBOX_FILTER_SETTINGS = {
 
 /** Every URL filter override, for dropping them all at once. */
 export const CLEARED_GITHUB_INBOX_FILTER_SEARCH = {
+  origin: undefined,
   type: undefined,
   state: undefined,
   involvement: undefined,
