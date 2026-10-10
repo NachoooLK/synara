@@ -137,6 +137,7 @@ export function visibleModCodeReviewRows(
           item.repository,
           row.identity.itemId,
           item.author?.login,
+          item.author?.name,
           ...(item.labels?.map((label) => label.name) ?? []),
         ].some((value) => value?.toLowerCase().includes(query))
       );

@@ -9,6 +9,8 @@ import "../../index.css";
 
 import {
   DEFAULT_SERVER_SETTINGS_VIEW,
+  ModsSnapshot,
+  ModsPullRequestListResult,
   type GitHubInboxItem,
   type GitHubInboxListInput,
   type GitHubInboxListResult,
@@ -19,12 +21,14 @@ import {
   type PullRequestDetail,
 } from "@synara/contracts";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Schema } from "effect";
 import { useState } from "react";
 import { page, userEvent } from "vitest/browser";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "vitest-browser-react";
 
 import { useStore } from "~/store";
+import { useModsStore } from "~/mods/modsStore";
 import type { Project } from "~/types";
 
 vi.mock("~/hooks/useHandleNewThread", () => ({
@@ -343,6 +347,7 @@ afterEach(() => {
   document.body.innerHTML = "";
   delete (window as { nativeApi?: NativeApi }).nativeApi;
   useStore.setState({ projects: [] });
+  useModsStore.setState({ snapshot: null });
 });
 
 describe("GitHubInbox list", () => {
@@ -786,6 +791,97 @@ function paste(text: string) {
 }
 
 describe("GitHubInbox search box", () => {
+  it("searches GitHub and mod PRs by the creator name shown in the list", async () => {
+    api.list.mockResolvedValue(
+      listResult({
+        items: [
+          {
+            ...PULL_REQUEST_41,
+            author: { ...actor("teammate"), name: "Ada Lovelace" },
+          },
+        ],
+      }),
+    );
+    const source = { kind: "mod" as const, modId: "demo", sourceId: "reviews" };
+    const modList = Schema.decodeUnknownSync(ModsPullRequestListResult)({
+      source,
+      revision: "current",
+      items: [
+        {
+          repository: "Team/Repo",
+          itemId: "review/A",
+          displayNumber: 51,
+          title: "Improve export",
+          url: "https://reviews.example.test/A",
+          state: "open",
+          author: { login: "account-27", name: "Ada Lovelace" },
+          projectContexts: [],
+          isPinned: false,
+          createdAt: NOW,
+        },
+        {
+          repository: "Team/Repo",
+          itemId: "review/B",
+          displayNumber: 52,
+          title: "Fix billing",
+          url: "https://reviews.example.test/B",
+          state: "open",
+          author: { login: "account-28", name: "Grace Hopper" },
+          projectContexts: [],
+          isPinned: false,
+          createdAt: NOW,
+        },
+      ],
+    });
+    window.nativeApi = {
+      ...window.nativeApi,
+      mods: { pullRequests: { list: async () => modList } },
+    } as unknown as NativeApi;
+    useModsStore.getState().setSnapshot(
+      Schema.decodeUnknownSync(ModsSnapshot)({
+        modsDir: "/mods",
+        mods: [
+          {
+            id: "demo",
+            version: "1",
+            description: null,
+            path: "/mods/demo",
+            enabled: true,
+            status: "running",
+            error: null,
+            hooks: [],
+            commands: [],
+            tools: [],
+            views: [],
+            mcpServers: [],
+            mcpSignIns: [],
+            permissions: [],
+            reloadsOnChange: false,
+            statusText: null,
+            loadedAt: null,
+            pullRequestSources: [
+              { source, title: "Team reviews", revision: "current", capabilities: {} },
+            ],
+          },
+        ],
+      }),
+    );
+    await mount();
+    await expectRows([41, 51, 52]);
+    const input = page.getByRole("textbox", { name: "Search pull requests and issues" });
+    await input.fill("ADA LOVELACE");
+    await expectRows([41, 51]);
+    await input.fill("account-27");
+    await expectRows([51]);
+    await input.fill("teammate");
+    await expectRows([41]);
+    await input.fill("grace hopper");
+    await expectRows([52]);
+    await input.fill("unknown creator");
+    await expectRows([]);
+    await input.fill("");
+    await expectRows([41, 51, 52]);
+  });
   it("selects the loaded item a pasted PR link or #number names", async () => {
     await mount();
     await expectRows([44, 43, 42, 41]);

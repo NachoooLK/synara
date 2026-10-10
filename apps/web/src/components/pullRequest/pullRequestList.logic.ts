@@ -184,7 +184,7 @@ export function matchesPullRequestSearchQuery(
 ): boolean {
   if (normalizedQuery.length === 0) return true;
   const labels = (entry.labels ?? []).map((label) => label.name).join(" ");
-  return `${entry.title} ${entry.repository} ${entry.headBranch ?? ""} #${entry.number} ${entry.author?.login ?? ""} ${labels}`
+  return `${entry.title} ${entry.repository} ${entry.headBranch ?? ""} #${entry.number} ${entry.author?.login ?? ""} ${entry.author?.name ?? ""} ${labels}`
     .toLowerCase()
     .includes(normalizedQuery);
 }

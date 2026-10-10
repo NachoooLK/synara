@@ -7,6 +7,7 @@ import {
   parseCodeReviewSourceKey,
   sortCodeReviewRows,
   toCodeReviewRows,
+  visibleModCodeReviewRows,
 } from "./codeReview.logic";
 const source = { kind: "mod" as const, modId: "demo", sourceId: "reviews" };
 function page(modId: string, updatedAt: string | null = null) {
@@ -29,6 +30,32 @@ function page(modId: string, updatedAt: string | null = null) {
   });
 }
 describe("code review identity", () => {
+  it("finds mod PRs by their creator's display name as well as login", () => {
+    const result = page("demo");
+    const rows = toCodeReviewRows(undefined, [
+      {
+        ...result,
+        items: [
+          {
+            ...result.items[0]!,
+            author: { login: "account-27", name: "Ada Lovelace", avatarUrl: null, url: null },
+          },
+        ],
+      },
+    ]);
+    const filters = {
+      kind: "all" as const,
+      state: "open" as const,
+      involvement: "everything" as const,
+      projectIds: [],
+      labels: [],
+    };
+    for (const query of ["ada", "lovelace", "ada lovelace", "account-27"])
+      expect(
+        visibleModCodeReviewRows(rows, filters, query, "updated").map((row) => row.identity.itemId),
+      ).toEqual(["42"]);
+    expect(visibleModCodeReviewRows(rows, filters, "grace hopper", "updated")).toEqual([]);
+  });
   it("separates source identities and viewers", () => {
     const rows = toCodeReviewRows(undefined, [page("demo"), page("other")]);
     expect(rows).toHaveLength(2);

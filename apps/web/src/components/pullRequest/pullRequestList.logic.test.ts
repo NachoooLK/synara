@@ -332,6 +332,13 @@ describe("filterInboxItemsByInvolvement", () => {
 });
 
 describe("matchesPullRequestSearchQuery", () => {
+  it("matches a creator's display name when it differs from their login", () => {
+    const entry = makeEntry({ author: { ...makeActor("account-27"), name: "Ada Lovelace" } });
+    expect(matchesPullRequestSearchQuery(entry, "ada lovelace")).toBe(true);
+    expect(matchesPullRequestSearchQuery(entry, "lovelace")).toBe(true);
+    expect(matchesPullRequestSearchQuery(entry, "account-27")).toBe(true);
+    expect(matchesPullRequestSearchQuery(entry, "grace hopper")).toBe(false);
+  });
   it("matches title, repository, branch, and author case-insensitively", () => {
     const entry = makeEntry({
       title: "Fix Widget",
