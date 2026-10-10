@@ -14,6 +14,7 @@ describe("WsRequestAdmission", () => {
     expect(classifyWsRequest(ORCHESTRATION_WS_METHODS.repairState)).toBe("expensive-read");
     expect(classifyWsRequest(WS_METHODS.serverPrewarmVoice)).toBe("expensive-read");
     expect(classifyWsRequest(MODS_WS_METHODS.renderView)).toBe("mods");
+    expect(classifyWsRequest(MODS_WS_METHODS.mcpSignIn)).toBe("mods");
     expect(classifyWsRequest(MODS_WS_METHODS.list)).toBe("standard");
     expect(classifyWsRequest(WS_METHODS.projectsResolveWorkspaceFileReferences)).toBe(
       "expensive-read",

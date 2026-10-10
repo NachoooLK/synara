@@ -994,6 +994,8 @@ export function createWsNativeApi(): NativeApi {
         transport.request(MODS_WS_METHODS.dispatchUi, input, { timeoutMs: null }),
       export: (input) => transport.request(MODS_WS_METHODS.export, input),
       import: (input) => transport.request(MODS_WS_METHODS.import, input),
+      mcpSignIn: (input) => transport.request(MODS_WS_METHODS.mcpSignIn, input),
+      mcpSignOut: (input) => transport.request(MODS_WS_METHODS.mcpSignOut, input),
       // Subscribed on demand, not at startup: Stable refuses the stream.
       onEvent: (callback) =>
         transport.subscribe(MODS_WS_CHANNELS.event, (message) => callback(message.data)),

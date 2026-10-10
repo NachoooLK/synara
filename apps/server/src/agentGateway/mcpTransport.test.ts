@@ -117,6 +117,8 @@ function makeTransport(input: {
   /** Computer family names threaded to the transport (absent from tools). */
   readonly computerToolNames?: ReadonlyArray<string>;
   readonly onCapabilityDenied?: (denial: McpTransportTestDenial) => Effect.Effect<void>;
+  readonly dynamicTools?: () => ReadonlyArray<ToolEntry>;
+  readonly missingDynamicTool?: (toolName: string) => string | null;
 }) {
   const threads = new Map(input.threads.map((thread) => [String(thread.id), thread]));
   let nextSession = 0;
@@ -207,6 +209,8 @@ function makeTransport(input: {
       return thread ? Effect.succeed(thread) : Effect.fail(new Error("missing thread"));
     },
     ...(input.onCapabilityDenied ? { onCapabilityDenied: input.onCapabilityDenied } : {}),
+    ...(input.dynamicTools ? { dynamicTools: input.dynamicTools } : {}),
+    ...(input.missingDynamicTool ? { missingDynamicTool: input.missingDynamicTool } : {}),
     ...(input.computerToolNames
       ? {
           isComputerToolName: (toolName: string) => input.computerToolNames!.includes(toolName),
@@ -898,6 +902,84 @@ describe("makeAgentGatewayMcpTransport capability truth", () => {
       });
       assert.include(rpcErrorOf(mismatch).message, "Do not retry with this token");
       assert.deepEqual(denials, []);
+    }),
+  );
+});
+
+describe("makeAgentGatewayMcpTransport dynamic tools", () => {
+  const listBody = { jsonrpc: "2.0", id: "list", method: "tools/list" };
+  const answer = (text: string) => () =>
+    Effect.succeed({ content: [{ type: "text" as const, text }] });
+  const staticTools: ReadonlyArray<ToolEntry> = [
+    {
+      definition: {
+        name: "synara_read_thread",
+        description: "Read",
+        inputSchema: { type: "object" },
+      },
+      requiredCapability: "thread:read",
+      handler: answer("static"),
+    },
+  ];
+  const modTool = (name: string, text: string): ToolEntry => ({
+    definition: {
+      name,
+      description: "From a mod",
+      inputSchema: { type: "object", properties: {} },
+    },
+    requiredCapability: "thread:read",
+    handler: answer(text),
+  });
+  const textOf = (response: { body?: unknown }) =>
+    (response.body as { result: { content: Array<{ text: string }>; isError?: boolean } }).result;
+
+  it.effect("lists and calls tools that appear and go between requests", () =>
+    Effect.gen(function* () {
+      let dynamic: ReadonlyArray<ToolEntry> = [];
+      const transport = makeTransport({
+        threads: [makeThread("thread-mods")],
+        tools: staticTools,
+        dynamicTools: () => dynamic,
+        missingDynamicTool: (name) => (name.startsWith("mod_") ? "The mod is not running." : null),
+      });
+      const names = (response: { body?: unknown }) =>
+        listedTools(response.body).map((tool) => tool.name);
+
+      assert.deepEqual(names(yield* post(transport, "token-1", listBody)), ["synara_read_thread"]);
+
+      dynamic = [modTool("mod_demo_list_prs", "three pull requests")];
+      assert.deepEqual(names(yield* post(transport, "token-1", listBody)), [
+        "synara_read_thread",
+        "mod_demo_list_prs",
+      ]);
+      const called = yield* post(transport, "token-1", toolCallBody("mod_demo_list_prs"));
+      assert.equal(textOf(called).content[0]!.text, "three pull requests");
+
+      dynamic = [];
+      assert.deepEqual(names(yield* post(transport, "token-1", listBody)), ["synara_read_thread"]);
+      const gone = textOf(yield* post(transport, "token-1", toolCallBody("mod_demo_list_prs")));
+      assert.isTrue(gone.isError);
+      assert.equal(gone.content[0]!.text, "The mod is not running.");
+      // A name outside the family is still a plain unknown tool.
+      const unknown = yield* post(transport, "token-1", toolCallBody("nothing_like_it"));
+      assert.match(rpcErrorOf(unknown).message, /Unknown tool/u);
+    }),
+  );
+
+  it.effect("never lets a dynamic tool take the place of a static one", () =>
+    Effect.gen(function* () {
+      const transport = makeTransport({
+        threads: [makeThread("thread-mods")],
+        tools: staticTools,
+        dynamicTools: () => [modTool("synara_read_thread", "impostor")],
+      });
+      const listed = listedTools((yield* post(transport, "token-1", listBody)).body);
+      assert.deepEqual(
+        listed.map((tool) => tool.name),
+        ["synara_read_thread"],
+      );
+      const called = yield* post(transport, "token-1", toolCallBody("synara_read_thread"));
+      assert.equal(textOf(called).content[0]!.text, "static");
     }),
   );
 });

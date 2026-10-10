@@ -1,18 +1,21 @@
 // FILE: ModsSettingsPanel.tsx
 // Purpose: Settings → Mods. Lists the mods in the mods folder with their state and
 //          where their views live, lets the person enable (after a trust prompt),
-//          disable, reload and export each one, shows its log, and imports exported
-//          mods picked with Import… or dropped on the window.
+//          disable, reload and export each one and sign in to its MCP servers, shows
+//          its log, and imports exported mods picked with Import… or dropped on the
+//          window.
 // Layer: Settings panel (Beta-only; the section is hidden on Stable)
 
 import {
   MOD_BUNDLE_LIMITS,
   type ModLogEntry,
+  type ModMcpSignIn,
+  type ModPermission,
   type ModsImportInput,
   type ModStatus,
   type ModSummary,
 } from "@synara/contracts";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useId, useRef, useState } from "react";
 
 import {
   SettingsCard,
@@ -32,6 +35,7 @@ import {
   AlertDialogTitle,
 } from "~/components/ui/alert-dialog";
 import { Button } from "~/components/ui/button";
+import { Checkbox } from "~/components/ui/checkbox";
 import { DisclosureChevron } from "~/components/ui/DisclosureChevron";
 import { DisclosureRegion } from "~/components/ui/DisclosureRegion";
 import { Skeleton } from "~/components/ui/skeleton";
@@ -42,6 +46,7 @@ import { getRevealInFolderLabel } from "~/lib/fileReferenceContextMenu";
 import { FolderOpenIcon } from "~/lib/icons";
 import { revealFolderInShell } from "~/lib/revealFolder";
 import { cn, getNavigatorPlatform } from "~/lib/utils";
+import { startModMcpSignIn } from "~/mods/modMcpSignIn";
 import { useModsStore } from "~/mods/modsStore";
 import { describeModAdditions, describeModViews } from "~/mods/modsSnapshot.logic";
 import { useModFileDrop } from "~/mods/useModFileDrop";
@@ -54,6 +59,7 @@ const STATUS_LABELS: Record<ModStatus, string> = {
   starting: "Starting",
   running: "Running",
   error: "Error",
+  changed: "Changed",
 };
 
 const STATUS_DOT_CLASS_NAMES: Record<ModStatus, string> = {
@@ -61,6 +67,7 @@ const STATUS_DOT_CLASS_NAMES: Record<ModStatus, string> = {
   starting: "bg-amber-500",
   running: "bg-green-500",
   error: "bg-destructive",
+  changed: "bg-amber-500",
 };
 
 function errorText(error: unknown, fallback: string): string {
@@ -77,13 +84,53 @@ function ModPath({ path, className }: { path: string; className?: string }) {
   );
 }
 
+/** What each permission lets a mod do, as the person reads it before trusting the mod. */
+const PERMISSION_LABELS: Record<ModPermission, string> = {
+  prompts: "change the messages you send to agents",
+  approvals: "deny tool calls that wait for your approval",
+  tools: "give agents new tools",
+};
+
+function describeModPermissions(permissions: ReadonlyArray<ModPermission>): string | null {
+  if (permissions.length === 0) return null;
+  return permissions.map((permission) => PERMISSION_LABELS[permission]).join("; ");
+}
+
+/** What the trust prompt says about the mod's sign-ins; two servers on one host read as one. */
+function describeModSignIns(signIns: ReadonlyArray<ModMcpSignIn>): ReadonlyArray<string> {
+  return [
+    ...new Set(
+      signIns.map((signIn) =>
+        signIn.state === "needed"
+          ? `It will ask you to sign in to ${signIn.host}.`
+          : `It is signed in to ${signIn.host}, and keeps that sign-in.`,
+      ),
+    ),
+  ];
+}
+
 interface ModConfirmRequest {
   readonly title: string;
   readonly description: string;
   readonly confirmLabel: string;
+  /** A choice the person may tick before confirming. */
+  readonly option?: { readonly label: string; readonly description: string };
 }
 
-type ModConfirm = (request: ModConfirmRequest) => Promise<boolean>;
+interface ModConfirmAnswer {
+  readonly confirmed: boolean;
+  /** Whether the request's option was ticked; false when it had none. */
+  readonly optionChecked: boolean;
+}
+
+type ModConfirm = (request: ModConfirmRequest) => Promise<ModConfirmAnswer>;
+
+/** Lets a mod being written keep reloading; anything else stops when its files change. */
+const RELOAD_ON_CHANGE_OPTION = {
+  label: "Keep reloading it when its files change",
+  description:
+    "For a mod you or an agent you are watching is writing, until Synara restarts. Otherwise a change stops the mod and Synara asks you again.",
+} as const;
 
 /**
  * An in-app confirmation for trusting or replacing a mod. Unlike the desktop's native
@@ -92,22 +139,25 @@ type ModConfirm = (request: ModConfirmRequest) => Promise<boolean>;
 function useModConfirmDialog(): { readonly confirm: ModConfirm; readonly dialog: ReactNode } {
   const [state, setState] = useState<{
     readonly request: ModConfirmRequest;
-    readonly resolve: (confirmed: boolean) => void;
+    readonly resolve: (answer: ModConfirmAnswer) => void;
     readonly open: boolean;
   } | null>(null);
+  const [optionChecked, setOptionChecked] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const optionId = useId();
 
   const confirm: ModConfirm = (request) =>
-    new Promise<boolean>((resolve) => {
+    new Promise<ModConfirmAnswer>((resolve) => {
+      setOptionChecked(false);
       setState((previous) => {
-        if (previous?.open) previous.resolve(false);
+        if (previous?.open) previous.resolve({ confirmed: false, optionChecked: false });
         return { request, resolve, open: true };
       });
     });
   // The request stays set while the dialog animates out.
   const settle = (confirmed: boolean) => {
     if (!state?.open) return;
-    state.resolve(confirmed);
+    state.resolve({ confirmed, optionChecked: confirmed && optionChecked });
     setState({ ...state, open: false });
   };
 
@@ -123,6 +173,25 @@ function useModConfirmDialog(): { readonly confirm: ModConfirm; readonly dialog:
           <AlertDialogHeader>
             <AlertDialogTitle>{state.request.title}</AlertDialogTitle>
             <AlertDialogDescription>{state.request.description}</AlertDialogDescription>
+            {state.request.option ? (
+              <label
+                htmlFor={optionId}
+                className="flex cursor-pointer items-start gap-2 pt-2 text-ui text-foreground select-none"
+              >
+                <Checkbox
+                  id={optionId}
+                  className="mt-0.5"
+                  checked={optionChecked}
+                  onCheckedChange={(checked) => setOptionChecked(checked === true)}
+                />
+                <span className="space-y-0.5">
+                  <span className="block">{state.request.option.label}</span>
+                  <span className="block text-ui-sm text-muted-foreground">
+                    {state.request.option.description}
+                  </span>
+                </span>
+              </label>
+            ) : null}
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogClose ref={cancelRef} render={<Button variant="outline" size="sm" />}>
@@ -235,24 +304,118 @@ function announceEnabledMod(id: string, enabled: ModSummary | undefined): void {
   }
 }
 
+/** One MCP server of the mod that asks for a sign-in, with the button that starts or ends it. */
+function ModMcpSignInLine({ mod, signIn }: { mod: ModSummary; signIn: ModMcpSignIn }) {
+  const [pending, setPending] = useState(false);
+  const [pageOpened, setPageOpened] = useState(false);
+
+  const start = async () => {
+    setPending(true);
+    try {
+      if (await startModMcpSignIn(mod.id, signIn.server)) setPageOpened(true);
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const signOut = async () => {
+    setPending(true);
+    try {
+      useModsStore
+        .getState()
+        .setSnapshot(
+          await ensureNativeApi().mods.mcpSignOut({ id: mod.id, server: signIn.server }),
+        );
+    } catch (error) {
+      toastManager.add({
+        type: "error",
+        title: "Could not sign out",
+        description: errorText(error, "The server did not answer."),
+      });
+    } finally {
+      setPending(false);
+    }
+  };
+
+  if (signIn.state === "signed-in") {
+    const text = `Signed in to ${signIn.host}`;
+    return (
+      <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+        <span title={text} className="line-clamp-2 min-w-0 break-words">
+          {text}
+        </span>
+        <Button size="xs" variant="outline" disabled={pending} onClick={() => void signOut()}>
+          Sign out
+        </Button>
+      </span>
+    );
+  }
+
+  // The server starts a sign-in only for a mod that is on.
+  const blockedReason = !mod.enabled
+    ? "Turn the mod on first."
+    : mod.status === "changed"
+      ? "Trust the mod's changes first."
+      : null;
+  const text = `Needs you to sign in to ${signIn.host}${signIn.detail === null ? "" : `: ${signIn.detail}`}`;
+  return (
+    <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+      <span title={text} className="line-clamp-2 min-w-0 break-words">
+        {text}
+      </span>
+      {/* A disabled button takes no hover, so the reason sits on its wrapper. */}
+      <span title={blockedReason ?? undefined} className="inline-flex shrink-0">
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={pending || blockedReason !== null}
+          onClick={() => void start()}
+        >
+          {pageOpened ? "Open the page again" : "Sign in"}
+        </Button>
+      </span>
+      {pageOpened ? <span>Finish signing in in your browser.</span> : null}
+    </span>
+  );
+}
+
 function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
   const [pending, setPending] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
 
+  const permissionsText = describeModPermissions(mod.permissions);
+
+  const isChanged = mod.status === "changed";
+
+  // Also how a mod stopped because its files changed is trusted again.
   const setEnabled = async (enabled: boolean) => {
     const api = ensureNativeApi();
+    let reloadOnChange = false;
     if (enabled) {
-      const confirmed = await confirm({
-        title: `Enable the "${mod.id}" mod?`,
-        description:
-          "A mod runs with Synara's own access: it can read your projects and chats and run code on this computer. Only enable mods you wrote or trust.",
-        confirmLabel: "Enable mod",
+      const answer = await confirm({
+        title: isChanged
+          ? `Trust the changes to the "${mod.id}" mod?`
+          : `Enable the "${mod.id}" mod?`,
+        description: [
+          isChanged ? "Its files are not the ones you enabled." : null,
+          "A mod runs with Synara's own access: it can read your projects and chats and run code on this computer.",
+          permissionsText ? `This one also asks to ${permissionsText}.` : null,
+          ...describeModSignIns(mod.mcpSignIns),
+          "Only enable mods you wrote or trust.",
+        ]
+          .filter((line) => line !== null)
+          .join(" "),
+        confirmLabel: isChanged ? "Trust changes" : "Enable mod",
+        option: RELOAD_ON_CHANGE_OPTION,
       });
-      if (!confirmed) return;
+      if (!answer.confirmed) return;
+      reloadOnChange = answer.optionChecked;
     }
     setPending(true);
     try {
-      const snapshot = await api.mods.setEnabled({ id: mod.id, enabled });
+      const snapshot = await api.mods.setEnabled(
+        enabled ? { id: mod.id, enabled, reloadOnChange } : { id: mod.id, enabled },
+      );
       useModsStore.getState().setSnapshot(snapshot);
       if (enabled) {
         announceEnabledMod(
@@ -320,6 +483,11 @@ function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
       : null,
     mod.views.length > 0 ? `Views: ${describeModViews(mod)}` : null,
     mod.mcpServers.length > 0 ? `MCP: ${mod.mcpServers.join(", ")}` : null,
+    mod.tools.length > 0
+      ? `Tools for agents: ${mod.tools.map((tool) => tool.servedName).join(", ")}`
+      : null,
+    permissionsText ? `May ${permissionsText}` : null,
+    mod.reloadsOnChange ? "Reloads when its files change" : null,
   ].filter((detail): detail is string => detail !== null);
 
   return (
@@ -341,9 +509,19 @@ function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
         <span className="flex min-w-0 flex-col gap-1">
           {mod.statusText ? <span className="text-foreground">{mod.statusText}</span> : null}
           {details.length > 0 ? <span>{details.join(" · ")}</span> : null}
+          {mod.mcpSignIns.map((signIn) => (
+            // The state is part of the key, so the browser hint goes once the sign-in arrives.
+            <ModMcpSignInLine key={`${signIn.server}:${signIn.state}`} mod={mod} signIn={signIn} />
+          ))}
           {mod.error ? (
             <span className="line-clamp-4 break-words whitespace-pre-wrap text-destructive">
               {mod.error}
+            </span>
+          ) : null}
+          {isChanged ? (
+            <span className="text-warning">
+              Its files changed since you enabled it, so it is stopped. Trust the changes to run it
+              again.
             </span>
           ) : null}
           <ModPath path={mod.path} />
@@ -371,6 +549,11 @@ function ModRow({ mod, confirm }: { mod: ModSummary; confirm: ModConfirm }) {
           <Button size="xs" variant="outline" disabled={pending} onClick={() => void exportMod()}>
             Export
           </Button>
+          {isChanged ? (
+            <Button size="xs" disabled={pending} onClick={() => void setEnabled(true)}>
+              Trust changes
+            </Button>
+          ) : null}
           <Switch
             checked={mod.enabled}
             disabled={pending}
@@ -410,7 +593,7 @@ async function importModFile(file: File, confirm: ModConfirm): Promise<void> {
     const mods = useModsStore.getState().snapshot?.mods ?? [];
     const installed = name !== null && mods.some((mod) => mod.id === name);
     if (installed) {
-      const confirmed = await confirm({
+      const { confirmed } = await confirm({
         title: `Replace the installed "${name}" mod?`,
         description:
           "Its files will be replaced with the ones in this file and it will stay off until you enable it again. What it has saved stays.",
@@ -551,7 +734,7 @@ export function ModsSettingsPanel() {
       <SettingsSection title="Mods folder">
         <SettingsRow
           title="Location"
-          description="Each mod is a folder here with .synara-mod/mod.json and hooks/hooks.json. Synara reloads a mod when its files change."
+          description="Each mod is a folder here with .synara-mod/mod.json and hooks/hooks.json."
           status={
             snapshot ? (
               <ModPath path={snapshot.modsDir} className="text-ui-sm text-muted-foreground" />

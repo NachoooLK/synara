@@ -120,6 +120,17 @@ export function makeAgentGatewayMcpTransport(input: {
    */
   readonly isComputerToolName?: (toolName: string) => boolean;
   readonly computerControlCapability?: AgentGatewayCapability;
+  /**
+   * Tools that come and go while the server runs (the ones mods give to agents),
+   * read on every listing and call. A dynamic tool never replaces a static one
+   * of the same name.
+   */
+  readonly dynamicTools?: () => ReadonlyArray<ToolEntry>;
+  /**
+   * For a name no tool answers to: the error to give when it belongs to the
+   * dynamic family (its source went away), or null for a plain unknown tool.
+   */
+  readonly missingDynamicTool?: (toolName: string) => string | null;
 }): AgentGatewayShape["handleMcpPost"] {
   const toolsByName = new Map(input.tools.map((tool) => [tool.definition.name, tool]));
   // The catalog is immutable after construction, so the sanitized `tools/list`
@@ -150,7 +161,15 @@ export function makeAgentGatewayMcpTransport(input: {
           return jsonRpcResult(request.id, {});
         case "tools/list":
           return jsonRpcResult(request.id, {
-            tools: filterToolsByCapability(input.tools, context.callerCapabilities)
+            tools: filterToolsByCapability(
+              [
+                ...input.tools,
+                ...(input.dynamicTools?.() ?? []).filter(
+                  (tool) => !toolsByName.has(tool.definition.name),
+                ),
+              ],
+              context.callerCapabilities,
+            )
               // Discovery-only tools stay callable by exact name — toolsByName
               // is built from the unfiltered catalog — but do not advertise.
               .filter((tool) => tool.discoveryOnly !== true)
@@ -188,8 +207,16 @@ export function makeAgentGatewayMcpTransport(input: {
                 ),
               ),
             );
-          const tool = toolsByName.get(toolName);
+          const tool =
+            toolsByName.get(toolName) ??
+            input.dynamicTools?.().find((entry) => entry.definition.name === toolName);
           if (!tool) {
+            // A session may hold the name of a tool whose source has stopped;
+            // tell the agent that, not that it mistyped.
+            const missing = input.missingDynamicTool?.(toolName) ?? null;
+            if (missing !== null) {
+              return jsonRpcResult(request.id, mcpToolResultError(missing));
+            }
             // Entirely-unknown names stay INVALID_PARAMS — except a computer
             // tool the caller's session was never granted: that is a
             // capability truth, not a typo, so it denies like a known one.

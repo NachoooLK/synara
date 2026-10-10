@@ -117,6 +117,119 @@ export interface ModEvents {
     /** `text` is shown to the person as a toast. */
     readonly result: { readonly text?: string } | void;
   };
+
+  // ── Agents: watching (no permission needed; nothing returned changes anything) ──
+  // These say when things happen, never what was written or run.
+
+  readonly "thread.created": {
+    readonly input: {
+      readonly threadId: string;
+      readonly projectId: string;
+      readonly title: string;
+    };
+    readonly result: void;
+  };
+  /** A turn was asked for: by the person, an automation or another agent. */
+  readonly "turn.started": {
+    readonly input: {
+      readonly threadId: string;
+      readonly origin: "user" | "automation" | "agent";
+    };
+    readonly result: void;
+  };
+  readonly "turn.completed": {
+    readonly input: {
+      readonly threadId: string;
+      readonly turnId: string | null;
+      /** "completed", "failed", "interrupted" or "cancelled". */
+      readonly state: string;
+    };
+    readonly result: void;
+  };
+  readonly "tool.started": { readonly input: ModToolActivity; readonly result: void };
+  readonly "tool.completed": { readonly input: ModToolActivity; readonly result: void };
+
+  // ── Agents: acting (each needs its permission in mod.json) ───────────
+
+  /**
+   * Needs the "prompts" permission. A message the person is sending to an
+   * agent, before Synara adds its own context. Return `{ text }` to send
+   * something else, `{ block }` to stop it and tell the person why, or nothing.
+   * The thread keeps the message as the person wrote it. Mods run one after
+   * another, each seeing what the previous one returned. Finish within 10
+   * seconds or the message goes without your change. Not called for messages
+   * agents and automations send.
+   */
+  readonly "prompt.submit": {
+    readonly input: {
+      readonly threadId: string;
+      readonly projectId: string | null;
+      readonly provider: string;
+      readonly model: string;
+      readonly text: string;
+    };
+    readonly result: { readonly text?: string; readonly block?: string } | void;
+  };
+  /**
+   * Needs the "approvals" permission. A tool call that waits for the person's
+   * approval. Return `{ deny: "why" }` to decline it for them; a mod cannot
+   * approve. Answer within 5 seconds or it stays with the person, who may also
+   * answer first. Never called in full access, where nothing asks for
+   * approval, nor for providers that do not ask (Pi, Antigravity).
+   */
+  readonly "approval.requested": {
+    readonly input: {
+      readonly threadId: string;
+      readonly requestId: string;
+      readonly provider: string;
+      /** "command", "file-read", "file-change", "permissions" or "tool". */
+      readonly kind: string;
+      readonly toolName: string | null;
+      readonly title: string | null;
+      /** The command line or path the person is shown. Providers may shorten a long one. */
+      readonly detail: string | null;
+    };
+    readonly result: { readonly deny?: string } | void;
+  };
+  /**
+   * Needs the "tools" permission. An agent called a tool this mod registered
+   * with `$.tool.register`. What the hook returns is the tool's result: text or
+   * plain JSON, up to 100,000 characters. Match on the tool:
+   * `on("tool.call", { tool: "list_prs" }, …)`.
+   */
+  readonly "tool.call": {
+    readonly input: {
+      readonly tool: string;
+      readonly arguments: Readonly<Record<string, unknown>>;
+      /** The thread whose agent called the tool. */
+      readonly threadId: string | null;
+    };
+    readonly result: unknown;
+  };
+}
+
+/** A tool an agent ran, as mods may watch it: what and when, not its arguments or output. */
+export interface ModToolActivity {
+  readonly threadId: string;
+  readonly turnId: string | null;
+  /** The tool's title as the provider reports it, when it does. */
+  readonly tool: string | null;
+  /** The kind of work: "command_execution", "file_change", "mcp_tool_call", … */
+  readonly kind: string | null;
+  readonly status: string | null;
+}
+
+/** A tool a mod gives to agents. */
+export interface ModToolDefinition {
+  /** Lowercase letters, digits and underscores; agents see it as `mod_<mod>_<name>`. */
+  readonly name: string;
+  /** What the tool does and when to use it; agents read this. Up to 1,024 characters. */
+  readonly description: string;
+  /**
+   * JSON Schema of the arguments: `{ type: "object", properties: { … } }`,
+   * without `$ref`, `anyOf`, `oneOf` or `allOf`. Defaults to no arguments.
+   */
+  readonly inputSchema?: Readonly<Record<string, unknown>>;
 }
 
 export type ModEventName = keyof ModEvents;
@@ -187,6 +300,14 @@ export interface ModApi {
     readonly register: (command: ModCommandDefinition) => Promise<void>;
     readonly unregister: (name: string) => Promise<void>;
   };
+  /**
+   * Tools for agents; needs the "tools" permission. Up to 10 per mod. Sessions
+   * that read the tool list only when they start see the tools registered by then.
+   */
+  readonly tool: {
+    readonly register: (tool: ModToolDefinition) => Promise<void>;
+    readonly unregister: (name: string) => Promise<void>;
+  };
   readonly threads: {
     /** Newest first; archived threads only when asked. */
     readonly list: (options?: {
@@ -203,8 +324,14 @@ export interface ModApi {
   /**
    * The MCP servers the mod's mod.json declares under "mcpServers", by name.
    * Synara starts a local server on first use and stops it with the mod.
+   *
+   * A remote server may ask the person to sign in. Synara handles that and keeps
+   * the token; until they have, calls reject with an error whose `code` is
+   * "mcp_sign_in_needed", and Synara shows a Sign in button in the mod's view.
    */
   readonly mcp: {
+    /** Whether the server waits for the person to sign in. It does not call the server. */
+    readonly status: (server: string) => Promise<"ready" | "sign-in-needed">;
     readonly tools: (server: string) => Promise<ModMcpTool[]>;
     readonly call: (
       server: string,

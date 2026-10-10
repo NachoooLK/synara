@@ -64,6 +64,9 @@ import type {
   ModsExportResult,
   ModsImportInput,
   ModsImportResult,
+  ModsMcpSignInInput,
+  ModsMcpSignInResult,
+  ModsMcpSignOutInput,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
@@ -1511,6 +1514,10 @@ export interface NativeApi {
     export: (input: ModsExportInput) => Promise<ModsExportResult>;
     /** Installs an exported mod, turned off until the person enables it. */
     import: (input: ModsImportInput) => Promise<ModsImportResult>;
+    /** Starts a sign-in to one of a mod's MCP servers and returns the page to open. */
+    mcpSignIn: (input: ModsMcpSignInInput) => Promise<ModsMcpSignInResult>;
+    /** Forgets a mod's sign-in to one of its MCP servers. */
+    mcpSignOut: (input: ModsMcpSignOutInput) => Promise<ModsSnapshot>;
     /** Opens the mods stream while at least one callback listens. */
     onEvent: (callback: (event: ModsStreamEvent) => void) => () => void;
   };

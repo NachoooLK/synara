@@ -18,8 +18,11 @@ import {
   ModViewSite,
   ThreadId,
   type ModCommand,
+  type ModAgentToolSummary,
   type ModLogEntry,
   type ModLogLevel,
+  type ModMcpServerConfig,
+  type ModPermission,
   type ModsDispatchUiResult,
   type ModsExportResult,
   type ModsImportResult,
@@ -37,11 +40,12 @@ import {
 import { Schema } from "effect";
 
 import type { ModProject, ModThread } from "./modApi.ts";
-import { packModFolder, readModBundle, writeModFiles } from "./modBundle.ts";
+import { hashModFolder, packModFolder, readModBundle, writeModFiles } from "./modBundle.ts";
 import { listModFolders, readModDefinition, type ModDefinition } from "./modDiscovery.ts";
 import { ModWorkerHost, resolveModWorkerUrl } from "./modWorkerHost.ts";
 import { normalizeModUiTree } from "./modUiTree.ts";
 import { ModMcpClient } from "./modMcpClient.ts";
+import { makeMemoryModSecretVault, ModMcpSignIns, type ModSecretVault } from "./modMcpSignIn.ts";
 
 const MOD_LOG_LIMIT = 200;
 const MOD_LOG_TEXT_LIMIT = 4_000;
@@ -65,10 +69,32 @@ const MOD_INVALIDATE_COALESCE_MS = 50;
 const MOD_STORE_FLUSH_MS = 250;
 /** Toasts and log lines a mod may emit per window before the rest are dropped. */
 const MOD_RATE_WINDOW_MS = 10_000;
+/** Tools one mod may give to agents; each costs tokens in every session. */
+const MOD_TOOL_LIMIT = 10;
+const MOD_TOOL_DESCRIPTION_LIMIT = 1_024;
+const MOD_TOOL_SCHEMA_BYTES_LIMIT = 8_000;
+/** Providers cap tool names at 64 characters; this leaves room for the MCP server prefix. */
+const MOD_TOOL_SERVED_NAME_LIMIT = 48;
+/** How long `prompt.submit` hooks may hold a message before it is sent as written. */
+const MOD_PROMPT_HOOKS_TIMEOUT_MS = 10_000;
+/** How long `approval.requested` hooks have to deny a request before it is left to the person. */
+const MOD_APPROVAL_HOOKS_TIMEOUT_MS = 5_000;
+/** Observed events one mod may be handling at once; more are dropped, not queued. */
+const MOD_OBSERVE_IN_FLIGHT_LIMIT = 8;
+
+/** The permission a mod's manifest must list for its hooks on an event to run. */
+const EVENT_PERMISSIONS: Readonly<Record<string, ModPermission>> = {
+  "prompt.submit": "prompts",
+  "approval.requested": "approvals",
+  "tool.call": "tools",
+};
+
+const isToolName = (value: unknown): value is string =>
+  typeof value === "string" && /^[a-z][a-z0-9_]{0,31}$/u.test(value);
 const MOD_TOAST_RATE_LIMIT = 5;
 const MOD_LOG_RATE_LIMIT = 200;
 const MOD_URL_LIMIT = 2_048;
-const REGISTRY_VERSION = 1;
+const REGISTRY_VERSION = 2;
 /** Hidden folder in the mods folder that keeps versions an import replaced. */
 const MOD_REPLACED_DIRECTORY = ".replaced";
 
@@ -128,9 +154,49 @@ export interface ModManagerOptions {
   readonly watch?: boolean;
   /** The icon names Synara ships; views and trees naming another icon draw without it. */
   readonly iconNames?: ReadonlySet<string> | null;
+  /** Where sign-ins to MCP servers are kept. Without one they last until Synara stops. */
+  readonly secrets?: ModSecretVault;
+  /** The port sign-ins return to. Tests pass 0 for any free port. */
+  readonly signInPort?: number;
 }
 
 export type ModViewSource = ModView["refreshOn"][number];
+
+/** A message a person is sending to an agent, as `prompt.submit` hooks see it. */
+export interface ModPromptInput {
+  readonly threadId: string;
+  readonly projectId: string | null;
+  readonly provider: string;
+  readonly model: string;
+  readonly text: string;
+}
+
+export type ModPromptOutcome =
+  /** The text to send, and the mods that changed it (empty when none did). */
+  | { readonly kind: "send"; readonly text: string; readonly changedBy: ReadonlyArray<string> }
+  /** A mod stopped the message. */
+  | { readonly kind: "block"; readonly modId: string; readonly reason: string };
+
+/** A tool call waiting for the person's approval, as `approval.requested` hooks see it. */
+export interface ModApprovalInput {
+  readonly threadId: string;
+  readonly requestId: string;
+  readonly provider: string;
+  /** What kind of thing wants approval: "command", "file-read", "file-change", "permissions", "tool". */
+  readonly kind: string;
+  /** The tool's name, when the provider names it. */
+  readonly toolName: string | null;
+  /** The card's title, when the provider gives one. */
+  readonly title: string | null;
+  /** What the person is shown: the command line or the path. Providers may shorten it. */
+  readonly detail: string | null;
+}
+
+/** A tool a mod gives to agents. */
+export interface ModAgentTool extends ModAgentToolSummary {
+  readonly modId: string;
+  readonly inputSchema: Record<string, unknown>;
+}
 
 export class ModManagerError extends Error {
   override readonly name = "ModManagerError";
@@ -138,6 +204,8 @@ export class ModManagerError extends Error {
 
 interface ModRecord {
   definition: ModDefinition;
+  /** The fingerprint of the mod's files as last read; null when they could not be read. */
+  contentHash: string | null;
   enabled: boolean;
   status: ModStatus;
   runtimeError: string | null;
@@ -146,6 +214,9 @@ interface ModRecord {
   generation: number;
   readonly commands: Map<string, ModCommand>;
   readonly views: Map<string, ModView>;
+  readonly tools: Map<string, ModAgentTool>;
+  /** Observed events this mod is handling right now. */
+  observing: number;
   /** Connections to the MCP servers the manifest declares, opened on first use. */
   readonly mcp: Map<string, ModMcpClient>;
   statusText: string | null;
@@ -259,19 +330,43 @@ export class ModManager {
   private readonly storeFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly invalidateTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly refreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private enabledIds = new Set<string>();
+  /**
+   * The enabled mods, each with the fingerprint of the files the person trusted
+   * (null for a mod enabled before fingerprints: it is taken on the next start).
+   */
+  private trusted = new Map<string, string | null>();
+  /** Mods the person let reload as their files change; forgotten when Synara restarts. */
+  private readonly reloadGrants = new Set<string>();
   private registryWrite: Promise<void> = Promise.resolve();
   /** Imports run one after another, so two cannot install the same name at once. */
   private imports: Promise<unknown> = Promise.resolve();
   private watcher: FSWatcher | null = null;
+  /** Watchers on the real folders of linked mods, which change outside the mods folder. */
+  private readonly linkWatchers = new Map<string, { target: string; watcher: FSWatcher }>();
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private workerUrl: URL | null;
+  /** The person's sign-ins to the remote MCP servers of mods. */
+  private readonly signIns: ModMcpSignIns;
   private started = false;
   private stopped = false;
 
   constructor(options: ModManagerOptions) {
     this.options = options;
     this.workerUrl = options.workerUrl ?? null;
+    this.signIns = new ModMcpSignIns({
+      vault: options.secrets ?? makeMemoryModSecretVault(),
+      port: options.signInPort,
+      onChange: (modId, redraw) => {
+        if (this.stopped) return;
+        this.scheduleSnapshot();
+        // After a sign-in the views can draw what the server refused before.
+        if (redraw && this.records.has(modId)) this.scheduleInvalidate(modId, null);
+      },
+      log: (modId, level, message) => {
+        const record = this.records.get(modId);
+        if (record) this.appendLog(record, level, message);
+      },
+    });
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -282,17 +377,23 @@ export class ModManager {
     this.started = true;
     await fs.mkdir(this.options.modsDir, { recursive: true });
     await fs.mkdir(this.storeDir(), { recursive: true });
-    this.enabledIds = await this.readRegistry();
+    const stored = await this.readRegistry();
     const folders = await listModFolders(this.options.modsDir);
     // Trust belongs to a mod that exists; a later folder with that name is new code.
     const present = new Set(folders.map((folder) => path.basename(folder)));
-    const kept = new Set([...this.enabledIds].filter((id) => present.has(id)));
-    if (kept.size !== this.enabledIds.size) await this.writeRegistry(kept);
-    this.enabledIds = kept;
+    const kept = new Map([...stored].filter(([id]) => present.has(id)));
+    if (kept.size !== stored.size) await this.writeRegistry(kept);
+    this.trusted = kept;
     for (const folder of folders) {
       await this.refreshMod(path.basename(folder), { restart: false });
     }
-    if (this.options.watch !== false) this.startWatching();
+    if (this.options.watch !== false) {
+      this.startWatching();
+      // The mods read above were found before there was a watcher to hang their links on.
+      for (const record of this.records.values()) {
+        await this.watchLinkedMod(record.definition.id, record.definition.root);
+      }
+    }
   }
 
   /** Resolves once every start and stop that has been asked for has finished. */
@@ -305,6 +406,8 @@ export class ModManager {
     this.stopped = true;
     this.watcher?.close();
     this.watcher = null;
+    for (const link of this.linkWatchers.values()) link.watcher.close();
+    this.linkWatchers.clear();
     for (const timer of this.refreshTimers.values()) clearTimeout(timer);
     this.refreshTimers.clear();
     for (const timer of this.invalidateTimers.values()) clearTimeout(timer);
@@ -312,6 +415,7 @@ export class ModManager {
     // Deleting the entry being visited is safe while iterating a Map.
     for (const modId of this.storeFlushTimers.keys()) this.flushStore(modId);
     if (this.snapshotTimer !== null) clearTimeout(this.snapshotTimer);
+    await this.signIns.stop();
     await Promise.all(
       [...this.records.values()].map((record) =>
         this.transition(record, () => this.stopRecord(record)),
@@ -339,21 +443,54 @@ export class ModManager {
     };
   }
 
-  async setEnabled(id: string, enabled: boolean): Promise<ModsSnapshot> {
+  /**
+   * Turns a mod on or off. Turning it on trusts its files as they are now,
+   * also for a mod that is already on and was stopped because they changed.
+   * `reloadOnChange` lets it keep reloading as they change, for a mod being
+   * written; otherwise a change stops it until it is trusted again.
+   */
+  async setEnabled(
+    id: string,
+    enabled: boolean,
+    options: { readonly reloadOnChange?: boolean | undefined } = {},
+  ): Promise<ModsSnapshot> {
     const record = this.requireRecord(id);
-    if (record.enabled !== enabled) {
-      // Save first: if the disk refuses, nothing changed and the toggle can be tried again.
-      const next = new Set(this.enabledIds);
-      if (enabled) next.add(id);
-      else next.delete(id);
-      await this.writeRegistry(next);
-      this.enabledIds = next;
-      record.enabled = enabled;
-      await this.transition(record, () =>
-        enabled ? this.startRecord(record) : this.stopRecord(record),
-      );
+    if (!enabled) {
+      this.reloadGrants.delete(id);
+      if (record.enabled || this.trusted.has(id)) {
+        // Save first: if the disk refuses, nothing changed and the toggle can be tried again.
+        const next = new Map(this.trusted);
+        next.delete(id);
+        await this.writeRegistry(next);
+        this.trusted = next;
+        record.enabled = false;
+        await this.transition(record, () => this.stopRecord(record));
+      }
+      return this.snapshot();
     }
+    const hash = await this.readContentHash(record);
+    const alreadyRunsIt =
+      record.enabled &&
+      (record.status === "running" || record.status === "starting") &&
+      this.trusted.get(id) === hash;
+    if (this.trusted.get(id) !== hash || !this.trusted.has(id)) {
+      const next = new Map(this.trusted);
+      next.set(id, hash);
+      await this.writeRegistry(next);
+      this.trusted = next;
+    }
+    if (options.reloadOnChange === true) this.reloadGrants.add(id);
+    else if (options.reloadOnChange === false) this.reloadGrants.delete(id);
+    record.enabled = true;
+    if (alreadyRunsIt) this.scheduleSnapshot();
+    else await this.transition(record, () => this.startRecord(record));
     return this.snapshot();
+  }
+
+  /** The fingerprint of a mod's files now; null when its folder cannot be read whole. */
+  private async readContentHash(record: ModRecord): Promise<string | null> {
+    record.contentHash = await hashModFolder(record.definition.root).catch(() => null);
+    return record.contentHash;
   }
 
   /** Reads the mod's files again and, when it is enabled, restarts it. */
@@ -361,6 +498,31 @@ export class ModManager {
     this.requireRecord(id);
     await this.refreshMod(id, { restart: true });
     await this.records.get(id)?.transition;
+    return this.snapshot();
+  }
+
+  /**
+   * Starts the person's sign-in to one of a mod's MCP servers and returns the
+   * page to open. Only for a mod they trust as it is now: the sign-in gives the
+   * mod's code their account on that server.
+   */
+  async beginMcpSignIn(id: string, server: string): Promise<{ url: string }> {
+    const record = this.requireRecord(id);
+    if (record.status === "changed") {
+      throw new ModManagerError(
+        `The "${id}" mod changed since it was enabled. Trust its changes before signing in for it.`,
+      );
+    }
+    if (!record.enabled) {
+      throw new ModManagerError(`Turn the "${id}" mod on before signing in for it.`);
+    }
+    const [name, config] = this.mcpServer(record, server);
+    return { url: await this.signIns.begin(id, name, config) };
+  }
+
+  async signOutMcp(id: string, server: string): Promise<ModsSnapshot> {
+    const [name] = this.mcpServer(this.requireRecord(id), server);
+    await this.signIns.signOut(id, name);
     return this.snapshot();
   }
 
@@ -516,6 +678,253 @@ export class ModManager {
     return entries.length === 0 ? fallback(input) : this.runChain(event, input, entries, fallback);
   }
 
+  // ── Agent hooks ────────────────────────────────────────────────────
+
+  /** Whether a running mod hooks `event` and holds the permission it needs. */
+  hasHooks(event: string): boolean {
+    for (const record of this.records.values()) {
+      const host = record.host;
+      if (host === null || !host.isAlive) continue;
+      const permission = EVENT_PERMISSIONS[event];
+      if (permission !== undefined && !this.hasPermission(record, permission)) continue;
+      if (host.hooks.some((hook) => hook.event === event)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Tells running mods that something happened. Each hook runs on its own and
+   * nothing it returns changes anything; a mod already busy with too many
+   * events misses this one.
+   */
+  observe(event: string, input: unknown): void {
+    for (const entry of this.allHooksOf(event, input)) {
+      const { record } = entry;
+      if (record.observing >= MOD_OBSERVE_IN_FLIGHT_LIMIT) continue;
+      record.observing += 1;
+      void entry.host
+        .invoke(entry.hookId, input, async () => undefined)
+        .then((outcome) => {
+          if (outcome.kind === "error") {
+            this.appendLog(record, "error", `A "${event}" hook failed: ${outcome.error}`);
+          }
+        })
+        .finally(() => {
+          record.observing -= 1;
+        });
+    }
+  }
+
+  /**
+   * Passes a message a person is sending through the `prompt.submit` hooks of
+   * the mods allowed to change it, one after another. A hook returns `{ text }`
+   * to change the message, `{ block }` to stop it, or nothing. A hook that
+   * fails, takes too long or returns text that does not fit is skipped: the
+   * message is never lost to a mod's mistake.
+   */
+  async submitPrompt(input: ModPromptInput, maxChars: number): Promise<ModPromptOutcome> {
+    let current = input;
+    const changedBy: string[] = [];
+    const deadline = Date.now() + MOD_PROMPT_HOOKS_TIMEOUT_MS;
+    for (const entry of this.allHooksOf("prompt.submit", input)) {
+      const { record } = entry;
+      const modId = record.definition.id;
+      const remaining = deadline - Date.now();
+      const snapshot = current;
+      const outcome =
+        remaining <= 0
+          ? undefined
+          : await withTimeout(
+              entry.host.invoke(entry.hookId, snapshot, async () => ({ text: snapshot.text })),
+              remaining,
+            );
+      if (outcome === undefined) {
+        this.appendLog(
+          record,
+          "warn",
+          `A "prompt.submit" hook took longer than ${MOD_PROMPT_HOOKS_TIMEOUT_MS / 1000} s; the message was sent without it.`,
+        );
+        break;
+      }
+      if (outcome.kind === "error") {
+        this.appendLog(record, "error", `A "prompt.submit" hook failed: ${outcome.error}`);
+        continue;
+      }
+      const result = (outcome.value ?? {}) as { readonly text?: unknown; readonly block?: unknown };
+      if (typeof result.block === "string" && result.block.trim().length > 0) {
+        const reason = clampText(result.block.trim(), MOD_TOAST_TEXT_LIMIT);
+        this.appendLog(record, "info", `Stopped a message: ${reason}`);
+        return { kind: "block", modId, reason };
+      }
+      if (result.text === undefined || result.text === current.text) continue;
+      if (typeof result.text !== "string" || result.text.trim().length === 0) {
+        this.appendLog(record, "warn", 'A "prompt.submit" hook returned no text; ignored.');
+        continue;
+      }
+      if (result.text.length > maxChars) {
+        this.appendLog(
+          record,
+          "warn",
+          `A "prompt.submit" hook returned ${result.text.length} characters, more than the ${maxChars} that fit; ignored.`,
+        );
+        continue;
+      }
+      current = { ...current, text: result.text };
+      changedBy.push(modId);
+    }
+    return { kind: "send", text: current.text, changedBy };
+  }
+
+  /**
+   * Asks the mods allowed to review approvals whether to deny a tool call that
+   * waits for the person. A mod can only deny; with no denial in time the
+   * request stays with the person, as if no mod were there.
+   */
+  async reviewApproval(
+    input: ModApprovalInput,
+  ): Promise<{ readonly modId: string; readonly reason: string } | null> {
+    const deadline = Date.now() + MOD_APPROVAL_HOOKS_TIMEOUT_MS;
+    for (const entry of this.allHooksOf("approval.requested", input)) {
+      const { record } = entry;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const outcome = await withTimeout(
+        entry.host.invoke(entry.hookId, input, async () => undefined),
+        remaining,
+      );
+      if (outcome === undefined) break;
+      if (outcome.kind === "error") {
+        this.appendLog(record, "error", `An "approval.requested" hook failed: ${outcome.error}`);
+        continue;
+      }
+      const deny = (outcome.value as { readonly deny?: unknown } | null | undefined)?.deny;
+      if (typeof deny === "string" && deny.trim().length > 0) {
+        const reason = clampText(deny.trim(), MOD_TOAST_TEXT_LIMIT);
+        this.appendLog(record, "info", `Denied a ${input.kind} approval: ${reason}`);
+        return { modId: record.definition.id, reason };
+      }
+    }
+    return null;
+  }
+
+  /** The tools running mods give to agents. */
+  agentTools(): ModAgentTool[] {
+    return [...this.records.values()]
+      .filter((record) => record.status === "running")
+      .toSorted((left, right) => left.definition.id.localeCompare(right.definition.id))
+      .flatMap((record) => [...record.tools.values()]);
+  }
+
+  /** Runs a mod's tool for an agent; the `tool.call` hook's answer is the result. */
+  async callAgentTool(
+    servedName: string,
+    args: Record<string, unknown>,
+    threadId: string | null,
+  ): Promise<unknown> {
+    for (const record of this.records.values()) {
+      const tool = [...record.tools.values()].find((entry) => entry.servedName === servedName);
+      if (!tool) continue;
+      const input = { tool: tool.name, arguments: args, threadId };
+      const entries = this.hooksOf(record, "tool.call", input);
+      if (entries.length === 0) {
+        throw new ModManagerError(
+          `The "${record.definition.id}" mod has no "tool.call" hook for "${tool.name}".`,
+        );
+      }
+      const failures: string[] = [];
+      const result = await this.runChain(
+        "tool.call",
+        input,
+        entries,
+        async () => undefined,
+        failures,
+      );
+      if (result === undefined && failures.length > 0) {
+        throw new ModManagerError(`The "${tool.name}" tool failed: ${failures[0]}`);
+      }
+      return result ?? null;
+    }
+    throw new ModManagerError(
+      `No running mod has a tool named "${servedName}". Its mod may be off or reloading.`,
+    );
+  }
+
+  /** Checks a tool a mod registers; every provider must be able to take its name and schema. */
+  private checkAgentTool(record: ModRecord, value: unknown): ModAgentTool {
+    const definition = (value ?? {}) as Partial<
+      Record<"name" | "description" | "inputSchema", unknown>
+    >;
+    const call = "$.tool.register({ name, description, inputSchema })";
+    if (!isToolName(definition.name)) {
+      throw new ModManagerError(
+        `${call}: name must be lowercase letters, digits and underscores, starting with a letter, up to 32 characters.`,
+      );
+    }
+    const modId = record.definition.id;
+    const servedName = `mod_${modId.replaceAll("-", "_")}_${definition.name}`;
+    if (servedName.length > MOD_TOOL_SERVED_NAME_LIMIT) {
+      throw new ModManagerError(
+        `${call}: "${servedName}" is longer than ${MOD_TOOL_SERVED_NAME_LIMIT} characters; shorten the tool's name.`,
+      );
+    }
+    for (const other of this.records.values()) {
+      if (other === record) continue;
+      if ([...other.tools.values()].some((tool) => tool.servedName === servedName)) {
+        throw new ModManagerError(
+          `${call}: the "${other.definition.id}" mod already serves a tool as "${servedName}".`,
+        );
+      }
+    }
+    if (!record.tools.has(definition.name) && record.tools.size >= MOD_TOOL_LIMIT) {
+      throw new ModManagerError(`A mod can give agents at most ${MOD_TOOL_LIMIT} tools.`);
+    }
+    const description = requireText(
+      definition.description,
+      `${call}: description`,
+      MOD_TOOL_DESCRIPTION_LIMIT,
+    ).trim();
+    const schema = definition.inputSchema ?? { type: "object", properties: {} };
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(schema);
+    } catch {
+      throw new ModManagerError(`${call}: inputSchema must be plain JSON.`);
+    }
+    const root = schema as Record<string, unknown>;
+    if (
+      schema === null ||
+      typeof schema !== "object" ||
+      Array.isArray(schema) ||
+      root.type !== "object" ||
+      (root.properties !== undefined &&
+        (root.properties === null ||
+          typeof root.properties !== "object" ||
+          Array.isArray(root.properties)))
+    ) {
+      throw new ModManagerError(
+        `${call}: inputSchema must be a JSON Schema object with type "object" and a "properties" object.`,
+      );
+    }
+    if (/"\$(?:ref|defs)"|"(?:anyOf|oneOf|allOf)"\s*:/u.test(serialized)) {
+      throw new ModManagerError(
+        `${call}: inputSchema may not use $ref, $defs, anyOf, oneOf or allOf; some providers refuse them.`,
+      );
+    }
+    if (serialized.length > MOD_TOOL_SCHEMA_BYTES_LIMIT) {
+      throw new ModManagerError(
+        `${call}: inputSchema is larger than ${MOD_TOOL_SCHEMA_BYTES_LIMIT / 1000} KB.`,
+      );
+    }
+    return {
+      modId,
+      name: definition.name,
+      servedName,
+      // Agents read this as an instruction; say where it comes from.
+      description: `[${modId} mod] ${description}`,
+      inputSchema: JSON.parse(serialized) as Record<string, unknown>,
+    };
+  }
+
   // ── Import ─────────────────────────────────────────────────────────
 
   private async installBundle(value: unknown, replace: boolean): Promise<ModsImportResult> {
@@ -560,14 +969,16 @@ export class ModManager {
         throw new ModManagerError(`The mod "${id}" cannot be imported: ${definition.error}`);
       }
 
-      // New code is never trusted on the old code's behalf.
+      // New code is never trusted on the old code's behalf, nor signed in on it.
+      if (existing !== null) await this.signIns.forget(id);
       if (this.records.get(id)?.enabled) await this.setEnabled(id, false);
-      else if (this.enabledIds.has(id)) {
-        const next = new Set(this.enabledIds);
+      else if (this.trusted.has(id)) {
+        const next = new Map(this.trusted);
         next.delete(id);
         await this.writeRegistry(next);
-        this.enabledIds = next;
+        this.trusted = next;
       }
+      this.reloadGrants.delete(id);
 
       // The replaced version is kept, not deleted: it may hold a git history or notes.
       const previous =
@@ -604,7 +1015,8 @@ export class ModManager {
 
   // ── Records ────────────────────────────────────────────────────────
 
-  private mcpClient(record: ModRecord, server: unknown): ModMcpClient {
+  /** One of the servers the mod's manifest declares, by the name the mod gives it. */
+  private mcpServer(record: ModRecord, server: unknown): [string, ModMcpServerConfig] {
     const servers = record.definition.manifest?.mcpServers ?? {};
     if (typeof server !== "string" || !Object.hasOwn(servers, server)) {
       const declared = Object.keys(servers);
@@ -614,10 +1026,19 @@ export class ModManager {
         }).`,
       );
     }
-    let client = record.mcp.get(server);
+    return [server, servers[server]!];
+  }
+
+  private mcpClient(record: ModRecord, server: unknown): ModMcpClient {
+    const [name, config] = this.mcpServer(record, server);
+    let client = record.mcp.get(name);
     if (!client) {
-      client = new ModMcpClient(server, servers[server]!);
-      record.mcp.set(server, client);
+      client = new ModMcpClient(
+        name,
+        config,
+        "url" in config ? this.signIns.access(record.definition.id, name, config) : null,
+      );
+      record.mcp.set(name, client);
     }
     return client;
   }
@@ -660,7 +1081,15 @@ export class ModManager {
     return record.transition;
   }
 
-  private async refreshMod(id: string, options: { readonly restart: boolean }): Promise<void> {
+  /**
+   * Reads a mod's folder again. `restart` restarts an enabled mod;
+   * `onlyIfChanged` skips that when its files are the ones already running
+   * (an editor touching a file, a save without changes).
+   */
+  private async refreshMod(
+    id: string,
+    options: { readonly restart: boolean; readonly onlyIfChanged?: boolean },
+  ): Promise<void> {
     if (this.stopped || !isModId(id)) return;
     const root = path.join(this.options.modsDir, id);
     const definition = await readModDefinition(root).catch(
@@ -681,25 +1110,36 @@ export class ModManager {
         this.stateSizes.delete(id);
         this.scheduleSnapshot();
       }
-      // A folder that comes back under this name is new code; it starts off.
-      if (this.enabledIds.has(id)) {
-        const next = new Set(this.enabledIds);
+      this.linkWatchers.get(id)?.watcher.close();
+      this.linkWatchers.delete(id);
+      // A folder that comes back under this name is new code; it starts off, signed out.
+      await this.signIns.forget(id);
+      this.reloadGrants.delete(id);
+      if (this.trusted.has(id)) {
+        const next = new Map(this.trusted);
         next.delete(id);
         await this.writeRegistry(next);
-        this.enabledIds = next;
+        this.trusted = next;
       }
       return;
     }
+    await this.watchLinkedMod(id, root);
+    const contentHash = await hashModFolder(root).catch(() => null);
     if (!existing) {
+      // Read before the mod is listed, so its row says at once whether it is signed in.
+      await this.signIns.load(id);
       const record: ModRecord = {
         definition,
-        enabled: this.enabledIds.has(id),
+        contentHash,
+        enabled: this.trusted.has(id),
         status: "disabled",
         runtimeError: null,
         host: null,
         generation: 0,
         commands: new Map(),
         views: new Map(),
+        tools: new Map(),
+        observing: 0,
         mcp: new Map(),
         statusText: null,
         loadedAt: null,
@@ -713,7 +1153,13 @@ export class ModManager {
       this.scheduleSnapshot();
       return;
     }
+    const unchanged = existing.contentHash !== null && existing.contentHash === contentHash;
     existing.definition = definition;
+    existing.contentHash = contentHash;
+    if (options.onlyIfChanged === true && unchanged && existing.host !== null) {
+      this.scheduleSnapshot();
+      return;
+    }
     if (existing.enabled && (options.restart || existing.host === null)) {
       void this.transition(existing, async () => {
         await this.stopRecord(existing);
@@ -734,8 +1180,10 @@ export class ModManager {
     const generation = record.generation;
     record.commands.clear();
     record.views.clear();
+    record.tools.clear();
     record.unknownIcons.clear();
     await this.closeMcp(record);
+    this.signIns.restarted(record.definition.id);
     record.statusText = null;
     record.loadedAt = null;
     record.runtimeError = null;
@@ -749,6 +1197,36 @@ export class ModManager {
       record.status = "error";
       this.scheduleSnapshot();
       return;
+    }
+    // Run only the code the person trusted. A mod that changed since then waits for
+    // them, unless they said it may reload while it is being written.
+    const id = definition.id;
+    const current = await this.readContentHash(record);
+    if (generation !== record.generation) return;
+    if (current === null) {
+      record.status = "error";
+      record.runtimeError =
+        "The mod's files cannot be read to check them; it may hold too many or too large files.";
+      this.scheduleSnapshot();
+      return;
+    }
+    const trustedHash = this.trusted.get(id) ?? null;
+    if (trustedHash !== current) {
+      if (trustedHash !== null && !this.reloadGrants.has(id)) {
+        record.status = "changed";
+        this.appendLog(
+          record,
+          "warn",
+          "Its files changed since it was enabled, so it was stopped. The person can press Trust changes in Settings → Mods.",
+        );
+        this.scheduleSnapshot();
+        return;
+      }
+      const next = new Map(this.trusted);
+      next.set(id, current);
+      await this.writeRegistry(next).catch(() => undefined);
+      this.trusted = next;
+      if (generation !== record.generation) return;
     }
     record.status = "starting";
     this.scheduleSnapshot();
@@ -788,6 +1266,16 @@ export class ModManager {
       record.status = "running";
       record.loadedAt = new Date().toISOString();
       this.appendLog(record, "info", `Loaded version ${definition.manifest.version}.`);
+      for (const event of new Set(host.hooks.map((hook) => hook.event))) {
+        const permission = EVENT_PERMISSIONS[event];
+        if (permission !== undefined && !this.hasPermission(record, permission)) {
+          this.appendLog(
+            record,
+            "warn",
+            `The "${event}" hook will not run: add "${permission}" to "permissions" in mod.json.`,
+          );
+        }
+      }
       this.scheduleSnapshot();
       await this.runChain(
         "mod.start",
@@ -816,6 +1304,7 @@ export class ModManager {
     record.host = null;
     record.commands.clear();
     record.views.clear();
+    record.tools.clear();
     await this.closeMcp(record);
     record.statusText = null;
     record.loadedAt = null;
@@ -832,6 +1321,7 @@ export class ModManager {
     record.runtimeError = reason;
     record.commands.clear();
     record.views.clear();
+    record.tools.clear();
     void this.closeMcp(record);
     record.statusText = null;
     this.appendLog(record, "error", reason);
@@ -870,9 +1360,22 @@ export class ModManager {
   private hooksOf(record: ModRecord, event: string, input: unknown): HookEntry[] {
     const host = record.host;
     if (host === null || !host.isAlive) return [];
+    const permission = EVENT_PERMISSIONS[event];
+    if (permission !== undefined && !this.hasPermission(record, permission)) return [];
     return host.hooks
       .filter((hook) => hook.event === event && matchesModEvent(hook.matcher, input))
       .map((hook) => ({ record, host, hookId: hook.hookId }));
+  }
+
+  private hasPermission(record: ModRecord, permission: ModPermission): boolean {
+    return record.definition.manifest?.permissions?.includes(permission) ?? false;
+  }
+
+  /** Every running mod's hooks for an event, in mod order. */
+  private allHooksOf(event: string, input: unknown): HookEntry[] {
+    return [...this.records.values()]
+      .toSorted((left, right) => left.definition.id.localeCompare(right.definition.id))
+      .flatMap((record) => this.hooksOf(record, event, input));
   }
 
   /** `failures`, when given, collects why each failed hook failed. */
@@ -1032,6 +1535,10 @@ export class ModManager {
         }
         return undefined;
       }
+      case "mcp.status": {
+        const [name, config] = this.mcpServer(record, args[0]);
+        return this.signIns.needsSignIn(modId, name, config) ? "sign-in-needed" : "ready";
+      }
       case "mcp.tools":
         return this.mcpClient(record, args[0]).listTools();
       case "mcp.call": {
@@ -1068,6 +1575,21 @@ export class ModManager {
       }
       case "command.unregister": {
         if (record.commands.delete(String(args[0]))) this.scheduleSnapshot();
+        return undefined;
+      }
+      case "tool.register": {
+        if (!this.hasPermission(record, "tools")) {
+          throw new ModManagerError(
+            '$.tool.register: add "tools" to "permissions" in mod.json; the person sees it before enabling the mod.',
+          );
+        }
+        const tool = this.checkAgentTool(record, args[0]);
+        record.tools.set(tool.name, tool);
+        this.scheduleSnapshot();
+        return undefined;
+      }
+      case "tool.unregister": {
+        if (record.tools.delete(String(args[0]))) this.scheduleSnapshot();
         return undefined;
       }
       case "threads.list": {
@@ -1199,24 +1721,39 @@ export class ModManager {
     return path.join(this.options.dataDir, "store");
   }
 
-  private async readRegistry(): Promise<Set<string>> {
+  /** Reads the enabled mods and what was trusted of each; older files listed only their ids. */
+  private async readRegistry(): Promise<Map<string, string | null>> {
     try {
       const parsed = JSON.parse(await fs.readFile(this.registryFile(), "utf8")) as {
         readonly enabled?: unknown;
+        readonly mods?: unknown;
       };
-      return new Set(
-        Array.isArray(parsed.enabled)
-          ? parsed.enabled.filter((id): id is string => typeof id === "string")
-          : [],
-      );
+      const registry = new Map<string, string | null>();
+      if (Array.isArray(parsed.enabled)) {
+        for (const id of parsed.enabled) if (typeof id === "string") registry.set(id, null);
+      }
+      if (parsed.mods !== null && typeof parsed.mods === "object" && !Array.isArray(parsed.mods)) {
+        for (const [id, entry] of Object.entries(parsed.mods as Record<string, unknown>)) {
+          const hash = (entry as { readonly hash?: unknown } | null)?.hash;
+          registry.set(id, typeof hash === "string" ? hash : null);
+        }
+      }
+      return registry;
     } catch {
-      return new Set();
+      return new Map();
     }
   }
 
-  private writeRegistry(enabledIds: ReadonlySet<string>): Promise<void> {
+  private writeRegistry(trusted: ReadonlyMap<string, string | null>): Promise<void> {
     const contents = JSON.stringify(
-      { version: REGISTRY_VERSION, enabled: [...enabledIds].toSorted() },
+      {
+        version: REGISTRY_VERSION,
+        mods: Object.fromEntries(
+          [...trusted]
+            .toSorted(([left], [right]) => left.localeCompare(right))
+            .map(([id, hash]) => [id, { hash }]),
+        ),
+      },
       null,
       2,
     );
@@ -1305,6 +1842,37 @@ export class ModManager {
     }
   }
 
+  /**
+   * A mod whose folder is a link (to a repository, while it is being written)
+   * changes where the mods folder's watcher does not look; watch its real folder.
+   */
+  private async watchLinkedMod(id: string, root: string): Promise<void> {
+    if (this.watcher === null) return;
+    const target = await fs
+      .lstat(root)
+      .then((stat) => (stat.isSymbolicLink() ? fs.realpath(root) : null))
+      .catch(() => null);
+    const current = this.linkWatchers.get(id);
+    if ((current?.target ?? null) === target) return;
+    current?.watcher.close();
+    this.linkWatchers.delete(id);
+    if (target === null) return;
+    try {
+      const watcher = watch(target, { recursive: true }, (_event, filename) => {
+        const segments = typeof filename === "string" ? filename.split(/[\\/]/u) : [];
+        if (segments.some((segment) => segment === "node_modules" || segment === ".git")) return;
+        this.scheduleRefresh(id);
+      });
+      watcher.on("error", () => {
+        watcher.close();
+        if (this.linkWatchers.get(id)?.watcher === watcher) this.linkWatchers.delete(id);
+      });
+      this.linkWatchers.set(id, { target, watcher });
+    } catch {
+      // Without a watcher the mod still reloads from Settings.
+    }
+  }
+
   private scheduleRefresh(id: string): void {
     const pending = this.refreshTimers.get(id);
     if (pending !== undefined) clearTimeout(pending);
@@ -1312,7 +1880,7 @@ export class ModManager {
       id,
       setTimeout(() => {
         this.refreshTimers.delete(id);
-        void this.refreshMod(id, { restart: true });
+        void this.refreshMod(id, { restart: true, onlyIfChanged: true });
       }, MOD_RELOAD_DEBOUNCE_MS),
     );
   }
@@ -1362,8 +1930,16 @@ export class ModManager {
       error: definition.error ?? record.runtimeError,
       hooks: [...new Set((record.host?.hooks ?? []).map((hook) => hook.event))],
       commands: [...record.commands.values()],
+      tools: [...record.tools.values()].map((tool) => ({
+        name: tool.name,
+        servedName: tool.servedName,
+        description: tool.description,
+      })),
       views: [...record.views.values()],
       mcpServers: Object.keys(definition.manifest?.mcpServers ?? {}),
+      mcpSignIns: this.signIns.summary(definition.id, definition.manifest?.mcpServers),
+      permissions: [...new Set(definition.manifest?.permissions ?? [])],
+      reloadsOnChange: this.reloadGrants.has(definition.id),
       statusText: record.statusText,
       loadedAt: record.loadedAt,
     };

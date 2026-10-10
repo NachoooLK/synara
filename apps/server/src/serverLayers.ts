@@ -145,7 +145,14 @@ export function makeServerRuntimeServicesLayer(
     Layer.provideMerge(serverSettingsLayer),
     Layer.provideMerge(providerHealthLayer),
   );
+  const modHostLayer = ModHostLive.pipe(
+    // Keeps the sign-ins of mods to their MCP servers.
+    Layer.provide(ServerSecretStoreLive),
+    Layer.provideMerge(runtimeServicesLayer),
+  );
   const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
+    // Optional to the reactor: mods allowed to change prompts see a message before it is sent.
+    Layer.provideMerge(modHostLayer),
     Layer.provideMerge(runtimeServicesLayer),
     Layer.provideMerge(providerHealthLayer),
     Layer.provideMerge(OrchestrationEventDeliveryRepositoryLive),
@@ -213,7 +220,6 @@ export function makeServerRuntimeServicesLayer(
     serverAuthLayer,
   );
   const todoServiceLayer = TodoServiceLive.pipe(Layer.provideMerge(TodoRepositoryLive));
-  const modHostLayer = ModHostLive.pipe(Layer.provideMerge(runtimeServicesLayer));
   const automationSchedulerLayer = AutomationSchedulerLive.pipe(
     Layer.provideMerge(automationServiceLayer),
     Layer.provideMerge(AutomationRepositoryLive),

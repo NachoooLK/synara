@@ -1,12 +1,20 @@
 // FILE: ModViewHost.tsx
 // Purpose: Mounts one view of a mod: asks the server to draw it, draws it again
 //          when the mod or Synara's data changes, and sends presses back to the
-//          mod, applying what the handler asked of the window.
+//          mod, applying what the handler asked of the window. While the mod waits
+//          for a sign-in to one of its MCP servers, asks for it where the failed
+//          draw would show.
 // Layer: Web mods UI
 
-import type { ModUiEffect, ModUiTree, ModViewContext, ModViewSite } from "@synara/contracts";
+import type {
+  ModMcpSignIn,
+  ModUiEffect,
+  ModUiTree,
+  ModViewContext,
+  ModViewSite,
+} from "@synara/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { PanelStateMessage } from "~/components/chat/PanelStateMessage";
 import { Button } from "~/components/ui/button";
@@ -16,6 +24,7 @@ import { openExternalLink } from "~/lib/linkChips";
 import { cn } from "~/lib/utils";
 import { ensureNativeApi } from "~/nativeApi";
 
+import { startModMcpSignIn } from "./modMcpSignIn";
 import { ModUiRenderer, type ModUiDispatch } from "./ModUiRenderer";
 import { modViewVersionKey, useModsStore } from "./modsStore";
 
@@ -34,6 +43,55 @@ interface ViewState {
   readonly tree: ModUiTree | null;
   readonly error: string | null;
   readonly loaded: boolean;
+}
+
+/**
+ * Asks for the sign-in to one MCP server the mod cannot call without it. `slim` is
+ * the one line above a view the mod drew anyway; otherwise it stands in for the view.
+ */
+function ModSignInRequest(props: { modId: string; signIn: ModMcpSignIn; slim?: boolean }) {
+  const { modId, signIn } = props;
+  const [pending, setPending] = useState(false);
+  const [pageOpened, setPageOpened] = useState(false);
+  const text = `The ${modId} mod needs you to sign in to ${signIn.host}.`;
+  const hint = "Finish signing in in your browser.";
+  const button = (
+    <Button
+      size="xs"
+      variant="outline"
+      disabled={pending}
+      onClick={() => {
+        setPending(true);
+        void startModMcpSignIn(modId, signIn.server)
+          .then((opened) => {
+            if (opened) setPageOpened(true);
+          })
+          .finally(() => setPending(false));
+      }}
+    >
+      Sign in
+    </Button>
+  );
+
+  if (props.slim) {
+    // One line has room for one sentence: the hint takes the request's place.
+    const line = pageOpened ? hint : text;
+    return (
+      <div className="mx-2 my-1 flex items-center justify-between gap-2 rounded-md border border-warning/32 bg-warning/4 px-2 py-1 text-ui-sm text-foreground">
+        <span title={line} className="min-w-0 truncate">
+          {line}
+        </span>
+        {button}
+      </div>
+    );
+  }
+  return (
+    <div className="flex max-w-full flex-col items-center gap-3">
+      <span className="max-w-full break-words">{text}</span>
+      {button}
+      {pageOpened ? <span>{hint}</span> : null}
+    </div>
+  );
 }
 
 export function ModViewHost(props: {
@@ -61,6 +119,12 @@ export function ModViewHost(props: {
   const loadedAt = mod?.loadedAt ?? null;
   const status = mod?.status ?? null;
   const modError = mod?.error ?? null;
+  // Quiet sites have no room to ask; the mod's other views and Settings → Mods do.
+  const signInsNeeded =
+    !quiet && status === "running"
+      ? (mod?.mcpSignIns ?? []).filter((signIn) => signIn.state === "needed")
+      : [];
+  const signInNeeded = signInsNeeded.length > 0;
   const [state, setState] = useState<ViewState>({ tree: null, error: null, loaded: false });
   const [retry, setRetry] = useState(0);
   // One render in flight per view; requests that arrive meanwhile collapse into
@@ -129,8 +193,21 @@ export function ModViewHost(props: {
     modVersion,
     loadedAt,
     status,
+    // A view that failed for want of a sign-in draws again once the person has signed in.
+    signInNeeded,
     retry,
   ]);
+
+  // The error a sign-in request stood in for is out of date once the sign-in is
+  // there: drop it before it shows, while the view draws again.
+  useLayoutEffect(() => {
+    if (signInNeeded) return;
+    setState((previous) =>
+      previous.error === null
+        ? previous
+        : { ...previous, error: null, loaded: previous.tree !== null },
+    );
+  }, [signInNeeded]);
 
   const applyEffect = (effect: ModUiEffect) => {
     switch (effect.type) {
@@ -192,7 +269,9 @@ export function ModViewHost(props: {
               ? `The ${modId} mod is starting…`
               : status === "error"
                 ? `The ${modId} mod stopped${modError ? `: ${modError}` : "."}`
-                : `The ${modId} mod is off.`}
+                : status === "changed"
+                  ? `The ${modId} mod changed since you enabled it, so it is stopped until you trust the change.`
+                  : `The ${modId} mod is off.`}
           </span>
           {status === "starting" ? null : (
             <Button size="xs" variant="outline" onClick={openModsSettings}>
@@ -206,7 +285,7 @@ export function ModViewHost(props: {
 
   return (
     <div className={cn("flex min-h-0 min-w-0 flex-col [&>*]:shrink-0", props.className)}>
-      {state.error ? (
+      {state.error && !signInNeeded ? (
         <div
           role="alert"
           className="mx-2 my-1 flex items-start justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/6 px-2 py-1.5 text-ui-sm text-destructive"
@@ -226,10 +305,24 @@ export function ModViewHost(props: {
         <PanelStateMessage>
           <Spinner className="size-4" aria-label="Loading the view" />
         </PanelStateMessage>
+      ) : signInNeeded && (state.error !== null || state.tree === null) ? (
+        // The failed draw is the missing sign-in, so the request takes its place. It
+        // grows past a short panel instead of losing its top to the centering.
+        <PanelStateMessage className="h-auto min-h-full flex-col gap-5">
+          {signInsNeeded.map((signIn) => (
+            <ModSignInRequest key={signIn.server} modId={modId} signIn={signIn} />
+          ))}
+        </PanelStateMessage>
       ) : state.tree === null && state.error === null ? (
         <PanelStateMessage>Nothing to show.</PanelStateMessage>
       ) : (
-        <ModUiRenderer tree={state.tree} dispatch={dispatch} site={props.site} />
+        <>
+          {/* The mod drew through the failure itself; its view stays, under the request. */}
+          {signInsNeeded.map((signIn) => (
+            <ModSignInRequest key={signIn.server} modId={modId} signIn={signIn} slim />
+          ))}
+          <ModUiRenderer tree={state.tree} dispatch={dispatch} site={props.site} />
+        </>
       )}
     </div>
   );

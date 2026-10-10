@@ -32,13 +32,74 @@ function inputError(error: unknown): Effect.Effect<McpToolCallResult> {
   return Effect.succeed(mcpToolResultError(errorText(error)));
 }
 
+/** What an agent should do about a mod that stopped because it was edited. */
+const MOD_CHANGED_NOTE =
+  'The files are not the ones the person enabled, so the mod is stopped, and reloading again will not start it. Ask the person to press Trust changes in Settings → Mods, ticking "Keep reloading it when its files change" if you will keep editing it.';
+
+/** The most text one mod tool may hand an agent; more would cost the turn its context. */
+const MOD_TOOL_RESULT_CHARS_LIMIT = 100_000;
+const MOD_TOOL_NAME_PREFIX = "mod_";
+
+/**
+ * The tools running mods give to agents, as the gateway serves them. They are
+ * read on every listing, so a mod's tools appear and go with the mod; a session
+ * that lists tools only when it starts sees the ones registered by then.
+ */
+export function makeAgentGatewayModToolSource(modHost: ModHostShape): {
+  readonly tools: () => ReadonlyArray<ToolEntry>;
+  readonly missingTool: (toolName: string) => string | null;
+} {
+  return {
+    tools: () =>
+      modHost.agentTools().map(
+        (tool): ToolEntry => ({
+          // The same bar as reloading a mod: the session may act on this thread.
+          requiredCapability: "thread:write",
+          requiresActiveTurn: true,
+          definition: {
+            name: tool.servedName,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+          },
+          handler: (args, context) =>
+            modHost
+              .callAgentTool({
+                servedName: tool.servedName,
+                arguments: args,
+                threadId: context.callerThreadId,
+              })
+              .pipe(
+                Effect.map((value): McpToolCallResult => {
+                  const text = typeof value === "string" ? value : JSON.stringify(value ?? null);
+                  return text.length > MOD_TOOL_RESULT_CHARS_LIMIT
+                    ? mcpToolResultError(
+                        `The ${tool.modId} mod's "${tool.name}" tool returned ${text.length} characters; the limit is ${MOD_TOOL_RESULT_CHARS_LIMIT}.`,
+                      )
+                    : typeof value === "string"
+                      ? { content: [{ type: "text", text: value }] }
+                      : mcpToolResultJson(value ?? null);
+                }),
+                Effect.catch((error) => Effect.succeed(mcpToolResultError(error.message))),
+                Effect.catchDefect((defect) =>
+                  Effect.succeed(mcpToolResultError(errorText(defect))),
+                ),
+              ),
+        }),
+      ),
+    missingTool: (toolName) =>
+      toolName.startsWith(MOD_TOOL_NAME_PREFIX)
+        ? `No running mod has a tool named "${toolName}". Its mod may be off, reloading or failing; the person can check Settings → Mods.`
+        : null,
+  };
+}
+
 export function makeAgentGatewayModTools(modHost: ModHostShape): ReadonlyArray<ToolEntry> {
   const listMods: ToolEntry = {
     requiredCapability: "thread:read",
     definition: {
       name: "synara_mods_list",
       description:
-        "List the Synara mods in the mods folder with their status (disabled, starting, running, error), load or runtime error, registered views and commands, and the mods folder path. Use it after writing or editing a mod to see whether it loaded. A new mod is disabled until the person enables it in Settings → Mods.",
+        'List the Synara mods in the mods folder with their status (disabled, starting, running, error, changed), load or runtime error, registered views and commands, and the mods folder path. Use it after writing or editing a mod to see whether it loaded. A new mod is disabled until the person enables it in Settings → Mods. "changed" means its files are not the ones the person enabled: it stays stopped until they press Trust changes there. "mcpSignIns" lists the mod\'s MCP servers that ask the person to sign in: while one is "needed", calls to it fail until the person presses Sign in (in the mod\'s view or in Settings → Mods); you cannot sign in for them.',
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       annotations: { title: "List Synara mods", ...READ_ONLY_TOOL_ANNOTATIONS },
     },
@@ -56,6 +117,10 @@ export function makeAgentGatewayModTools(modHost: ModHostShape): ReadonlyArray<T
             hooks: mod.hooks,
             views: mod.views.map((view) => ({ id: view.id, site: view.site, title: view.title })),
             commands: mod.commands.map((command) => command.name),
+            permissions: mod.permissions,
+            reloadsOnChange: mod.reloadsOnChange,
+            agentTools: mod.tools.map((tool) => tool.servedName),
+            mcpSignIns: mod.mcpSignIns,
             path: mod.path,
           })),
         }),
@@ -151,7 +216,7 @@ export function makeAgentGatewayModTools(modHost: ModHostShape): ReadonlyArray<T
     definition: {
       name: "synara_mod_reload",
       description:
-        "Reload an enabled Synara mod: read its files again and restart it. Synara already reloads a mod when its files change; use this after a failure or to start over with a fresh worker.",
+        'Reload an enabled Synara mod: read its files again and restart it. Use it after a failure or to start over with a fresh worker. A mod whose files changed since the person enabled it comes back as "changed" and does not run until they trust the change in Settings → Mods.',
       inputSchema: {
         type: "object",
         properties: { modId: MOD_ID_SCHEMA },
@@ -177,7 +242,12 @@ export function makeAgentGatewayModTools(modHost: ModHostShape): ReadonlyArray<T
         () => modHost.reload({ id: modId }),
         (snapshot) => {
           const mod = snapshot.mods.find((candidate) => candidate.id === modId);
-          return { modId, status: mod?.status ?? "missing", error: mod?.error ?? null };
+          return {
+            modId,
+            status: mod?.status ?? "missing",
+            error: mod?.error ?? null,
+            ...(mod?.status === "changed" ? { next: MOD_CHANGED_NOTE } : {}),
+          };
         },
       );
     },

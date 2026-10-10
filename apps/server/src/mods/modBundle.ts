@@ -3,6 +3,7 @@
 //          checks and unpacks such a file when a mod is imported.
 // Layer: Mods runtime (filesystem reads and writes, no lifecycle)
 
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 
@@ -52,19 +53,24 @@ function toBundleFile(relativePath: string, contents: Buffer): ModBundleFile {
   }
 }
 
-/**
- * Reads every file of a mod's folder into its exported form. Hidden entries
- * other than `.synara-mod` (such as `.env` or `.git`), `node_modules` and links
- * stay behind, so secrets and tooling do not travel with the mod.
- */
-export async function packModFolder(
-  root: string,
-  info: { readonly name: string; readonly version: string },
-): Promise<ModBundle> {
-  const folder = await fs.realpath(root);
-  const files: ModBundleFile[] = [];
-  let rawBytes = 0;
+/** How large a mod's folder may be for Synara to check what it holds. */
+const MOD_HASH_LIMITS = { files: 2_000, bytes: 50_000_000 } as const;
 
+interface ModFile {
+  /** Relative to the mod's folder, with `/` between segments. */
+  readonly path: string;
+  readonly absolute: string;
+  readonly size: number;
+}
+
+/**
+ * The files a mod consists of, in a fixed order. Hidden entries other than
+ * `.synara-mod` (such as `.env` or `.git`), `node_modules` and links are not
+ * part of it: they are not exported, and they are not what the person trusts.
+ */
+async function listModFiles(root: string, maxFiles: number): Promise<ModFile[]> {
+  const folder = await fs.realpath(root);
+  const files: ModFile[] = [];
   const visit = async (directory: string, segments: ReadonlyArray<string>): Promise<void> => {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
@@ -76,21 +82,36 @@ export async function packModFolder(
         continue;
       }
       if (!entry.isFile()) continue;
-      // Check the size before reading, so a stray large file is never loaded.
-      const { size } = await fs.stat(absolute);
-      if (rawBytes + size > MOD_BUNDLE_LIMITS.bytes) throw tooBig(rawBytes + size);
-      if (files.length >= MOD_BUNDLE_LIMITS.files) {
-        throw new ModBundleError(
-          `The mod has more than ${MOD_BUNDLE_LIMITS.files} files, the most an exported mod can hold.`,
-        );
+      if (files.length >= maxFiles) {
+        throw new ModBundleError(`The mod has more than ${maxFiles} files.`);
       }
-      const contents = await fs.readFile(absolute);
-      rawBytes += contents.byteLength;
-      if (rawBytes > MOD_BUNDLE_LIMITS.bytes) throw tooBig(rawBytes);
-      files.push(toBundleFile([...segments, entry.name].join("/"), contents));
+      const { size } = await fs.stat(absolute);
+      files.push({ path: [...segments, entry.name].join("/"), absolute, size });
     }
   };
   await visit(folder, []);
+  return files;
+}
+
+/**
+ * Reads every file of a mod's folder into its exported form. Hidden entries
+ * other than `.synara-mod` (such as `.env` or `.git`), `node_modules` and links
+ * stay behind, so secrets and tooling do not travel with the mod.
+ */
+export async function packModFolder(
+  root: string,
+  info: { readonly name: string; readonly version: string },
+): Promise<ModBundle> {
+  const files: ModBundleFile[] = [];
+  let rawBytes = 0;
+  for (const file of await listModFiles(root, MOD_BUNDLE_LIMITS.files)) {
+    // Check the size before reading, so a stray large file is never loaded.
+    if (rawBytes + file.size > MOD_BUNDLE_LIMITS.bytes) throw tooBig(rawBytes + file.size);
+    const contents = await fs.readFile(file.absolute);
+    rawBytes += contents.byteLength;
+    if (rawBytes > MOD_BUNDLE_LIMITS.bytes) throw tooBig(rawBytes);
+    files.push(toBundleFile(file.path, contents));
+  }
 
   const bundle: ModBundle = {
     format: MOD_BUNDLE_FORMAT,
@@ -103,6 +124,27 @@ export async function packModFolder(
   const bytes = Buffer.byteLength(JSON.stringify(bundle));
   if (bytes > MOD_BUNDLE_LIMITS.bytes) throw tooBig(bytes);
   return bundle;
+}
+
+/**
+ * A fingerprint of the code a mod would run: the names and bytes of its files.
+ * The person's trust is in this, so a mod whose files change is asked about again.
+ */
+export async function hashModFolder(root: string): Promise<string> {
+  const hash = createHash("sha256");
+  let bytes = 0;
+  for (const file of await listModFiles(root, MOD_HASH_LIMITS.files)) {
+    bytes += file.size;
+    if (bytes > MOD_HASH_LIMITS.bytes) {
+      throw new ModBundleError(
+        `The mod's folder is larger than ${formatMegabytes(MOD_HASH_LIMITS.bytes)}, too large to check.`,
+      );
+    }
+    const contents = await fs.readFile(file.absolute);
+    hash.update(`${file.path}\u0000${contents.byteLength}\u0000`);
+    hash.update(contents);
+  }
+  return hash.digest("hex");
 }
 
 function checkBundlePath(filePath: string): void {

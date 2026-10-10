@@ -19,6 +19,8 @@ export const MODS_WS_METHODS = {
   dispatchUi: "mods.dispatchUi",
   export: "mods.export",
   import: "mods.import",
+  mcpSignIn: "mods.mcpSignIn",
+  mcpSignOut: "mods.mcpSignOut",
   subscribeEvents: "mods.subscribeEvents",
 } as const;
 
@@ -56,6 +58,33 @@ export type ModMcpServerName = typeof ModMcpServerName.Type;
 
 const ModMcpText = Schema.String.check(Schema.isMaxLength(4_096));
 
+/** The port Synara listens on for the browser's return from a sign-in, unless it is taken. */
+export const MOD_MCP_SIGN_IN_PORT = 47_823;
+/** The path of that return address: `http://127.0.0.1:<port>/callback`. */
+export const MOD_MCP_SIGN_IN_PATH = "/callback";
+
+/**
+ * How the person signs in to a remote server that asks for it (OAuth). A mod
+ * need not declare it: Synara finds out when the server refuses a call. It is
+ * needed for a server that does not register apps by itself (`clientId`), and
+ * it lets Synara say that a sign-in is coming before the mod runs.
+ */
+export const ModMcpOAuthConfig = Schema.Struct({
+  /** The client id registered for Synara with the server's authorization server. */
+  clientId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2_048))),
+  /** The scopes to ask for. By default, the ones the server lists. */
+  scopes: Schema.optional(
+    Schema.Array(Schema.String.check(Schema.isPattern(/^[\x21\x23-\x5b\x5d-\x7e]{1,256}$/))).check(
+      Schema.isMaxLength(32),
+    ),
+  ),
+  /** The port of the return address, for a client id registered with a fixed one. */
+  callbackPort: Schema.optional(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(1_024), Schema.isLessThanOrEqualTo(65_535)),
+  ),
+});
+export type ModMcpOAuthConfig = typeof ModMcpOAuthConfig.Type;
+
 /**
  * An MCP server a mod uses. Values may say `${env:NAME}` to take a variable
  * from Synara's environment, so tokens stay out of the mod's files.
@@ -72,9 +101,20 @@ export const ModMcpServerConfig = Schema.Union([
     /** A remote server reached over streamable HTTP. */
     url: TrimmedNonEmptyString.check(Schema.isMaxLength(2_048)),
     headers: Schema.optional(Schema.Record(Schema.String, ModMcpText)),
+    oauth: Schema.optional(ModMcpOAuthConfig),
   }),
 ]);
 export type ModMcpServerConfig = typeof ModMcpServerConfig.Type;
+
+/**
+ * What a mod may do to agents, beyond drawing views and reading lists. A mod
+ * asks for these in its manifest and the person sees them before enabling it:
+ * - `prompts`: change the messages the person sends to agents (`prompt.submit`).
+ * - `approvals`: deny tool calls that wait for the person's approval (`approval.requested`).
+ * - `tools`: give agents new tools (`$.tool.register`).
+ */
+export const ModPermission = Schema.Literals(["prompts", "approvals", "tools"]);
+export type ModPermission = typeof ModPermission.Type;
 
 export const ModManifest = Schema.Struct({
   name: ModId,
@@ -84,6 +124,8 @@ export const ModManifest = Schema.Struct({
   apiVersion: Schema.optional(Schema.Literal(MOD_API_VERSION)),
   /** MCP servers the mod calls through `$.mcp`, by the name it uses for them. */
   mcpServers: Schema.optional(Schema.Record(ModMcpServerName, ModMcpServerConfig)),
+  /** What the mod asks to do to agents; without an entry the matching hooks never run. */
+  permissions: Schema.optional(Schema.Array(ModPermission).check(Schema.isMaxLength(8))),
 });
 export type ModManifest = typeof ModManifest.Type;
 
@@ -98,7 +140,11 @@ export type ModHooksFile = typeof ModHooksFile.Type;
 
 // ── Runtime state ────────────────────────────────────────────────────
 
-export const ModStatus = Schema.Literals(["disabled", "starting", "running", "error"]);
+/**
+ * `changed`: the mod is enabled, but its files are not the ones the person
+ * trusted, so it is stopped until they trust the change.
+ */
+export const ModStatus = Schema.Literals(["disabled", "starting", "running", "error", "changed"]);
 export type ModStatus = typeof ModStatus.Type;
 
 export const ModCommandName = Schema.String.check(
@@ -199,6 +245,31 @@ export const ModUiEffect = Schema.Union([
 ]);
 export type ModUiEffect = typeof ModUiEffect.Type;
 
+/** A tool a mod gives to agents, as Settings lists it. */
+export const ModAgentToolSummary = Schema.Struct({
+  /** The name the mod registered. */
+  name: Schema.String,
+  /** The name agents call: `mod_<mod>_<name>`. */
+  servedName: Schema.String,
+  description: Schema.String,
+});
+export type ModAgentToolSummary = typeof ModAgentToolSummary.Type;
+
+/**
+ * A server of a mod that asks the person to sign in. `needed`: calls to it fail
+ * until they do. The token stays in Synara; the mod never sees it.
+ */
+export const ModMcpSignIn = Schema.Struct({
+  /** The name the mod gives the server. */
+  server: ModMcpServerName,
+  /** The server's host, which receives the token: what the person agrees to sign in to. */
+  host: Schema.String,
+  state: Schema.Literals(["needed", "signed-in"]),
+  /** Why a sign-in is needed again or did not complete, when there is something to say. */
+  detail: Schema.NullOr(Schema.String),
+});
+export type ModMcpSignIn = typeof ModMcpSignIn.Type;
+
 export const ModSummary = Schema.Struct({
   id: ModId,
   version: Schema.String,
@@ -215,6 +286,14 @@ export const ModSummary = Schema.Struct({
   views: Schema.Array(ModView),
   /** The names of the MCP servers the manifest declares. */
   mcpServers: Schema.Array(Schema.String),
+  /** The servers among them that ask the person to sign in, as far as Synara knows. */
+  mcpSignIns: Schema.Array(ModMcpSignIn),
+  /** What the manifest asks to do to agents. */
+  permissions: Schema.Array(ModPermission),
+  /** The tools the mod gives to agents (needs the `tools` permission). */
+  tools: Schema.Array(ModAgentToolSummary),
+  /** The person let this mod reload as its files change, without asking again (until restart). */
+  reloadsOnChange: Schema.Boolean,
   /** The mod's status line entry, set with `$.ui.status`. */
   statusText: Schema.NullOr(Schema.String),
   loadedAt: Schema.NullOr(IsoDateTime),
@@ -271,7 +350,13 @@ export type ModsStreamEvent = typeof ModsStreamEvent.Type;
 
 export const ModsSetEnabledInput = Schema.Struct({
   id: ModId,
+  /** Enabling trusts the mod's files as they are now, also for a mod that is already enabled. */
   enabled: Schema.Boolean,
+  /**
+   * With `enabled`: keep reloading the mod as its files change, for a mod that
+   * is being written. Without it a change stops the mod until it is trusted again.
+   */
+  reloadOnChange: Schema.optional(Schema.Boolean),
 });
 export type ModsSetEnabledInput = typeof ModsSetEnabledInput.Type;
 
@@ -397,3 +482,28 @@ export const ModsImportResult = Schema.Struct({
   snapshot: ModsSnapshot,
 });
 export type ModsImportResult = typeof ModsImportResult.Type;
+
+// ── Signing in to a mod's MCP server ─────────────────────────────────
+// Each sign-in belongs to one mod and one server address. Synara keeps the
+// token and sends it only to that address.
+
+export const ModsMcpSignInInput = Schema.Struct({
+  id: ModId,
+  server: ModMcpServerName,
+});
+export type ModsMcpSignInInput = typeof ModsMcpSignInInput.Type;
+
+export const ModsMcpSignInResult = Schema.Struct({
+  /**
+   * The sign-in page, to open in a browser on the computer that runs Synara:
+   * the browser returns to an address on that computer.
+   */
+  url: Schema.String.check(Schema.isMaxLength(8_192)),
+});
+export type ModsMcpSignInResult = typeof ModsMcpSignInResult.Type;
+
+export const ModsMcpSignOutInput = Schema.Struct({
+  id: ModId,
+  server: ModMcpServerName,
+});
+export type ModsMcpSignOutInput = typeof ModsMcpSignOutInput.Type;

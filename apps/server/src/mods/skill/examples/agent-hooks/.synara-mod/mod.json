@@ -1,0 +1,6 @@
+{
+  "name": "agent-hooks",
+  "version": "0.1.0",
+  "description": "Adds team rules to prompts, denies force pushes, gives agents a tool and counts finished turns.",
+  "permissions": ["prompts", "approvals", "tools"]
+}

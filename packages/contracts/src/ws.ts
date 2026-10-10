@@ -144,6 +144,8 @@ import {
   ModsDispatchUiInput,
   ModsExportInput,
   ModsImportInput,
+  ModsMcpSignInInput,
+  ModsMcpSignOutInput,
   ModsReadLogsInput,
   ModsReloadInput,
   ModsRenderViewInput,
@@ -552,6 +554,8 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(MODS_WS_METHODS.dispatchUi, ModsDispatchUiInput),
   tagRequestBody(MODS_WS_METHODS.export, ModsExportInput),
   tagRequestBody(MODS_WS_METHODS.import, ModsImportInput),
+  tagRequestBody(MODS_WS_METHODS.mcpSignIn, ModsMcpSignInInput),
+  tagRequestBody(MODS_WS_METHODS.mcpSignOut, ModsMcpSignOutInput),
   tagRequestBody(MODS_WS_METHODS.subscribeEvents, Schema.Struct({})),
 
   // Shell methods

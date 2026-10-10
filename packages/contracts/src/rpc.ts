@@ -100,6 +100,9 @@ import {
   ModsExportResult,
   ModsImportInput,
   ModsImportResult,
+  ModsMcpSignInInput,
+  ModsMcpSignInResult,
+  ModsMcpSignOutInput,
   ModsReadLogsInput,
   ModsReadLogsResult,
   ModsReloadInput,
@@ -924,6 +927,18 @@ export const WsModsImportRpc = Rpc.make(MODS_WS_METHODS.import, {
   error: WsRpcError,
 });
 
+export const WsModsMcpSignInRpc = Rpc.make(MODS_WS_METHODS.mcpSignIn, {
+  payload: ModsMcpSignInInput,
+  success: ModsMcpSignInResult,
+  error: WsRpcError,
+});
+
+export const WsModsMcpSignOutRpc = Rpc.make(MODS_WS_METHODS.mcpSignOut, {
+  payload: ModsMcpSignOutInput,
+  success: ModsSnapshot,
+  error: WsRpcError,
+});
+
 export const WsSubscribeModsEventsRpc = Rpc.make(MODS_WS_METHODS.subscribeEvents, {
   payload: Schema.Struct({}),
   success: ModsStreamEvent,
@@ -941,6 +956,8 @@ export const WsModsRpcGroup = RpcGroup.make(
   WsModsDispatchUiRpc,
   WsModsExportRpc,
   WsModsImportRpc,
+  WsModsMcpSignInRpc,
+  WsModsMcpSignOutRpc,
   WsSubscribeModsEventsRpc,
 );
 

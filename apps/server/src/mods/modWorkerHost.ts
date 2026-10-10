@@ -277,11 +277,13 @@ export class ModWorkerHost {
           },
           (error: unknown) => {
             settle();
+            const code = (error as { readonly code?: unknown } | null)?.code;
             this.post({
               type: "api-result",
               requestId: message.requestId,
               ok: false,
               error: error instanceof Error ? error.message : describeModError(error),
+              ...(typeof code === "string" ? { code } : {}),
             });
           },
         );

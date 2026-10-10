@@ -18,11 +18,12 @@ export const WS_REQUEST_CLASS_LIMITS: Readonly<Record<WsRequestClass, number>> =
   mods: 4,
 };
 
-/** Calls that run a mod's code, which may take seconds. */
+/** Calls that run a mod's code or wait on a server it chose, which may take seconds. */
 const MOD_METHODS = new Set<string>([
   MODS_WS_METHODS.renderView,
   MODS_WS_METHODS.dispatchUi,
   MODS_WS_METHODS.runCommand,
+  MODS_WS_METHODS.mcpSignIn,
 ]);
 
 const CONTROL_METHODS = new Set<string>([

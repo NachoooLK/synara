@@ -40,6 +40,16 @@ describe("shouldInlineSkillForProvider", () => {
 
   it("inlines only Synara-owned paths for cursor", () => {
     expect(shouldInlineSkillForProvider("cursor", synaraSkillPath)).toBe(true);
+    // Beta and development keep their home in their own folder; it is Synara's all the same.
+    expect(
+      shouldInlineSkillForProvider("cursor", "/Users/me/.synara-beta/skills/reviewer/SKILL.md"),
+    ).toBe(true);
+    expect(
+      shouldInlineSkillForProvider(
+        "cursor",
+        "/Users/me/.synara-beta/builtin-skills/synara-mods/SKILL.md",
+      ),
+    ).toBe(true);
     expect(shouldInlineSkillForProvider("cursor", cursorSkillPath)).toBe(false);
     expect(shouldInlineSkillForProvider("cursor", codexSkillPath)).toBe(false);
   });
@@ -52,6 +62,9 @@ describe("shouldInlineSkillForProvider", () => {
 
   it("inlines cross-provider paths for pi but not pi-native skills", () => {
     expect(shouldInlineSkillForProvider("pi", synaraSkillPath)).toBe(true);
+    expect(
+      shouldInlineSkillForProvider("pi", "/Users/me/.synara-beta/skills/reviewer/SKILL.md"),
+    ).toBe(true);
     expect(shouldInlineSkillForProvider("pi", claudeSkillPath)).toBe(true);
     expect(shouldInlineSkillForProvider("pi", piSkillPath)).toBe(false);
   });

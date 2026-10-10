@@ -16,6 +16,10 @@ function mod(id: string, statusText: string | null = null): ModSummary {
     commands: [],
     views: [],
     mcpServers: [],
+    mcpSignIns: [],
+    permissions: [],
+    tools: [],
+    reloadsOnChange: false,
     statusText,
     loadedAt: null,
   };

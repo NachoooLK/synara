@@ -119,7 +119,7 @@ import { isServerGroupsEnabled } from "../../projectAgent/groupsBetaGate.ts";
 import { makeThreadReadTools } from "../threadReadTools.ts";
 import { makeThreadDiagnosticTools } from "../threadDiagnosticTools.ts";
 import { makeAgentGatewayKanbanTools } from "../kanbanTools.ts";
-import { makeAgentGatewayModTools } from "../modTools.ts";
+import { makeAgentGatewayModTools, makeAgentGatewayModToolSource } from "../modTools.ts";
 import { ModHost } from "../../mods/Services/ModHost.ts";
 import { pruneProjectedArchivedManagedWorktrees } from "../../managedWorktrees.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -1624,11 +1624,17 @@ export const makeAgentGateway = Effect.gen(function* () {
       .map((tool) => tool.definition.name),
   );
 
+  const modToolSource =
+    modHost?.available === true ? makeAgentGatewayModToolSource(modHost) : undefined;
+
   return {
     handleMcpPost: makeAgentGatewayMcpTransport({
       credentials,
       snapshotQuery,
       tools,
+      ...(modToolSource
+        ? { dynamicTools: modToolSource.tools, missingDynamicTool: modToolSource.missingTool }
+        : {}),
       onCapabilityDenied: surfaceCapabilityDenial,
       // Namespace-insensitive: a session that never saw the catalog reaches
       // for prefixed spellings (synara_computer_click,

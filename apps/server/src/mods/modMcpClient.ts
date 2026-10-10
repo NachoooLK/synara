@@ -3,7 +3,8 @@
 //          mod's manifest declares, started on first use and closed with the mod.
 //          Local servers speak JSON-RPC over stdio in their own process tree, with
 //          the filtered environment provider children get; remote ones speak
-//          streamable HTTP under one deadline per request, body included.
+//          streamable HTTP under one deadline per request, body included, and
+//          carry the person's sign-in when the server asks for one.
 // Layer: Mods runtime
 
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -50,6 +51,41 @@ export interface ModMcpCallResult {
 
 export class ModMcpError extends Error {
   override readonly name = "ModMcpError";
+}
+
+/** The `code` of the error a mod's call fails with while its server waits for a sign-in. */
+export const MOD_MCP_SIGN_IN_NEEDED_CODE = "mcp_sign_in_needed";
+
+/** The call cannot be made until the person signs in to the server. */
+export class ModMcpSignInNeededError extends ModMcpError {
+  readonly code = MOD_MCP_SIGN_IN_NEEDED_CODE;
+}
+
+/** A request the server would not serve for lack of a sign-in it accepts. */
+export interface ModMcpRefusal {
+  readonly status: number;
+  /** The `WWW-Authenticate` header, which may say where to sign in. */
+  readonly challenge: string | null;
+  /** The token the request carried, or null when it carried none. */
+  readonly token: string | null;
+}
+
+/**
+ * The person's sign-in to one remote server. It lives outside the client: the
+ * token never enters the mod, and it outlasts the connection.
+ */
+export interface ModMcpAccess {
+  /**
+   * The token to send, or null for a server not known to ask for one. Throws
+   * `ModMcpSignInNeededError` when the person has to sign in first.
+   */
+  readonly token: () => Promise<string | null>;
+  /**
+   * Resolves true when the request should be sent again (there is a new
+   * token) and false when the refusal is not about signing in; throws
+   * `ModMcpSignInNeededError` when the person has to sign in.
+   */
+  readonly refused: (refusal: ModMcpRefusal) => Promise<boolean>;
 }
 
 /** Synara's own variables (auth token, ports, homes) are never handed to a mod. */
@@ -260,7 +296,11 @@ class StdioTransport implements McpTransport {
 type HttpOutcome =
   | { readonly kind: "result"; readonly value: unknown }
   /** HTTP 404 to a request that carried this session id: the server forgot it. */
-  | { readonly kind: "expired"; readonly sessionId: string };
+  | { readonly kind: "expired"; readonly sessionId: string }
+  /** HTTP 401 or 403 from a server whose sign-in Synara can handle. */
+  | ({ readonly kind: "refused" } & ModMcpRefusal);
+
+type ServedOutcome = Exclude<HttpOutcome, { readonly kind: "refused" }>;
 
 /**
  * Incremental `text/event-stream` reader. Hands each event's `data:` lines,
@@ -324,19 +364,25 @@ class HttpTransport implements McpTransport {
   private readonly url: string;
   private readonly headers: Record<string, string>;
   private readonly serverName: string;
+  private readonly access: ModMcpAccess | null;
   private sessionId: string | null = null;
   private renewal: Promise<void> | null = null;
   private nextId = 1;
   private closed = false;
   private readonly aborts = new Set<AbortController>();
 
-  constructor(serverName: string, config: Extract<ModMcpServerConfig, { readonly url: string }>) {
+  constructor(
+    serverName: string,
+    config: Extract<ModMcpServerConfig, { readonly url: string }>,
+    access: ModMcpAccess | null,
+  ) {
     this.serverName = serverName;
     this.url = expandModMcpValue(config.url);
     if (!/^https?:\/\//iu.test(this.url)) {
       throw new ModMcpError(`The "${serverName}" MCP server URL must be http or https.`);
     }
     this.headers = expandRecord(config.headers);
+    this.access = access;
   }
 
   /**
@@ -346,9 +392,25 @@ class HttpTransport implements McpTransport {
   private async post<T>(
     body: Record<string, unknown>,
     sessionId: string | null,
-    consume: (response: Response) => Promise<T>,
+    consume: (response: Response, token: string | null) => Promise<T>,
   ): Promise<T> {
     if (this.closed) throw new ModMcpError(CLOSED_MESSAGE);
+    // Before the deadline starts: a token that ran out may be renewed here.
+    const token = this.access === null ? null : await this.access.token();
+    if (this.closed) throw new ModMcpError(CLOSED_MESSAGE);
+    // The sign-in's token replaces an Authorization header the manifest sets; two
+    // spellings of one header would be sent joined, which no server accepts.
+    const headers =
+      token === null
+        ? this.headers
+        : {
+            ...Object.fromEntries(
+              Object.entries(this.headers).filter(
+                ([name]) => name.toLowerCase() !== "authorization",
+              ),
+            ),
+            authorization: `Bearer ${token}`,
+          };
     const abort = new AbortController();
     this.aborts.add(abort);
     const timer = setTimeout(
@@ -364,7 +426,7 @@ class HttpTransport implements McpTransport {
         response = await fetch(this.url, {
           method: "POST",
           headers: {
-            ...this.headers,
+            ...headers,
             "content-type": "application/json",
             accept: "application/json, text/event-stream",
             "mcp-protocol-version": MCP_PROTOCOL_VERSION,
@@ -380,7 +442,7 @@ class HttpTransport implements McpTransport {
         );
       }
       try {
-        return await consume(response);
+        return await consume(response, token);
       } catch (error) {
         if (abort.signal.reason instanceof ModMcpError) throw abort.signal.reason;
         if (error instanceof ModMcpError) throw error;
@@ -469,7 +531,16 @@ class HttpTransport implements McpTransport {
   private send(method: string, params: unknown): Promise<HttpOutcome> {
     const id = this.nextId++;
     const sessionId = this.sessionId;
-    return this.post({ id, method, params }, sessionId, async (response) => {
+    return this.post({ id, method, params }, sessionId, async (response, token) => {
+      if (this.access !== null && (response.status === 401 || response.status === 403)) {
+        void response.body?.cancel().catch(() => undefined);
+        return {
+          kind: "refused",
+          status: response.status,
+          challenge: response.headers.get("www-authenticate"),
+          token,
+        };
+      }
       if (this.sessionId === sessionId) {
         this.sessionId = response.headers.get("mcp-session-id") ?? this.sessionId;
       }
@@ -495,8 +566,24 @@ class HttpTransport implements McpTransport {
     });
   }
 
-  private async requestOnce(method: string, params: unknown): Promise<unknown> {
+  /**
+   * Sends a request, and once more when the server refused the first one and the
+   * sign-in has a new token to try. A refusal that stands fails the request, as a
+   * need to sign in when that is what it is.
+   */
+  private async sendSignedIn(method: string, params: unknown): Promise<ServedOutcome> {
     const outcome = await this.send(method, params);
+    if (outcome.kind !== "refused") return outcome;
+    if (!(await this.access?.refused(outcome))) throw this.httpError(method, outcome.status);
+    const again = await this.send(method, params);
+    if (again.kind !== "refused") return again;
+    // Lets the sign-in learn that its new token is refused too; it may throw.
+    await this.access?.refused(again);
+    throw this.httpError(method, again.status);
+  }
+
+  private async requestOnce(method: string, params: unknown): Promise<unknown> {
+    const outcome = await this.sendSignedIn(method, params);
     if (outcome.kind === "expired") throw this.httpError(method, 404);
     return outcome.value;
   }
@@ -519,7 +606,7 @@ class HttpTransport implements McpTransport {
 
   async request(method: string, params: unknown): Promise<unknown> {
     if (this.renewal) await this.renewal.catch(() => undefined);
-    const outcome = await this.send(method, params);
+    const outcome = await this.sendSignedIn(method, params);
     if (outcome.kind === "result") return outcome.value;
     // The server restarted or expired the session: start a new one and retry once.
     await this.renewSession(outcome.sessionId);
@@ -547,16 +634,19 @@ export class ModMcpClient {
   private readonly serverName: string;
   private readonly config: ModMcpServerConfig;
   private readonly refusedEnv: ReadonlyArray<string>;
+  private readonly access: ModMcpAccess | null;
   /** Set before the handshake so `close()` can stop a server that is still starting. */
   private transport: McpTransport | null = null;
   private connection: Promise<McpTransport> | null = null;
   private readonly stopping = new Set<Promise<void>>();
   private closed = false;
 
-  constructor(serverName: string, config: ModMcpServerConfig) {
+  /** `access`: the person's sign-in to a remote server, when Synara handles one for it. */
+  constructor(serverName: string, config: ModMcpServerConfig, access: ModMcpAccess | null = null) {
     this.serverName = serverName;
     this.config = config;
     this.refusedEnv = refusedEnvNames(config);
+    this.access = access;
   }
 
   private connect(): Promise<McpTransport> {
@@ -565,7 +655,7 @@ export class ModMcpClient {
     const transport: McpTransport =
       "command" in this.config
         ? new StdioTransport(this.serverName, this.config)
-        : new HttpTransport(this.serverName, this.config);
+        : new HttpTransport(this.serverName, this.config, this.access);
     this.transport = transport;
     const connection = this.handshake(transport);
     this.connection = connection;
@@ -600,6 +690,7 @@ export class ModMcpClient {
   /** Names the `${env:SYNARA_*}` references that were left empty, if any. */
   private explain(error: unknown): unknown {
     if (!(error instanceof ModMcpError) || this.refusedEnv.length === 0) return error;
+    if (error instanceof ModMcpSignInNeededError) return error;
     const names = this.refusedEnv.map((name) => `\${env:${name}}`).join(", ");
     return new ModMcpError(
       `${error.message} (${names} ${this.refusedEnv.length === 1 ? "was" : "were"} left empty: mods cannot read Synara's own SYNARA_ variables.)`,

@@ -308,7 +308,29 @@ let nextRequestId = 1;
 // asked for an effect such as opening a thread, even from a closure made at render.
 const currentCall = new AsyncLocalStorage<number>();
 
+/**
+ * What crosses to the server is copied into its memory before any of its own
+ * limits apply, so nothing larger than this leaves the worker.
+ */
+const MOD_MESSAGE_MAX_CHARS = 8_000_000;
+
+function isTooLargeToSend(value: unknown): boolean {
+  try {
+    return (JSON.stringify(value)?.length ?? 0) > MOD_MESSAGE_MAX_CHARS;
+  } catch {
+    // Not JSON (a cycle, a BigInt): posting it decides whether it can travel.
+    return false;
+  }
+}
+
 function callApi(method: string, args: ReadonlyArray<unknown>): Promise<unknown> {
+  if (isTooLargeToSend(args)) {
+    return Promise.reject(
+      new Error(
+        `$.${method}: the arguments are larger than ${MOD_MESSAGE_MAX_CHARS / 1_000_000} MB.`,
+      ),
+    );
+  }
   const requestId = nextRequestId++;
   const callId = currentCall.getStore() ?? null;
   return new Promise((resolve, reject) => {
@@ -492,7 +514,13 @@ async function invokeHandler(callId: number, handlerId: string, payload: unknown
 function settle(pending: Pending | undefined, outcome: ModCallOutcome): void {
   if (!pending) return;
   if (outcome.ok) pending.resolve(outcome.value);
-  else pending.reject(new Error(outcome.error));
+  else {
+    pending.reject(
+      outcome.code === undefined
+        ? new Error(outcome.error)
+        : Object.assign(new Error(outcome.error), { code: outcome.code }),
+    );
+  }
 }
 
 async function invoke(callId: number, hookId: number, input: unknown): Promise<void> {
@@ -518,7 +546,13 @@ async function invoke(callId: number, hookId: number, input: unknown): Promise<v
   let outcome: ModCallOutcome;
   try {
     const value = await currentCall.run(callId, () => hook.fn(api, deepFreeze(input), next));
-    outcome = { ok: true, value: withHandlerReferences(value) };
+    const result = withHandlerReferences(value);
+    outcome = isTooLargeToSend(result)
+      ? {
+          ok: false,
+          error: `A "${hook.event}" hook returned more than ${MOD_MESSAGE_MAX_CHARS / 1_000_000} MB.`,
+        }
+      : { ok: true, value: result };
   } catch (error) {
     outcome = { ok: false, error: describeForMod(error) };
   }

@@ -72,6 +72,7 @@ import {
   ComputerService,
   type ComputerServiceShape,
 } from "../../computer/Services/ComputerService.ts";
+import { ModHost, type ModHostShape } from "../../mods/Services/ModHost.ts";
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
 import { GitCommandError, TextGenerationError } from "../../git/Errors.ts";
 import {
@@ -348,6 +349,8 @@ describe("ProviderCommandReactor", () => {
     readonly generateThreadTitle?: TextGenerationShape["generateThreadTitle"];
     readonly computerService?: ComputerServiceShape;
     readonly gatewaySessions?: AgentGatewaySessionRegistryShape;
+    /** The mods service the reactor asks before sending a person's message. */
+    readonly modHost?: Pick<ModHostShape, "hasHooks" | "submitPrompt">;
     readonly getClaudeCacheObservation?: NonNullable<
       ProviderServiceShape["getClaudeCacheObservation"]
     >;
@@ -773,9 +776,14 @@ describe("ProviderCommandReactor", () => {
           : Layer.empty,
       ),
       Layer.provideMerge(
-        input?.gatewaySessions
-          ? Layer.succeed(AgentGatewaySessionRegistry, input.gatewaySessions)
-          : Layer.empty,
+        Layer.mergeAll(
+          input?.gatewaySessions
+            ? Layer.succeed(AgentGatewaySessionRegistry, input.gatewaySessions)
+            : Layer.empty,
+          input?.modHost
+            ? Layer.succeed(ModHost, input.modHost as unknown as ModHostShape)
+            : Layer.empty,
+        ),
       ),
       Layer.provideMerge(
         Layer.succeed(ProviderHealth, {
@@ -1524,6 +1532,117 @@ describe("ProviderCommandReactor", () => {
       }),
     );
   }
+
+  describe("prompt.submit mods", () => {
+    const makeModHost = (
+      rewrite: (text: string) => ReturnType<ModHostShape["submitPrompt"]>,
+    ): {
+      readonly host: Pick<ModHostShape, "hasHooks" | "submitPrompt">;
+      readonly seen: string[];
+    } => {
+      const seen: string[] = [];
+      return {
+        seen,
+        host: {
+          hasHooks: (event) => event === "prompt.submit",
+          submitPrompt: (input) => {
+            seen.push(input.text);
+            return rewrite(input.text);
+          },
+        },
+      };
+    };
+
+    it("sends what the mods returned and keeps the person's message as written", async () => {
+      const mods = makeModHost((text) =>
+        Effect.succeed({
+          kind: "send",
+          text: `${text}\n\nTeam rule: add tests.`,
+          changedBy: ["rules"],
+        }),
+      );
+      const harness = await createHarness({ modHost: mods.host });
+      await dispatchHarnessUserTurn(harness, {
+        messageId: "mod-rewrite-message",
+        text: "Fix the login bug",
+        createdAt: new Date().toISOString(),
+      });
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      await harness.drain();
+
+      expect(mods.seen).toEqual(["Fix the login bug"]);
+      const sent = harness.sendTurn.mock.calls[0]?.[0].input as string;
+      expect(sent).toContain("Fix the login bug\n\nTeam rule: add tests.");
+      const thread = await readHarnessThread(harness);
+      expect(thread?.messages.find((message) => message.id === "mod-rewrite-message")?.text).toBe(
+        "Fix the login bug",
+      );
+      expect(
+        thread?.activities.some(
+          (activity) =>
+            activity.kind === "mod.prompt.changed" &&
+            activity.summary === "Message changed by the rules mod",
+        ),
+      ).toBe(true);
+    });
+
+    it("sends nothing when a mod stops the message, and says which mod and why", async () => {
+      const mods = makeModHost(() =>
+        Effect.succeed({ kind: "block", modId: "guard", reason: "it holds a token" }),
+      );
+      const harness = await createHarness({ modHost: mods.host });
+      await dispatchHarnessUserTurn(harness, {
+        messageId: "mod-block-message",
+        text: "Use token sk-123",
+        createdAt: new Date().toISOString(),
+      });
+      await waitFor(async () =>
+        ((await readHarnessThread(harness))?.activities ?? []).some(
+          (activity) => activity.kind === "provider.turn.start.failed",
+        ),
+      );
+      await harness.drain();
+
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      const thread = await readHarnessThread(harness);
+      const failure = thread?.activities.find(
+        (activity) => activity.kind === "provider.turn.start.failed",
+      );
+      expect(failure?.summary).toBe("Message stopped by a mod");
+      expect((failure?.payload as { readonly detail?: string }).detail).toBe(
+        "The guard mod stopped this message: it holds a token",
+      );
+    });
+
+    it("does not pass a message an agent sent through the mods", async () => {
+      const mods = makeModHost((text) =>
+        Effect.succeed({ kind: "send", text: `${text} [changed]`, changedBy: ["rules"] }),
+      );
+      const harness = await createHarness({ modHost: mods.host });
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.makeUnsafe("cmd-mod-agent-origin"),
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          message: {
+            messageId: asMessageId("mod-agent-origin-message"),
+            role: "user",
+            text: "Report from another agent",
+            attachments: [],
+          },
+          dispatchOrigin: "agent",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: new Date().toISOString(),
+        }),
+      );
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      await harness.drain();
+
+      expect(mods.seen).toEqual([]);
+      expect(harness.sendTurn.mock.calls[0]?.[0].input as string).not.toContain("[changed]");
+    });
+  });
 
   async function emitHarnessTurnTerminal(
     harness: Awaited<ReturnType<typeof createHarness>>,

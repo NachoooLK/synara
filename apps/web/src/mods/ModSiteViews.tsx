@@ -16,6 +16,7 @@ import { useModsStore } from "./modsStore";
 interface SiteView {
   readonly modId: string;
   readonly viewId: string;
+  readonly title: string;
 }
 
 function useSiteViews(site: ModViewSite): readonly SiteView[] {
@@ -27,7 +28,7 @@ function useSiteViews(site: ModViewSite): readonly SiteView[] {
       .flatMap((mod) =>
         mod.views
           .filter((view) => view.site === site)
-          .map((view) => ({ modId: mod.id, viewId: view.id })),
+          .map((view) => ({ modId: mod.id, viewId: view.id, title: view.title })),
       );
   }, [snapshot, site]);
 }
@@ -45,7 +46,18 @@ export function ModComposerBands(props: { threadId: ThreadId; projectId: string 
           site="band"
           quiet
           className="min-w-0 px-3 py-1.5"
-          frame={(content) => <ComposerStackedPanel>{content}</ComposerStackedPanel>}
+          // Nothing on a band says where it comes from; its name and mod are one hover away.
+          frame={(content) => (
+            <ComposerStackedPanel>
+              <div
+                role="group"
+                aria-label={`${view.title}, from the ${view.modId} mod`}
+                title={`${view.title} · ${view.modId} mod`}
+              >
+                {content}
+              </div>
+            </ComposerStackedPanel>
+          )}
         />
       ))}
     </>

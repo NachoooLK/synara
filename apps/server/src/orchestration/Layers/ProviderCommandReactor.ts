@@ -104,6 +104,7 @@ import {
 } from "../../provider/Errors.ts";
 import { providerDisabledSettingsMessage } from "../../provider/enabledProviderAdapter.ts";
 import { buildInlineSkillInstructions } from "../../provider/skillPromptInjection.ts";
+import { ModHost } from "../../mods/Services/ModHost.ts";
 import {
   PROVIDER_DEBUG_MODE_PROMPT_PREFIX,
   withProviderDebugModePrompt,
@@ -616,6 +617,8 @@ const PRE_TURN_BASELINE_REF_PROBE_TIMEOUT = Duration.seconds(1);
 const PROVIDER_CACHE_RESPONSE_TIMEOUT = Duration.minutes(15);
 const GATEWAY_OPERATION_COMPLETION_WAIT_TIMEOUT = Duration.seconds(120);
 const PROVIDER_INPUT_SAFETY_MARGIN_CHARS = 1_000;
+/** Marks the failure of a turn start that a mod's `prompt.submit` hook stopped. */
+const MOD_PROMPT_BLOCK_OPERATION = "mods/prompt.submit";
 const THREAD_MENTION_CONTEXT_SUFFIX_PREFIX_CHARS = 2;
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const SIDECHAT_BOUNDARY_INSTRUCTION =
@@ -914,6 +917,8 @@ const make = Effect.gen(function* () {
   // handlers run inside the dispatching fiber, so a serviceOption lookup at
   // call time would see that fiber's (possibly empty) environment instead.
   const projectAgentRepository = yield* Effect.serviceOption(ProjectAgentRepository);
+  // Beta-only and optional: without mods, or with none hooking prompts, turns pay nothing.
+  const modHost = yield* Effect.serviceOption(ModHost);
   const acceptedCompletionContexts = new Set<number>();
   const textGeneration = yield* TextGeneration;
   const serverSettings = yield* ServerSettingsService;
@@ -2917,6 +2922,70 @@ const make = Effect.gen(function* () {
       : withLease(effect);
   };
 
+  const rewritePromptWithMods = Effect.fnUntraced(function* (input: {
+    readonly host: typeof ModHost.Service;
+    readonly thread: OrchestrationThread;
+    readonly threadId: ThreadId;
+    readonly text: string;
+    readonly modelSelection: ModelSelection | undefined;
+    readonly maxChars: number;
+    readonly createdAt: string;
+  }) {
+    const selection = input.modelSelection ?? input.thread.modelSelection;
+    const provider = input.thread.session?.providerName ?? selection.provider;
+    const outcome = yield* input.host.submitPrompt(
+      {
+        threadId: input.threadId,
+        projectId: input.thread.projectId,
+        provider,
+        model: selection.model,
+        text: input.text,
+      },
+      input.maxChars,
+    );
+    if (outcome.kind === "block") {
+      return yield* new ProviderAdapterValidationError({
+        provider,
+        operation: MOD_PROMPT_BLOCK_OPERATION,
+        issue: `The ${outcome.modId} mod stopped this message: ${outcome.reason}`,
+      });
+    }
+    return { text: outcome.text, changedBy: outcome.changedBy };
+  });
+
+  /**
+   * The transcript keeps the person's words; this line says that the agent got
+   * more. It hangs on the turn, because the thread only shows what a turn did.
+   */
+  const noteModPromptChange = (input: {
+    readonly threadId: ThreadId;
+    readonly changedBy: ReadonlyArray<string>;
+    readonly turnId: TurnId | null;
+    readonly createdAt: string;
+  }) =>
+    input.changedBy.length === 0
+      ? Effect.void
+      : orchestrationEngine
+          .dispatch({
+            type: "thread.activity.append",
+            commandId: serverCommandId("mod-prompt-changed"),
+            threadId: input.threadId,
+            activity: {
+              id: EventId.makeUnsafe(crypto.randomUUID()),
+              tone: "info",
+              kind: "mod.prompt.changed",
+              summary:
+                input.changedBy.length === 1
+                  ? `Message changed by the ${input.changedBy[0]} mod`
+                  : `Message changed by mods: ${input.changedBy.join(", ")}`,
+              payload: { mods: [...input.changedBy] },
+              turnId: input.turnId,
+              createdAt: input.createdAt,
+            },
+            createdAt: input.createdAt,
+          })
+          .pipe(Effect.ignore);
+
   const dispatchTurnForThreadCore = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly sourceEventSequence: number;
@@ -2976,12 +3045,40 @@ const make = Effect.gen(function* () {
         : null;
     // Synara owns this command. Keep it in durable user text for provenance,
     // but do not ask the provider to interpret a native slash command.
-    const authoredMessageText = computerInvocation
+    const writtenMessageText = computerInvocation
       ? computerInvocation.prompt || "Use Synara Computer for this task."
       : input.messageText;
     // The project packet is ambient context, not user words: it prefixes the
     // assembled provider input rather than joining `<latest_user_message>`.
     const projectContextPrefix = projectContext.trim().length > 0 ? `${projectContext}\n\n` : "";
+    // Mods the person allowed to change prompts see what the person wrote, once per
+    // dispatch and before any context is added, so every budget below fits the result.
+    // The stored message stays as written. Messages Synara or an agent authored, native
+    // control commands and reviews never pass through a mod.
+    const promptFromMods =
+      Option.isSome(modHost) &&
+      modHost.value.hasHooks("prompt.submit") &&
+      (input.dispatchOrigin === undefined || input.dispatchOrigin === "user") &&
+      input.turnKind !== "goal-continuation" &&
+      input.reviewTarget === undefined &&
+      !/^\/compact(?:\s|$)/.test(input.messageText.trim())
+        ? yield* rewritePromptWithMods({
+            host: modHost.value,
+            thread,
+            threadId: input.threadId,
+            text: writtenMessageText,
+            modelSelection: input.modelSelection,
+            maxChars: Math.max(
+              0,
+              PROVIDER_SEND_TURN_MAX_INPUT_CHARS -
+                PROVIDER_INPUT_SAFETY_MARGIN_CHARS -
+                providerPromptOverheadChars -
+                projectContextPrefix.length,
+            ),
+            createdAt: input.createdAt,
+          })
+        : { text: writtenMessageText, changedBy: [] as ReadonlyArray<string> };
+    const authoredMessageText = promptFromMods.text;
     const promptWithProjectContext = `${projectContextPrefix}${authoredMessageText}`;
     const threadMentionProjection = yield* resolveThreadMentionPromptProjection({
       mentions: input.mentions,
@@ -3081,6 +3178,12 @@ const make = Effect.gen(function* () {
           : {}),
         ...(input.skills !== undefined ? { skills: input.skills } : {}),
         ...(providerMentions !== undefined ? { mentions: providerMentions } : {}),
+      });
+      yield* noteModPromptChange({
+        threadId: input.threadId,
+        changedBy: promptFromMods.changedBy,
+        turnId: thread.latestTurn?.turnId ?? null,
+        createdAt: input.createdAt,
       });
       return;
     }
@@ -3266,7 +3369,8 @@ const make = Effect.gen(function* () {
               Math.min(
                 16_000,
                 PROVIDER_SEND_TURN_MAX_INPUT_CHARS -
-                  input.messageText.length -
+                  // A mod may have made the message longer than it was written.
+                  Math.max(input.messageText.length, authoredMessageText.length) -
                   mentionContextSuffix.length -
                   providerPromptOverheadChars -
                   PROVIDER_INPUT_SAFETY_MARGIN_CHARS,
@@ -4057,6 +4161,12 @@ const make = Effect.gen(function* () {
         sidechatContextBootstrapThreadIds.delete(input.threadId);
       }
     }
+    yield* noteModPromptChange({
+      threadId: input.threadId,
+      changedBy: promptFromMods.changedBy,
+      turnId: startedTurn?.turnId ?? thread.session?.activeTurnId ?? null,
+      createdAt: input.createdAt,
+    });
     return startedTurn;
   });
 
@@ -4688,12 +4798,18 @@ const make = Effect.gen(function* () {
                 const cancelledCompaction =
                   failure instanceof ProviderAdapterValidationError &&
                   failure.operation === "startClaudeCompaction.cancelled";
-                const detail = Cause.pretty(cause);
+                // A mod stopping a message is not a provider failure; say what happened.
+                const stoppedByMod =
+                  failure instanceof ProviderAdapterValidationError &&
+                  failure.operation === MOD_PROMPT_BLOCK_OPERATION;
+                const detail = stoppedByMod ? failure.issue : Cause.pretty(cause);
                 if (!cancelledCompaction)
                   yield* appendProviderFailureActivity({
                     threadId: event.payload.threadId,
                     kind: "provider.turn.start.failed",
-                    summary: "Provider turn start failed",
+                    summary: stoppedByMod
+                      ? "Message stopped by a mod"
+                      : "Provider turn start failed",
                     detail,
                     turnId: null,
                     createdAt: event.payload.createdAt,

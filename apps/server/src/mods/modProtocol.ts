@@ -16,10 +16,13 @@ export const MOD_API_METHODS = [
   "ui.openThread",
   "ui.openUrl",
   "ui.openDockView",
+  "mcp.status",
   "mcp.tools",
   "mcp.call",
   "command.register",
   "command.unregister",
+  "tool.register",
+  "tool.unregister",
   "threads.list",
   "threads.get",
   "projects.list",
@@ -52,7 +55,8 @@ export interface ModHookRegistration {
 
 export type ModCallOutcome =
   | { readonly ok: true; readonly value: unknown }
-  | { readonly ok: false; readonly error: string };
+  /** `code`: set on failures a mod may want to tell apart, such as a server waiting for a sign-in. */
+  | { readonly ok: false; readonly error: string; readonly code?: string };
 
 export type HostToWorkerMessage =
   | {

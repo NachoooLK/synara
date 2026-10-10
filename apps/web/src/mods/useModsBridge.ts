@@ -17,7 +17,7 @@ import { readNativeApi } from "~/nativeApi";
 
 import { registerModDockViewOpener } from "./ModViewHost";
 import { useModsStore } from "./modsStore";
-import { findStoppedMods } from "./modsSnapshot.logic";
+import { findNewlyNeededSignIns, findStoppedMods } from "./modsSnapshot.logic";
 import { openModDockView } from "./useModDockItems";
 
 function isModsRefusal(error: unknown): boolean {
@@ -39,10 +39,30 @@ export function showModToast(toast: Pick<ModToast, "modId" | "text" | "tone">): 
 
 /** A crash would otherwise only show in Settings → Mods. */
 function showModStoppedToast(mod: ModSummary, openModsSettings: () => void): void {
+  if (mod.status === "changed") {
+    toastManager.add({
+      type: "warning",
+      title: `The ${mod.id} mod changed and was stopped`,
+      description:
+        "Its files are not the ones you enabled. Trust the change in Mods settings to run it again.",
+      actionProps: { children: "Open Mods settings", onClick: openModsSettings },
+    });
+    return;
+  }
   toastManager.add({
     type: "error",
     title: `The ${mod.id} mod stopped`,
     description: mod.error ?? "It closed unexpectedly.",
+    actionProps: { children: "Open Mods settings", onClick: openModsSettings },
+  });
+}
+
+/** The mod's views ask too, but none may be open; its calls to the server fail until then. */
+function showModSignInNeededToast(modId: string, host: string, openModsSettings: () => void): void {
+  toastManager.add({
+    type: "warning",
+    title: `The ${modId} mod needs you to sign in`,
+    description: `Sign in to ${host} in Settings → Mods.`,
     actionProps: { children: "Open Mods settings", onClick: openModsSettings },
   });
 }
@@ -60,9 +80,14 @@ export function useModsBridge(): void {
     });
     const { setSnapshot, setUnavailable } = useModsStore.getState();
     const applySnapshot = (next: ModsSnapshot) => {
-      const stopped = findStoppedMods(useModsStore.getState().snapshot, next);
+      const previous = useModsStore.getState().snapshot;
+      const stopped = findStoppedMods(previous, next);
+      const signIns = findNewlyNeededSignIns(previous, next);
       setSnapshot(next);
       for (const mod of stopped) showModStoppedToast(mod, openModsSettings);
+      for (const { modId, signIn } of signIns) {
+        showModSignInNeededToast(modId, signIn.host, openModsSettings);
+      }
     };
     let disposed = false;
     let unsubscribe: (() => void) | null = null;

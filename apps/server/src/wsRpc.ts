@@ -3104,6 +3104,14 @@ const makeWsRpcHandlersLayer = () =>
           requireWsOwnerSession.pipe(
             Effect.andThen(modHost.import(input).pipe(Effect.mapError(toModsRpcError))),
           ),
+        // Signing in hands the mod the owner's account on a server, so it is the
+        // owner's to do; a paired device may still end a sign-in.
+        [MODS_WS_METHODS.mcpSignIn]: (input) =>
+          requireWsOwnerSession.pipe(
+            Effect.andThen(modHost.mcpSignIn(input).pipe(Effect.mapError(toModsRpcError))),
+          ),
+        [MODS_WS_METHODS.mcpSignOut]: (input) =>
+          modHost.mcpSignOut(input).pipe(Effect.mapError(toModsRpcError)),
         [MODS_WS_METHODS.subscribeEvents]: (_, { clientId }) =>
           streamAdmission.guard(
             clientId,

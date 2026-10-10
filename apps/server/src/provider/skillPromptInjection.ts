@@ -35,6 +35,17 @@ function pathSegments(path: string): Set<string> {
   );
 }
 
+/**
+ * Whether a skill lives in a Synara home. Each flavor has its own (`.synara`,
+ * `.synara-beta`, `.synara-dev`, …), and no provider scans any of them.
+ */
+function isSynaraOwnedSkillPath(segments: ReadonlySet<string>): boolean {
+  for (const segment of segments) {
+    if (segment === ".synara" || segment.startsWith(".synara-")) return true;
+  }
+  return false;
+}
+
 export function shouldInlineSkillForProvider(provider: ProviderKind, skillPath: string): boolean {
   const segments = pathSegments(skillPath);
   switch (provider) {
@@ -48,7 +59,7 @@ export function shouldInlineSkillForProvider(provider: ProviderKind, skillPath: 
     case "cursor":
       // cursor-agent natively scans .cursor/.agents/.claude/.codex skill roots;
       // only Synara-owned paths need inlining.
-      return segments.has(".synara");
+      return isSynaraOwnedSkillPath(segments);
     case "claudeAgent":
       // Claude Code only loads skills from .claude/skills folders.
       return !segments.has(".claude");
@@ -63,7 +74,10 @@ export function shouldInlineSkillForProvider(provider: ProviderKind, skillPath: 
     case "pi":
       // Pi loads its own skill set; anything resolved from a cross-provider
       // folder is portable and must be inlined.
-      return CROSS_PROVIDER_SKILL_DIR_NAMES.some((dir) => segments.has(dir));
+      return (
+        CROSS_PROVIDER_SKILL_DIR_NAMES.some((dir) => segments.has(dir)) ||
+        isSynaraOwnedSkillPath(segments)
+      );
     default:
       // Antigravity/Grok/Droid/OpenCode have no native skill support.
       return true;
