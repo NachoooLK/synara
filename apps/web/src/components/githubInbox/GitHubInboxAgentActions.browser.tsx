@@ -1,3 +1,4 @@
+import { modCodeReviewSelection } from "~/components/codeReview/codeReview.logic";
 // FILE: GitHubInboxAgentActions.browser.tsx
 // Purpose: Browser coverage for the inbox's agent actions, composed the way the route composes
 //          them: Send to agent (pull request and issue) up to the draft thread's card, the
@@ -7,9 +8,14 @@
 // Layer: GitHub inbox test
 
 import "../../index.css";
+import { Schema } from "effect";
+import { useModsStore } from "~/mods/modsStore";
 
 import {
   DEFAULT_SERVER_SETTINGS_VIEW,
+  ModsSnapshot,
+  ModsPullRequestListResult,
+  ModsPullRequestDetailResult,
   type ClientOrchestrationCommand,
   type GitHubInboxItem,
   type GitHubInboxListResult,
@@ -341,7 +347,7 @@ function Harness({ initialSearch }: { initialSearch: GitHubInboxSearch }) {
   const update = (patch: GitHubInboxSearchPatch) =>
     setSearch((previous) => mergeGitHubInboxSearch(previous, patch));
   setSearchFromTest = update;
-  const selection = githubInboxSelection(search);
+  const selection = modCodeReviewSelection(search) ?? githubInboxSelection(search);
   const sidechat = useGitHubInboxSidechat(selection);
   return (
     <div className="flex h-screen w-screen">
@@ -418,6 +424,7 @@ function shownSidechat(): string | null {
 
 beforeEach(async () => {
   localStorage.clear();
+  useModsStore.setState({ snapshot: null });
   useProjectEnvironmentStore.setState({ envModeByProjectId: {} });
   createdSidechats.length = 0;
   expiredSidechatIds.clear();
@@ -444,6 +451,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await cleanup();
+  useModsStore.setState({ snapshot: null });
   toastManager.close();
   delete (window as { nativeApi?: NativeApi }).nativeApi;
   useStore.setState({ projects: [] });
@@ -881,4 +889,107 @@ describe("Ask", () => {
     await expect.poll(shownSidechat).toBe(sidechatId);
     expect(createdSidechats).toHaveLength(1);
   });
+});
+
+const MOD_SOURCE = { kind: "mod" as const, modId: "fixture", sourceId: "reviews" };
+const MOD_ENTRY = {
+  repository: "Team/Repo",
+  itemId: "review/A-α",
+  title: "Native mod review",
+  url: "https://reviews.example.test/42",
+  state: "open",
+  projectContexts: [],
+  isPinned: false,
+};
+it("hands mod Ask and Send to agent full context without GitHub checkout", async () => {
+  useModsStore
+    .getState()
+    .setSnapshot(
+      Schema.decodeUnknownSync(ModsSnapshot)({
+        modsDir: "/mods",
+        mods: [
+          {
+            id: "fixture",
+            version: "1",
+            description: null,
+            path: "/mods/fixture",
+            enabled: true,
+            status: "running",
+            error: null,
+            hooks: [],
+            commands: [],
+            tools: [],
+            views: [],
+            mcpServers: [],
+            mcpSignIns: [],
+            permissions: [],
+            reloadsOnChange: false,
+            statusText: null,
+            loadedAt: null,
+            pullRequestSources: [
+              {
+                source: MOD_SOURCE,
+                title: "Fixture reviews",
+                revision: "current",
+                capabilities: {},
+              },
+            ],
+          },
+        ],
+      }),
+    );
+  window.nativeApi!.mods = {
+    pullRequests: {
+      list: async () =>
+        Schema.decodeUnknownSync(ModsPullRequestListResult)({
+          source: MOD_SOURCE,
+          revision: "current",
+          items: [MOD_ENTRY],
+        }),
+      detail: async () =>
+        Schema.decodeUnknownSync(ModsPullRequestDetailResult)({
+          ...MOD_ENTRY,
+          source: MOD_SOURCE,
+          revision: "current",
+          body: "Fixture description",
+        }),
+    },
+  } as unknown as NativeApi["mods"];
+  await mount({
+    selectedSource: "mod:fixture:reviews",
+    selectedRepo: MOD_ENTRY.repository,
+    selectedItemId: MOD_ENTRY.itemId,
+  });
+  await expect.element(page.getByRole("heading", { name: MOD_ENTRY.title })).toBeVisible();
+  await expect
+    .element(page.getByRole("button", { name: "Send to agent: choose project", exact: true }), {
+      timeout: 1500,
+    })
+    .toBeVisible();
+  await page.getByRole("button", { name: "Send to agent: choose project", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Alpha", exact: true }).click();
+  await expect.poll(() => handleNewThread.mock.calls.length).toBe(1);
+  const card =
+    useComposerDraftStore.getState().draftsByThreadId["draft-thread" as ThreadId]
+      ?.pullRequestContexts[0];
+  expect(card).toMatchObject({
+    source: MOD_SOURCE,
+    repository: "Team/Repo",
+    itemId: "review/A-α",
+    prNumber: null,
+  });
+  expect(preparePullRequestThread).not.toHaveBeenCalled();
+  await openSideChat();
+  await expect.poll(() => createdSidechats.length).toBe(1);
+  expect(createdSidechats[0]).toMatchObject({
+    runtimeMode: "approval-required",
+    projectId: projectA,
+    sidechatContext: {
+      kind: "code-review-item",
+      source: MOD_SOURCE,
+      repository: "Team/Repo",
+      itemId: "review/A-α",
+    },
+  });
+  expect(preparePullRequestThread).not.toHaveBeenCalled();
 });

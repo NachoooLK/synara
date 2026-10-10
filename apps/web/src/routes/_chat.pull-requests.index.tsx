@@ -1,3 +1,4 @@
+import { modCodeReviewSelection } from "~/components/codeReview/codeReview.logic";
 // FILE: _chat.pull-requests.index.tsx
 // Purpose: The Inbox route (`/pull-requests`, kept so links and persisted nav state survive):
 //          validates the URL, owns the route shell and header, and hands the page body to
@@ -38,7 +39,7 @@ function GitHubInboxRouteView() {
       search: (previous) => mergeGitHubInboxSearch(previous, patch),
       replace: true,
     });
-  const selection = githubInboxSelection(search);
+  const selection = modCodeReviewSelection(search) ?? githubInboxSelection(search);
   const sidechat = useGitHubInboxSidechat(selection);
 
   return (

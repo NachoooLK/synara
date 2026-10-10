@@ -2062,7 +2062,10 @@ export default function ChatView({
   const standaloneSidechatContext =
     activeThread && isStandaloneSidechatThread(activeThread) ? activeThread.sidechatContext : null;
   const standaloneSidechatItemNoun =
-    standaloneSidechatContext?.itemKind === "issue" ? "issue" : "pull request";
+    standaloneSidechatContext?.kind === "github-item" &&
+    standaloneSidechatContext.itemKind === "issue"
+      ? "issue"
+      : "pull request";
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);
   const turnDiffSummaryByAssistantMessageId = useMemo(() => {

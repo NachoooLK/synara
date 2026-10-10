@@ -12,12 +12,18 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { getProviderInstanceOptions, getProviderStartOptions, useAppSettings } from "~/appSettings";
-import { createGitHubItemContextDraft } from "~/components/chat/environment/environmentPullRequest.logic";
+import { MODS_ON } from "~/betaFeatures";
+import { useModsStore } from "~/mods/modsStore";
+import { modPullRequestDetailQueryOptions } from "~/lib/modPullRequestQueryOptions";
+import type { modCodeReviewSelection } from "../codeReview/codeReview.logic";
 import { useSidechatShortcut } from "~/components/chat/useSidechatShortcut";
 import {
   githubItemCardSourceFromIssue,
   githubItemCardSourceFromPullRequest,
   githubItemSidechatContext,
+  codeReviewItemContextDraft,
+  codeReviewAgentItemKey,
+  modItemCardSourceFromDetail,
   type GitHubItemAgentTarget,
 } from "~/components/pullRequest/githubItemAgentContext";
 import { focusPullRequestRow } from "~/components/pullRequest/pullRequestFocus";
@@ -39,7 +45,10 @@ import { readNativeApi } from "~/nativeApi";
 import { selectRightDockState, useRightDockStore } from "~/rightDockStore";
 import { GITHUB_INBOX_DOCK_HOST_ID } from "~/rightDockStore.logic";
 import { useStore } from "~/store";
-import { createSidechatSummariesForGitHubItemSelector } from "~/storeSelectors";
+import {
+  createSidechatSummariesForGitHubItemSelector,
+  createSidechatSummariesForModItemSelector,
+} from "~/storeSelectors";
 import type { SidebarThreadSummary } from "~/types";
 import type { GitHubInboxSelection } from "./githubInbox.logic";
 
@@ -102,7 +111,7 @@ function enqueueItemQuestion(input: {
     terminalContexts: [],
     fileComments: [],
     pastedTexts: [],
-    pullRequestContexts: [createGitHubItemContextDraft(input.target.source, { checkedOut: false })],
+    pullRequestContexts: [codeReviewItemContextDraft(input.target.source)],
     skills: [],
     mentions: [],
     selectedProvider: input.modelSelection.provider,
@@ -118,18 +127,44 @@ function enqueueItemQuestion(input: {
   });
 }
 
-export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
+export type CodeReviewSelection =
+  | GitHubInboxSelection
+  | NonNullable<ReturnType<typeof modCodeReviewSelection>>;
+function readTargetSidechats(target: GitHubItemAgentTarget) {
+  return "source" in target.source
+    ? createSidechatSummariesForModItemSelector({
+        source: target.source.source,
+        repository: target.source.repository,
+        itemId: target.source.itemId,
+      })(useStore.getState())
+    : readItemSidechats({
+        projectId: target.projectId,
+        repository: target.source.repository,
+        number: target.source.number,
+      });
+}
+export function useGitHubInboxSidechat(selection: CodeReviewSelection | null) {
   const queryClient = useQueryClient();
   const { settings } = useAppSettings();
   const threadsHydrated = useStore((store) => store.threadsHydrated);
   const dockState = useRightDockStore(
     useMemo(() => selectRightDockState(GITHUB_INBOX_DOCK_HOST_ID), []),
   );
-  const projectId = selection?.projectId ?? null;
-  const repository = selection?.repository ?? null;
-  const number = selection?.number ?? null;
-  const selectedKey =
-    projectId !== null && repository !== null && number !== null
+  const projects = useStore((store) => store.projects);
+  const modSelection = selection && "source" in selection ? selection : null;
+  const githubSelection = selection && !("source" in selection) ? selection : null;
+  const projectId =
+    githubSelection?.projectId ??
+    (modSelection ? (projects.find((project) => project.kind === "project")?.id ?? null) : null);
+  const repository = githubSelection?.repository ?? null;
+  const number = githubSelection?.number ?? null;
+  const selectedKey = modSelection
+    ? JSON.stringify([
+        modSelection.source,
+        modSelection.identity.repository,
+        modSelection.identity.itemId,
+      ])
+    : projectId !== null && repository !== null && number !== null
       ? itemKey({ projectId, repository, number })
       : null;
   const selectedKeyRef = useRef(selectedKey);
@@ -141,10 +176,23 @@ export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
   }, [selectedKey]);
   const selectItemSidechats = useMemo(
     () =>
-      projectId !== null && repository !== null && number !== null
-        ? createSidechatSummariesForGitHubItemSelector({ repository, number })
-        : selectNoSidechats,
-    [projectId, repository, number],
+      modSelection
+        ? createSidechatSummariesForModItemSelector({
+            source: modSelection.source,
+            ...modSelection.identity,
+          })
+        : projectId !== null && repository !== null && number !== null
+          ? createSidechatSummariesForGitHubItemSelector({ repository, number })
+          : selectNoSidechats,
+    [
+      projectId,
+      repository,
+      number,
+      modSelection?.source.modId,
+      modSelection?.source.sourceId,
+      modSelection?.identity.repository,
+      modSelection?.identity.itemId,
+    ],
   );
   const itemSidechats = useStore(selectItemSidechats);
   const [pendingKeys, setPendingKeys] = useState<ReadonlySet<string>>(() => new Set());
@@ -173,7 +221,7 @@ export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
     createSidechat: () => createForSelection(),
     revealSidechat: () => undefined,
     onHidden: () => {
-      if (selection) focusPullRequestRow(document, selection);
+      if (githubSelection) focusPullRequestRow(document, githubSelection);
     },
   });
 
@@ -196,11 +244,16 @@ export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
   };
 
   const createForTarget = (target: GitHubItemAgentTarget, question?: string): Promise<void> => {
-    const key = itemKey({
-      projectId: target.projectId,
-      repository: target.source.repository,
-      number: target.source.number,
-    });
+    if (
+      !useStore
+        .getState()
+        .projects.some(
+          (project) => project.kind === "project" && project.id === target.projectId,
+        ) ||
+      ("source" in target.source && !MODS_ON)
+    )
+      return Promise.resolve();
+    const key = codeReviewAgentItemKey(target.source);
     if (creatingKeys.current.has(key)) return Promise.resolve();
     const api = readNativeApi();
     if (!api) {
@@ -233,10 +286,7 @@ export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
           });
         } else {
           // Seed the card before the pane's composer mounts; the user writes the question.
-          addChatPullRequestContext(
-            threadId,
-            createGitHubItemContextDraft(target.source, { checkedOut: false }),
-          );
+          addChatPullRequestContext(threadId, codeReviewItemContextDraft(target.source));
         }
         // Creation may finish after the user selected another item or left this page.
         // Keep the created thread and its question, without replacing the current item's dock.
@@ -273,13 +323,7 @@ export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
 
   /** Ask from a detail panel: reopen the item's live side chat, or start one seeded with it. */
   const ask = (target: GitHubItemAgentTarget) => {
-    const existing = liveSidechatId(
-      readItemSidechats({
-        projectId: target.projectId,
-        repository: target.source.repository,
-        number: target.source.number,
-      }),
-    );
+    const existing = liveSidechatId(readTargetSidechats(target));
     if (existing) {
       showSidechat(existing);
       focusSidechat(existing);
@@ -295,11 +339,7 @@ export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
   const askQuestion = (target: GitHubItemAgentTarget, question: string) => {
     const text = question.trim();
     if (!text) return;
-    const summaries = readItemSidechats({
-      projectId: target.projectId,
-      repository: target.source.repository,
-      number: target.source.number,
-    });
+    const summaries = readTargetSidechats(target);
     const existing = liveSidechatId(summaries);
     if (existing) {
       const modelSelection =
@@ -322,6 +362,32 @@ export function useGitHubInboxSidechat(selection: GitHubInboxSelection | null) {
   // its panel, so they read its detail from the query cache the panel filled (or fetch it).
   const createForSelection = (): Promise<void> => {
     if (!selection) return Promise.resolve();
+    if ("source" in selection) {
+      const source = MODS_ON
+        ? (useModsStore
+            .getState()
+            .snapshot?.mods.filter((mod) => mod.status === "running")
+            .flatMap((mod) => mod.pullRequestSources)
+            .find(
+              (source) =>
+                source.source.modId === selection.source.modId &&
+                source.source.sourceId === selection.source.sourceId,
+            ) ?? null)
+        : null;
+      if (!source || !projectId) return Promise.resolve();
+      return queryClient
+        .ensureQueryData(modPullRequestDetailQueryOptions(source, selection.identity))
+        .then(
+          (detail) => createForTarget({ projectId, source: modItemCardSourceFromDetail(detail) }),
+          (error) => {
+            toastManager.add({
+              type: "error",
+              title: "Could not start a side chat",
+              description: error instanceof Error ? error.message : "Source unavailable.",
+            });
+          },
+        );
+    }
     const input = {
       projectId: selection.projectId,
       repository: selection.repository,

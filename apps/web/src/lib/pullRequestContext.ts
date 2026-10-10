@@ -1,3 +1,5 @@
+import type { ModPullRequestSourceRef } from "@synara/contracts";
+
 // FILE: pullRequestContext.ts
 // Purpose: Shared helpers for GitHub item context cards — the composer attachment that
 //   "Repair" / "Add to chat" in the PR menu and the inbox's Send to agent / Ask create instead
@@ -29,7 +31,10 @@ export interface PullRequestContextDraft {
   /** Absent means a pull request, so drafts and transcripts written earlier still parse. */
   itemKind?: PullRequestContextItemKind;
   /** The item's number and URL (named for pull requests, which came first). */
-  prNumber: number;
+  prNumber: number | null;
+  source?: ModPullRequestSourceRef;
+  repository?: string;
+  itemId?: string;
   prUrl: string;
   /** Card headline, e.g. "1 failing check". */
   title: string;
@@ -43,7 +48,10 @@ export interface ParsedPullRequestContextEntry {
   index: number;
   scope: PullRequestContextScope;
   itemKind: PullRequestContextItemKind;
-  prNumber: number;
+  prNumber: number | null;
+  source?: ModPullRequestSourceRef;
+  repository?: string;
+  itemId?: string;
   prUrl: string;
   title: string;
   subtitle: string;
@@ -61,13 +69,46 @@ const TRAILING_PULL_REQUEST_CONTEXT_BLOCK_PATTERN =
 interface SerializedPullRequestContextEntry {
   readonly scope: PullRequestContextScope;
   readonly itemKind?: "issue";
-  readonly prNumber: number;
+  readonly prNumber: number | null;
+  readonly source?: ModPullRequestSourceRef;
+  readonly repository?: string;
+  readonly itemId?: string;
   readonly prUrl: string;
   readonly title: string;
   readonly subtitle: string;
   readonly text: string;
 }
 
+export function isModContextIdentity(value: {
+  source?: unknown;
+  repository?: unknown;
+  itemId?: unknown;
+}): value is { source: ModPullRequestSourceRef; repository: string; itemId: string } {
+  const source = value.source;
+  return (
+    !!source &&
+    typeof source === "object" &&
+    "kind" in source &&
+    source.kind === "mod" &&
+    "modId" in source &&
+    typeof source.modId === "string" &&
+    /^[a-z0-9][a-z0-9-]{0,63}$/.test(source.modId) &&
+    "sourceId" in source &&
+    typeof source.sourceId === "string" &&
+    /^[a-z0-9][a-z0-9-]{0,63}$/.test(source.sourceId) &&
+    typeof value.repository === "string" &&
+    /\S/.test(value.repository) &&
+    value.repository.length <= 4096 &&
+    typeof value.itemId === "string" &&
+    /\S/.test(value.itemId) &&
+    value.itemId.length <= 4096
+  );
+}
+function modIdentity(value: { source?: unknown; repository?: unknown; itemId?: unknown }) {
+  return isModContextIdentity(value)
+    ? { source: value.source, repository: value.repository, itemId: value.itemId }
+    : {};
+}
 function normalizeLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -97,7 +138,12 @@ export function normalizePullRequestContext(
   if (!isPullRequestContextScope(draft.scope)) {
     return null;
   }
-  if (!Number.isInteger(draft.prNumber) || draft.prNumber <= 0) {
+  if (
+    draft.source
+      ? !isModContextIdentity(draft) ||
+        (draft.prNumber !== null && (!Number.isInteger(draft.prNumber) || draft.prNumber <= 0))
+      : draft.prNumber === null || !Number.isInteger(draft.prNumber) || draft.prNumber <= 0
+  ) {
     return null;
   }
   return {
@@ -105,6 +151,7 @@ export function normalizePullRequestContext(
     createdAt: draft.createdAt,
     scope: draft.scope,
     ...(draft.itemKind === "issue" ? { itemKind: "issue" as const } : {}),
+    ...modIdentity(draft),
     prNumber: draft.prNumber,
     prUrl: draft.prUrl.trim(),
     title,
@@ -134,19 +181,35 @@ export function normalizePullRequestContexts(
  * not stack two identical bubbles, but a fresher snapshot should win over a stale one.
  */
 export function pullRequestContextDedupKey(
-  context: Pick<PullRequestContextDraft, "scope" | "prNumber" | "prUrl">,
+  context: Pick<
+    PullRequestContextDraft,
+    "scope" | "prNumber" | "prUrl" | "source" | "repository" | "itemId"
+  >,
 ): string {
+  if (isModContextIdentity(context))
+    return JSON.stringify([
+      context.scope,
+      context.source.kind,
+      context.source.modId,
+      context.source.sourceId,
+      context.repository,
+      context.itemId,
+    ]);
   return `${context.scope}\u0000${context.prNumber}\u0000${context.prUrl}`;
 }
 
 export function pullRequestContextItemLabel(
-  context: Pick<PullRequestContextDraft, "itemKind" | "prNumber">,
+  context: Pick<PullRequestContextDraft, "itemKind" | "prNumber" | "source" | "itemId">,
 ): string {
+  if (context.source)
+    return `PR ${context.prNumber === null ? (context.itemId ?? "") : `#${context.prNumber}`}`;
   return `${context.itemKind === "issue" ? "Issue" : "PR"} #${context.prNumber}`;
 }
 
 export function formatPullRequestContextTitleSeed(
-  contexts: ReadonlyArray<Pick<PullRequestContextDraft, "title" | "prNumber" | "itemKind">>,
+  contexts: ReadonlyArray<
+    Pick<PullRequestContextDraft, "title" | "prNumber" | "itemKind" | "source" | "itemId">
+  >,
 ): string | null {
   const first = contexts[0];
   if (!first) {
@@ -171,6 +234,7 @@ export function buildPullRequestContextBlock(
       ? {
           scope: context.scope,
           itemKind: "issue",
+          ...modIdentity(context),
           prNumber: context.prNumber,
           prUrl: context.prUrl,
           title: context.title,
@@ -179,6 +243,7 @@ export function buildPullRequestContextBlock(
         }
       : {
           scope: context.scope,
+          ...modIdentity(context),
           prNumber: context.prNumber,
           prUrl: context.prUrl,
           title: context.title,
@@ -221,12 +286,18 @@ function parseEntries(block: string): ParsedPullRequestContextEntry[] {
       ) {
         return [];
       }
-      const prNumber = typeof candidate.prNumber === "number" ? candidate.prNumber : 0;
+      const prNumber =
+        typeof candidate.prNumber === "number"
+          ? candidate.prNumber
+          : isModContextIdentity(candidate)
+            ? null
+            : 0;
       return [
         {
           index: index + 1,
           scope: candidate.scope,
           itemKind: candidate.itemKind === "issue" ? "issue" : "pullRequest",
+          ...modIdentity(candidate),
           prNumber,
           prUrl: typeof candidate.prUrl === "string" ? candidate.prUrl : "",
           title: candidate.title,

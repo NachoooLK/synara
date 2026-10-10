@@ -1,3 +1,9 @@
+import {
+  createRootRoute,
+  createRouter,
+  createMemoryHistory,
+  RouterProvider,
+} from "@tanstack/react-router";
 import "../../index.css";
 import { Schema } from "effect";
 import {
@@ -6,6 +12,7 @@ import {
   ModsPullRequestListResult,
   ModsPullRequestDetailResult,
   type NativeApi,
+  type ModsPullRequestActionInput,
 } from "@synara/contracts";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
@@ -14,6 +21,7 @@ import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { useModsStore } from "~/mods/modsStore";
 import { useStore } from "~/store";
+import { ToastProvider } from "~/components/ui/toast";
 import { GitHubInbox } from "../githubInbox/GitHubInbox";
 import { mergeGitHubInboxSearch, type GitHubInboxSearch } from "../githubInbox/githubInbox.logic";
 
@@ -53,40 +61,38 @@ beforeEach(async () => {
   useStore.setState({ projects: [] });
   detailCalls.mockReset();
   diffCalls.mockReset();
-  useModsStore
-    .getState()
-    .setSnapshot(
-      Schema.decodeUnknownSync(ModsSnapshot)({
-        modsDir: "/mods",
-        mods: refs.map((source) => ({
-          id: source.modId,
-          version: "1",
-          path: `/mods/${source.modId}`,
-          description: null,
-          enabled: true,
-          status: "running",
-          error: null,
-          hooks: [],
-          commands: [],
-          tools: [],
-          views: [],
-          mcpServers: [],
-          mcpSignIns: [],
-          permissions: [],
-          reloadsOnChange: false,
-          statusText: null,
-          loadedAt: null,
-          pullRequestSources: [
-            {
-              source,
-              title: `${source.modId} reviews`,
-              revision: "current",
-              capabilities: { diff: source.modId === "alpha" },
-            },
-          ],
-        })),
-      }),
-    );
+  useModsStore.getState().setSnapshot(
+    Schema.decodeUnknownSync(ModsSnapshot)({
+      modsDir: "/mods",
+      mods: refs.map((source) => ({
+        id: source.modId,
+        version: "1",
+        path: `/mods/${source.modId}`,
+        description: null,
+        enabled: true,
+        status: "running",
+        error: null,
+        hooks: [],
+        commands: [],
+        tools: [],
+        views: [],
+        mcpServers: [],
+        mcpSignIns: [],
+        permissions: [],
+        reloadsOnChange: false,
+        statusText: null,
+        loadedAt: null,
+        pullRequestSources: [
+          {
+            source,
+            title: `${source.modId} reviews`,
+            revision: "current",
+            capabilities: { diff: source.modId === "alpha" },
+          },
+        ],
+      })),
+    }),
+  );
   window.nativeApi = {
     server: {
       getSettings: async () => DEFAULT_SERVER_SETTINGS_VIEW,
@@ -138,9 +144,20 @@ async function mount() {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   clients.push(client);
+  const routeTree = createRootRoute({
+    component: () => (
+      <ToastProvider>
+        <Harness />
+      </ToastProvider>
+    ),
+  });
+  const router = createRouter({
+    routeTree,
+    history: createMemoryHistory({ initialEntries: ["/"] }),
+  });
   await render(
     <QueryClientProvider client={client}>
-      <Harness />
+      <RouterProvider router={router} />
     </QueryClientProvider>,
   );
 }
@@ -185,4 +202,84 @@ it("hides unsupported tabs and preserves narrow list-detail navigation", async (
     .not.toBeInTheDocument();
   await page.getByRole("button", { name: "Back to code review" }).click();
   await expect.element(page.getByText("Review A", { exact: true })).toBeVisible();
+});
+
+function allowWrites() {
+  const snapshot = useModsStore.getState().snapshot!;
+  useModsStore.getState().setSnapshot({
+    ...snapshot,
+    mods: snapshot.mods.map((mod) =>
+      mod.id === "alpha"
+        ? {
+            ...mod,
+            pullRequestSources: mod.pullRequestSources.map((source) => ({
+              ...source,
+              capabilities: {
+                ...source.capabilities,
+                comment: true,
+                actions: ["merge", "close"] as const,
+                mergeMethods: ["squash"] as const,
+              },
+            })),
+          }
+        : mod,
+    ),
+  });
+}
+it("keeps an acknowledged comment successful when its refresh fails", async () => {
+  allowWrites();
+  let reads = 0;
+  const comment = vi.fn(async () => ({ ok: true as const, mergeOutcome: null }));
+  window.nativeApi!.mods.pullRequests.comment = comment;
+  window.nativeApi!.mods.pullRequests.detail = async () => {
+    if (++reads > 1) throw new Error("Read unavailable");
+    return Schema.decodeUnknownSync(ModsPullRequestDetailResult)({
+      ...entries[0],
+      source: refs[0],
+      revision: "current",
+      body: "Original description",
+      comments: [],
+      commentCount: 0,
+      isDraft: false,
+      mergeMethods: ["squash"],
+    });
+  };
+  await mount();
+  await page.getByText("Review A", { exact: true }).click();
+  await page.getByRole("textbox", { name: "Leave a comment" }).fill("One comment");
+  await page.getByRole("button", { name: "Post comment" }).click();
+  await expect.element(page.getByText("Comment posted", { exact: true })).toBeVisible();
+  await expect
+    .element(page.getByText("The latest refresh failed. Showing the last loaded detail."))
+    .toBeVisible();
+  expect(comment).toHaveBeenCalledTimes(1);
+});
+it("confirms merge with the first method supported by both source and item", async () => {
+  allowWrites();
+  const action = vi.fn(async (_input: ModsPullRequestActionInput) => ({
+    ok: true as const,
+    mergeOutcome: "merged" as const,
+  }));
+  window.nativeApi!.mods.pullRequests.action = action;
+  window.nativeApi!.mods.pullRequests.detail = async () =>
+    Schema.decodeUnknownSync(ModsPullRequestDetailResult)({
+      ...entries[0],
+      source: refs[0],
+      revision: "current",
+      isDraft: false,
+      mergeability: "mergeable",
+      mergeMethods: ["squash"],
+    });
+  await mount();
+  await page.getByText("Review A", { exact: true }).click();
+  await page.getByRole("button", { name: "Merge", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Merge", exact: true }).click();
+  await expect.poll(() => action.mock.calls.length).toBe(1);
+  expect(action.mock.calls[0]![0]).toMatchObject({
+    modId: "alpha",
+    sourceId: "reviews",
+    itemId: "review/A-α",
+    action: "merge",
+    mergeMethod: "squash",
+  });
 });

@@ -1,8 +1,14 @@
+import { MODS_ON } from "./betaFeatures";
 // FILE: storeSelectors.ts
 // Purpose: Stable Zustand selectors for entity lookups and lightweight sidebar projections.
 // Exports: Selector factories used by routes and sidebar-heavy components.
 
-import type { ProjectId, ThreadEnvironmentMode, ThreadId } from "@synara/contracts";
+import type {
+  ModPullRequestSourceRef,
+  ProjectId,
+  ThreadEnvironmentMode,
+  ThreadId,
+} from "@synara/contracts";
 import { isAutomationRunThread } from "@synara/shared/automationMode";
 import { isSidechatThread, sidechatContextMatchesGitHubItem } from "@synara/shared/sidechatThread";
 import { collectSubagentDescendants } from "@synara/shared/threadHierarchy";
@@ -745,4 +751,22 @@ export function createFirstProjectSelector(): (state: AppState) => Project | und
     previousFirstProject = state.projects.find((project) => project.kind === "project");
     return previousFirstProject;
   };
+}
+
+export function createSidechatSummariesForModItemSelector(item: {
+  source: ModPullRequestSourceRef;
+  repository: string;
+  itemId: string;
+}): (state: AppState) => readonly SidebarThreadSummary[] {
+  return createSortedSidechatSummariesSelector((thread) => {
+    const context = thread.sidechatContext;
+    return (
+      MODS_ON &&
+      context?.kind === "code-review-item" &&
+      context.source.modId === item.source.modId &&
+      context.source.sourceId === item.source.sourceId &&
+      context.repository === item.repository &&
+      context.itemId === item.itemId
+    );
+  });
 }

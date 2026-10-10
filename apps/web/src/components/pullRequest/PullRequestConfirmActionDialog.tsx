@@ -52,11 +52,12 @@ function confirmTitle(
 
 function confirmDescription(
   action: PullRequestConfirmAction,
-  number: number,
+  number: number | string,
   baseBranch: string | null,
   stack: PullRequestStack | null,
 ): string {
-  if (action.kind === "close") return `This will close #${number} without merging it.`;
+  if (action.kind === "close")
+    return `This will close ${typeof number === "number" ? `#${number}` : number} without merging it.`;
   if (stack) {
     return `This will atomically merge every open pull request through #${number} into ${stack.baseBranch} using ${action.method}.${
       stack.position < stack.size
@@ -64,7 +65,7 @@ function confirmDescription(
         : ""
     }`;
   }
-  return `This will merge #${number}${baseBranch ? ` into ${baseBranch}` : ""} using ${action.method}.`;
+  return `This will merge ${typeof number === "number" ? `#${number}` : number}${baseBranch ? ` into ${baseBranch}` : ""} using ${action.method}.`;
 }
 
 export function PullRequestConfirmActionDialog({
@@ -79,7 +80,7 @@ export function PullRequestConfirmActionDialog({
 }: {
   /** The action awaiting confirmation; null keeps the dialog closed. */
   action: PullRequestConfirmAction | null;
-  number: number;
+  number: number | string;
   baseBranch?: string | null;
   stack: PullRequestStack | null;
   stackMergeTargetCount: number;

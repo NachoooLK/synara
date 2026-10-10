@@ -1,3 +1,8 @@
+import {
+  ModPullRequestSourceRef,
+  ModPullRequestIdentity,
+  ModPullRequestUrl,
+} from "./modPullRequestIdentity";
 import { Effect, Option, Schema, SchemaIssue, SchemaTransformation, Struct } from "effect";
 import {
   LoadProjectImportHistoryInput,
@@ -480,7 +485,7 @@ const SidechatLifecycleTimestamp = Schema.optional(Schema.NullOr(IsoDateTime)).p
  * GitHub pull request or issue asked about from the inbox. Identifiers only; the item's
  * title, body and comments reach the provider as untrusted data in the user's own message.
  */
-export const ThreadSidechatContext = Schema.Struct({
+const GitHubThreadSidechatContext = Schema.Struct({
   kind: Schema.Literal("github-item"),
   // Same literals as `GitHubInboxItemKind`; importing it here would create a module cycle.
   itemKind: Schema.Literals(["pullRequest", "issue"]),
@@ -488,6 +493,16 @@ export const ThreadSidechatContext = Schema.Struct({
   number: PositiveInt,
   url: TrimmedNonEmptyString,
 });
+export const ThreadSidechatContext = Schema.Union([
+  GitHubThreadSidechatContext,
+  Schema.Struct({
+    kind: Schema.Literal("code-review-item"),
+    source: ModPullRequestSourceRef,
+    ...ModPullRequestIdentity.fields,
+    url: ModPullRequestUrl,
+    title: TrimmedNonEmptyString,
+  }),
+]);
 export type ThreadSidechatContext = typeof ThreadSidechatContext.Type;
 // Absent on every event and projection written before standalone sidechats existed.
 const SidechatContextField = Schema.optional(Schema.NullOr(ThreadSidechatContext)).pipe(

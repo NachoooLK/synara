@@ -10,7 +10,12 @@
 // Exports: PullRequestPrimaryAction, resolvePullRequestPrimaryAction, PullRequestPrimaryButton,
 //          PullRequestDraftStateItems, PullRequestActionMenuItems
 
-import type { PullRequestDetail, PullRequestMergeMethod, ProjectId } from "@synara/contracts";
+import type {
+  PullRequestDetail,
+  PullRequestMergeMethod,
+  PullRequestAction,
+  ProjectId,
+} from "@synara/contracts";
 import type { ComponentProps } from "react";
 
 import { MENU_ICON_CLASS_NAME } from "~/components/chat/composerPickerStyles";
@@ -159,7 +164,9 @@ export function PullRequestDraftStateItems({
   isDraft,
   disabled,
   onChange,
+  allowedActions = ["draft", "ready"],
 }: {
+  allowedActions?: readonly PullRequestAction[];
   isDraft: boolean;
   disabled: boolean;
   onChange: (next: "draft" | "ready") => void;
@@ -173,14 +180,18 @@ export function PullRequestDraftStateItems({
         if (value === "ready" && isDraft) onChange("ready");
       }}
     >
-      <MenuRadioItem value="draft" disabled={disabled}>
-        <DraftIcon className={MENU_ICON_CLASS_NAME} />
-        <span>Draft</span>
-      </MenuRadioItem>
-      <MenuRadioItem value="ready" disabled={disabled}>
-        <OpenIcon className={MENU_ICON_CLASS_NAME} />
-        <span>Ready for review</span>
-      </MenuRadioItem>
+      {allowedActions.includes("draft") ? (
+        <MenuRadioItem value="draft" disabled={disabled}>
+          <DraftIcon className={MENU_ICON_CLASS_NAME} />
+          <span>Draft</span>
+        </MenuRadioItem>
+      ) : null}
+      {allowedActions.includes("ready") ? (
+        <MenuRadioItem value="ready" disabled={disabled}>
+          <OpenIcon className={MENU_ICON_CLASS_NAME} />
+          <span>Ready for review</span>
+        </MenuRadioItem>
+      ) : null}
     </MenuRadioGroup>
   );
 }
@@ -211,7 +222,11 @@ export function PullRequestActionMenuItems({
   onResolveConflicts,
   onClose,
   onReopen,
+  allowedActions,
+  allowGitHubHandoffs = true,
 }: {
+  allowedActions?: readonly PullRequestAction[];
+  allowGitHubHandoffs?: boolean;
   detail: Pick<PullRequestDetail, "state" | "isDraft" | "mergeability" | "url">;
   host: "dock" | "page";
   actionPending: boolean;
@@ -234,19 +249,26 @@ export function PullRequestActionMenuItems({
   const open = detail.state === "open";
   return (
     <>
-      {open ? (
+      {open &&
+      (!allowedActions ||
+        allowedActions.some((action) => action === "draft" || action === "ready")) ? (
         <>
           <PullRequestDraftStateItems
             isDraft={detail.isDraft}
             disabled={actionPending}
             onChange={onStateChange}
+            {...(allowedActions ? { allowedActions } : {})}
           />
           <MenuSeparator />
         </>
       ) : null}
       {/* The merge method is a preference for the action, not a second action. Hidden while
           blocked: every method would fail. */}
-      {open && !detail.isDraft && mergeBlocker === null && mergeMethods.length > 0 ? (
+      {open &&
+      (!allowedActions || allowedActions.includes("merge")) &&
+      !detail.isDraft &&
+      mergeBlocker === null &&
+      mergeMethods.length > 0 ? (
         <>
           <MenuRadioGroup
             value={selectedMergeMethod}
@@ -282,13 +304,15 @@ export function PullRequestActionMenuItems({
           ) : null}
         </>
       ) : null}
-      <MenuItem onClick={onFixFindings} disabled={preparingThread !== null}>
-        <HammerIcon className={MENU_ICON_CLASS_NAME} />
-        <span>{preparingThread === "findings" ? "Preparing findings…" : "Fix findings"}</span>
-      </MenuItem>
+      {allowGitHubHandoffs ? (
+        <MenuItem onClick={onFixFindings} disabled={preparingThread !== null}>
+          <HammerIcon className={MENU_ICON_CLASS_NAME} />
+          <span>{preparingThread === "findings" ? "Preparing findings…" : "Fix findings"}</span>
+        </MenuItem>
+      ) : null}
       {/* Beside Fix findings: the same kind of hand-off, offered only while there is a conflict
           to resolve, which is also when Merge is blocked. */}
-      {open && detail.mergeability === "conflicting" ? (
+      {allowGitHubHandoffs && open && detail.mergeability === "conflicting" ? (
         <MenuItem onClick={onResolveConflicts} disabled={preparingThread !== null}>
           <ConflictIcon className={MENU_ICON_CLASS_NAME} />
           <span>
@@ -297,12 +321,12 @@ export function PullRequestActionMenuItems({
         </MenuItem>
       ) : null}
       {detail.state !== "merged" ? <MenuSeparator /> : null}
-      {open ? (
+      {open && (!allowedActions || allowedActions.includes("close")) ? (
         <MenuItem variant="destructive" disabled={actionPending} onClick={onClose}>
           <ClosedIcon className={MENU_ICON_CLASS_NAME} />
           <span>Close pull request</span>
         </MenuItem>
-      ) : detail.state === "closed" ? (
+      ) : detail.state === "closed" && (!allowedActions || allowedActions.includes("reopen")) ? (
         <MenuItem disabled={actionPending} onClick={onReopen}>
           <OpenIcon className={MENU_ICON_CLASS_NAME} />
           <span>Reopen pull request</span>

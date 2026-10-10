@@ -8,7 +8,7 @@
 import type { ThreadId } from "@synara/contracts";
 import { useState } from "react";
 
-import { createGitHubItemContextDraft } from "~/components/chat/environment/environmentPullRequest.logic";
+import { codeReviewItemContextDraft } from "./githubItemAgentContext";
 import { scheduleDeferredChatMount } from "~/components/chat/deferredChatMount";
 import { toastManager } from "~/components/ui/toast";
 import { requestComposerFocus } from "~/composerFocusRequestStore";
@@ -21,10 +21,7 @@ import { createSidechatSummariesForSourceSelector } from "~/storeSelectors";
 import type { GitHubItemAgentTarget } from "./githubItemAgentContext";
 
 function seedAndFocus(threadId: ThreadId, target: GitHubItemAgentTarget): void {
-  addChatPullRequestContext(
-    threadId,
-    createGitHubItemContextDraft(target.source, { checkedOut: false }),
-  );
+  addChatPullRequestContext(threadId, codeReviewItemContextDraft(target.source));
   // The pane's composer mounts after the dock switches tabs; focus it then.
   scheduleDeferredChatMount(window, () => requestComposerFocus(threadId));
 }

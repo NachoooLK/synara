@@ -67,6 +67,8 @@ import {
 import { cn } from "~/lib/utils";
 import { useStore } from "~/store";
 import { formatShortTimestamp } from "~/timestampFormat";
+import { modPullRequestSetPinnedMutationOptions } from "~/lib/modPullRequestMutationOptions";
+import { parseCodeReviewSourceKey } from "../codeReview/codeReview.logic";
 import { MODS_ON } from "~/betaFeatures";
 import { useModsStore } from "~/mods/modsStore";
 import { ModMcpSignInLine } from "~/mods/ModMcpSignInLine";
@@ -354,6 +356,7 @@ export function GitHubInbox({
         modSelection &&
         codeReviewSourceKey(source.source) === codeReviewSourceKey(modSelection.source),
     ) ?? null;
+  const modPinMutation = useMutation(modPullRequestSetPinnedMutationOptions(queryClient));
   const pinMutation = useMutation(pullRequestSetPinnedMutationOptions(queryClient));
   const activeActionCount = useIsMutating({
     mutationKey: pullRequestMutationKeys.action,
@@ -720,6 +723,27 @@ export function GitHubInbox({
                   }
                   onTogglePinned={(item) => {
                     if (!("sourceKey" in item)) togglePinned(item);
+                    else {
+                      const source = parseCodeReviewSourceKey(item.sourceKey);
+                      if (source?.kind === "mod")
+                        modPinMutation.mutate(
+                          {
+                            modId: source.modId,
+                            sourceId: source.sourceId,
+                            repository: item.repository,
+                            itemId: item.itemId,
+                            isPinned: !item.isPinned,
+                          },
+                          {
+                            onError: (error) =>
+                              toastManager.add({
+                                type: "error",
+                                title: "Could not update pin",
+                                description: error instanceof Error ? error.message : "Try again.",
+                              }),
+                          },
+                        );
+                    }
                   }}
                 />
               )}
@@ -761,15 +785,13 @@ export function GitHubInbox({
                   size="sm"
                   disabled={next.pending}
                   onClick={() =>
-                    void next
-                      .loadMore()
-                      .catch((error) =>
-                        toastManager.add({
-                          type: "error",
-                          title: `Could not load more from ${next.title}`,
-                          description: error instanceof Error ? error.message : "Try again.",
-                        }),
-                      )
+                    void next.loadMore().catch((error) =>
+                      toastManager.add({
+                        type: "error",
+                        title: `Could not load more from ${next.title}`,
+                        description: error instanceof Error ? error.message : "Try again.",
+                      }),
+                    )
                   }
                 >
                   Load more · {next.title}
@@ -836,6 +858,7 @@ export function GitHubInbox({
             <ModPullRequestDetailPanel
               key={JSON.stringify([modSelection, selectedSource?.revision])}
               source={selectedSource}
+              pageHost={pageHost}
               identity={modSelection.identity}
               onBack={isMobile ? goBackToList : undefined}
             />

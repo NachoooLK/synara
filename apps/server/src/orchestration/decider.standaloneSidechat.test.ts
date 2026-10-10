@@ -96,6 +96,24 @@ async function readModelWithSidechat(): Promise<OrchestrationReadModel> {
 }
 
 describe("standalone side chat decider", () => {
+  it("preserves a generic source and opaque item identity in the projected sidechat", async () => {
+    const context: ThreadSidechatContext = {
+      kind: "code-review-item",
+      source: { kind: "mod", modId: "fixture", sourceId: "reviews" },
+      repository: "Team/Repo",
+      itemId: "review/A-α",
+      url: "https://reviews.example.test/42",
+      title: "Review",
+    };
+    const base = await projectReadModel();
+    const [created] = await decide(base, createCommand({ sidechatContext: context }));
+    const model = await Effect.runPromise(
+      projectEvent(base, { ...created, sequence: 2 } as OrchestrationEvent),
+    );
+    expect(model.threads.find((thread) => thread.id === SIDECHAT_ID)?.sidechatContext).toEqual(
+      context,
+    );
+  });
   it("creates a sidechat with its GitHub context and starts the inactivity clock", async () => {
     const [event] = await decide(await projectReadModel(), createCommand());
 

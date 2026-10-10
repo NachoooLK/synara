@@ -6,6 +6,7 @@ import { resolveComputerControlMode } from "./computerControlMode";
 
 import {
   ModelSelection,
+  ModPullRequestSourceRef,
   OrchestrationProposedPlanId,
   OrchestrationThreadPullRequest,
   ProjectId,
@@ -62,6 +63,7 @@ import { type BrowserAnnotationDraft, normalizeBrowserAnnotations } from "./lib/
 import { normalizePastedTextContent } from "./lib/composerPastedText";
 import {
   isPullRequestContextScope,
+  isModContextIdentity,
   normalizePullRequestContexts,
   PULL_REQUEST_CONTEXT_SCOPES,
   type PullRequestContextDraft,
@@ -165,7 +167,10 @@ const PersistedPullRequestContextDraft = Schema.Struct({
   scope: Schema.Literals(PULL_REQUEST_CONTEXT_SCOPES),
   // Issue cards only; pull request cards omit it, as drafts saved before issues did.
   itemKind: Schema.optionalKey(Schema.Literal("issue")),
-  prNumber: Schema.Number,
+  prNumber: Schema.NullOr(Schema.Number),
+  source: Schema.optionalKey(ModPullRequestSourceRef),
+  repository: Schema.optionalKey(Schema.String),
+  itemId: Schema.optionalKey(Schema.String),
   prUrl: Schema.String,
   title: Schema.String,
   subtitle: Schema.String,
@@ -606,14 +611,21 @@ function normalizePersistedPullRequestContextDraft(
   const id = typeof candidate.id === "string" ? candidate.id : "";
   const text = typeof candidate.text === "string" ? candidate.text.trim() : "";
   const title = typeof candidate.title === "string" ? candidate.title.trim() : "";
-  const prNumber = typeof candidate.prNumber === "number" ? candidate.prNumber : 0;
+  const prNumber =
+    typeof candidate.prNumber === "number"
+      ? candidate.prNumber
+      : isModContextIdentity(candidate)
+        ? null
+        : 0;
   if (
     id.length === 0 ||
     text.length === 0 ||
     title.length === 0 ||
     !isPullRequestContextScope(candidate.scope) ||
-    !Number.isInteger(prNumber) ||
-    prNumber <= 0
+    (candidate.source
+      ? !isModContextIdentity(candidate) ||
+        (prNumber !== null && (!Number.isInteger(prNumber) || prNumber <= 0))
+      : prNumber === null || !Number.isInteger(prNumber) || prNumber <= 0)
   ) {
     return null;
   }
@@ -622,6 +634,9 @@ function normalizePersistedPullRequestContextDraft(
     createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : "",
     scope: candidate.scope,
     ...(candidate.itemKind === "issue" ? { itemKind: "issue" as const } : {}),
+    ...(isModContextIdentity(candidate)
+      ? { source: candidate.source, repository: candidate.repository, itemId: candidate.itemId }
+      : {}),
     prNumber,
     prUrl: typeof candidate.prUrl === "string" ? candidate.prUrl : "",
     title,
@@ -638,6 +653,9 @@ function toPersistedPullRequestContext(
     createdAt: context.createdAt,
     scope: context.scope,
     ...(context.itemKind === "issue" ? { itemKind: "issue" as const } : {}),
+    ...(isModContextIdentity(context)
+      ? { source: context.source, repository: context.repository, itemId: context.itemId }
+      : {}),
     prNumber: context.prNumber,
     prUrl: context.prUrl,
     title: context.title,

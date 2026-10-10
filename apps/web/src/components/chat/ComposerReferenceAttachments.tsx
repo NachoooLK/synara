@@ -100,6 +100,7 @@ export function ComposerReferenceAttachments({
       {pullRequestContexts.map((context) => (
         <ComposerPullRequestContextCard
           key={context.id}
+          source={context.source}
           scope={context.scope}
           itemKind={context.itemKind}
           title={context.title}

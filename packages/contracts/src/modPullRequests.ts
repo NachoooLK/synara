@@ -1,3 +1,15 @@
+import {
+  ModPullRequestSourceId,
+  ModPullRequestSourceRef,
+  ModPullRequestIdentity,
+  ModPullRequestUrl,
+} from "./modPullRequestIdentity";
+export {
+  ModPullRequestSourceId,
+  ModPullRequestSourceRef,
+  ModPullRequestIdentity,
+  ModPullRequestUrl,
+} from "./modPullRequestIdentity";
 import { Schema } from "effect";
 
 import {
@@ -21,37 +33,12 @@ import {
   GitHubViewerInvolvement,
 } from "./pullRequests";
 
-/** Shared with ModId without importing the mod snapshot (which contains sources). */
-export const ModPullRequestSourceId = Schema.String.check(
-  Schema.isPattern(/^[a-z0-9][a-z0-9-]{0,63}$/),
-);
-export type ModPullRequestSourceId = typeof ModPullRequestSourceId.Type;
-const OpaqueId = Schema.String.check(Schema.isPattern(/\S/), Schema.isMaxLength(4096));
-export const ModPullRequestUrl = Schema.String.check(
-  Schema.isMaxLength(8192),
-  Schema.makeFilter((value) => {
-    try {
-      const url = new URL(value);
-      return (
-        (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password
-      );
-    } catch {
-      return false;
-    }
-  }),
-);
 const nullable = <S extends Schema.Top>(schema: S) =>
   Schema.NullOr(schema).pipe(Schema.withDecodingDefault(() => null));
 const falseDefault = Schema.Boolean.pipe(Schema.withDecodingDefault(() => false));
 const actions = Schema.Array(PullRequestAction).pipe(Schema.withDecodingDefault(() => []));
 const methods = Schema.Array(PullRequestMergeMethod).pipe(Schema.withDecodingDefault(() => []));
 
-export const ModPullRequestSourceRef = Schema.Struct({
-  kind: Schema.Literal("mod"),
-  modId: ModPullRequestSourceId,
-  sourceId: ModPullRequestSourceId,
-});
-export type ModPullRequestSourceRef = typeof ModPullRequestSourceRef.Type;
 export const PullRequestSourceRef = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("github") }),
   ModPullRequestSourceRef,
@@ -86,10 +73,7 @@ export const ModPullRequestSourceSummary = Schema.Struct({
   revision: TrimmedNonEmptyString,
 });
 export type ModPullRequestSourceSummary = typeof ModPullRequestSourceSummary.Type;
-export const ModPullRequestIdentity = Schema.Struct({ repository: OpaqueId, itemId: OpaqueId });
-export type ModPullRequestIdentity = typeof ModPullRequestIdentity.Type;
-
-// Reuse the native shapes, tightening only their display-link fields at this boundary.
+// Reuse the native shapes, tightening their display links at the mod boundary.
 export const ModPullRequestActor = Schema.Struct({
   ...PullRequestActor.fields,
   avatarUrl: nullable(ModPullRequestUrl),
@@ -151,7 +135,7 @@ export const ModPullRequestDetail = Schema.Struct({
 export type ModPullRequestDetail = typeof ModPullRequestDetail.Type;
 export const ModPullRequestListResult = Schema.Struct({
   items: Schema.Array(ModPullRequestListEntry).check(Schema.isMaxLength(500)),
-  nextCursor: nullable(OpaqueId),
+  nextCursor: nullable(ModPullRequestIdentity.fields.itemId),
   totalCount: nullable(NonNegativeInt),
   viewer: nullable(TrimmedNonEmptyString),
 });
@@ -167,7 +151,7 @@ export const ModsPullRequestListInput = Schema.Struct({
   ...SourceInput,
   state: Schema.Literals(["open", "closed"]),
   sort: Schema.Literals(["created", "updated"]),
-  cursor: nullable(OpaqueId),
+  cursor: nullable(ModPullRequestIdentity.fields.itemId),
   limit: PositiveInt.check(Schema.isLessThanOrEqualTo(500)).pipe(
     Schema.withDecodingDefault(() => 100),
   ),

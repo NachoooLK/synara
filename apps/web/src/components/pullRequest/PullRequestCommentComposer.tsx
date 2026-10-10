@@ -23,17 +23,21 @@ export type GitHubCommentTarget = Pick<
 >;
 
 /** The slice of a React Query comment mutation the composer drives. */
-export interface GitHubCommentMutation {
-  mutateAsync: (input: GitHubCommentTarget & { body: string }) => Promise<unknown>;
+export interface GitHubCommentMutation<T = GitHubCommentTarget> {
+  mutateAsync: (input: T & { body: string }) => Promise<unknown>;
   isPending: boolean;
 }
 
-export function PullRequestCommentComposer({
+export function PullRequestCommentComposer<T extends object = GitHubCommentTarget>({
   target,
   mutation,
+  accountLabel = "Commenting as your GitHub account",
+  genericSource = false,
 }: {
-  target: GitHubCommentTarget;
-  mutation: GitHubCommentMutation;
+  target: T;
+  mutation: GitHubCommentMutation<T>;
+  accountLabel?: string;
+  genericSource?: boolean;
 }) {
   const [body, setBody] = useState("");
   // Synchronous re-entrancy lock: mutation.isPending updates on React's schedule, which is
@@ -49,20 +53,19 @@ export function PullRequestCommentComposer({
     submittingRef.current = true;
     void mutation
       .mutateAsync({
-        projectId: target.projectId,
-        repository: target.repository,
-        number: target.number,
+        ...target,
         body: trimmed,
       })
       .then(() => {
         setBody("");
+        if (genericSource) toastManager.add({ type: "success", title: "Comment posted" });
       })
       .catch((error: unknown) => {
         // The draft stays in the field on failure — nothing to re-type.
         toastManager.add({
           type: "error",
           title: "Could not post comment",
-          description: error instanceof Error ? error.message : "GitHub CLI comment failed.",
+          description: error instanceof Error ? error.message : "The comment could not be posted.",
         });
       })
       .finally(() => {
@@ -76,9 +79,9 @@ export function PullRequestCommentComposer({
     >
       <span
         className="flex size-5 shrink-0 items-center justify-center rounded-full bg-[var(--color-background-elevated-secondary)] text-muted-foreground"
-        title="Commenting as your GitHub account"
+        title={accountLabel}
       >
-        <GitHubIcon className="size-3" />
+        {genericSource ? <ArrowUpIcon className="size-3" /> : <GitHubIcon className="size-3" />}
       </span>
       <textarea
         rows={Math.min(6, body.split("\n").length)}

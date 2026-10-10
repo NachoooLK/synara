@@ -1,3 +1,6 @@
+import type { ModPullRequestSourceRef } from "@synara/contracts";
+import { MODS_ON } from "~/betaFeatures";
+import { useModsStore } from "~/mods/modsStore";
 // FILE: PullRequestContextCard.tsx
 // Purpose: Attachment-style cards for GitHub item context (the "Repair" / "Add to chat"
 //   bubbles, and the inbox's Send to agent / Ask cards for pull requests and issues): the composer card (remove) and the transcript card (click to reveal the
@@ -31,6 +34,7 @@ const SCOPE_ICONS: Record<PullRequestContextScope, ComponentType<{ className?: s
 };
 
 interface PullRequestContextCardShellProps {
+  source?: ModPullRequestSourceRef | undefined;
   scope: PullRequestContextScope;
   /** Absent means a pull request. An issue card always shows the issue glyph. */
   itemKind?: PullRequestContextItemKind | undefined;
@@ -41,6 +45,7 @@ interface PullRequestContextCardShellProps {
 }
 
 function PullRequestContextCardShell({
+  source,
   scope,
   itemKind,
   title,
@@ -48,6 +53,21 @@ function PullRequestContextCardShell({
   onRemove,
   className,
 }: PullRequestContextCardShellProps) {
+  const available = useModsStore(
+    (store) =>
+      !source ||
+      (MODS_ON &&
+        (store.snapshot?.mods ?? []).some(
+          (mod) =>
+            mod.status === "running" &&
+            mod.pullRequestSources.some(
+              (registered) =>
+                registered.source.modId === source.modId &&
+                registered.source.sourceId === source.sourceId,
+            ),
+        )),
+  );
+  const displaySubtitle = available ? subtitle : `${subtitle} · Source unavailable`;
   const Icon = itemKind === "issue" ? IssueOpenedIcon : SCOPE_ICONS[scope];
   return (
     <AttachmentCard
@@ -55,7 +75,13 @@ function PullRequestContextCardShell({
       className={cn("w-64", className)}
       icon={<Icon className="size-4" />}
       title={title}
-      subtitle={subtitle.length > 0 ? <span className="truncate">{subtitle}</span> : undefined}
+      subtitle={
+        displaySubtitle.length > 0 ? (
+          <span className="truncate" title={displaySubtitle}>
+            {displaySubtitle}
+          </span>
+        ) : undefined
+      }
       onRemove={onRemove}
       removeLabel={`Remove ${title}`}
     />
@@ -63,6 +89,7 @@ function PullRequestContextCardShell({
 }
 
 interface ComposerPullRequestContextCardProps {
+  source?: ModPullRequestSourceRef | undefined;
   scope: PullRequestContextScope;
   itemKind?: PullRequestContextItemKind | undefined;
   title: string;
@@ -77,6 +104,7 @@ export function ComposerPullRequestContextCard(props: ComposerPullRequestContext
 }
 
 interface UserMessagePullRequestContextCardProps {
+  source?: ModPullRequestSourceRef | undefined;
   scope: PullRequestContextScope;
   itemKind?: PullRequestContextItemKind | undefined;
   title: string;
@@ -87,6 +115,7 @@ interface UserMessagePullRequestContextCardProps {
 // Transcript echo: clicking the card reveals the exact prompt the agent received so the
 // user can audit what "Repair" asked for.
 export function UserMessagePullRequestContextCard({
+  source,
   scope,
   itemKind,
   title,
@@ -104,6 +133,7 @@ export function UserMessagePullRequestContextCard({
         onClick={() => setExpanded((value) => !value)}
       >
         <PullRequestContextCardShell
+          source={source}
           scope={scope}
           itemKind={itemKind}
           title={title}

@@ -18,7 +18,7 @@ import { useRightDockStore } from "~/rightDockStore";
 import { GITHUB_INBOX_DOCK_HOST_ID, type RightDockThreadState } from "~/rightDockStore.logic";
 import { useStore } from "~/store";
 import { createSidebarThreadSummariesSelector } from "~/storeSelectors";
-import type { GitHubInboxSelection } from "./githubInbox.logic";
+import type { CodeReviewSelection } from "./useGitHubInboxSidechat";
 
 const acceptAnyDockWidth = () => true;
 
@@ -36,7 +36,7 @@ export function GitHubInboxSidechatDock({
   onNewSidechat,
 }: {
   dockState: RightDockThreadState;
-  selection: GitHubInboxSelection;
+  selection: CodeReviewSelection;
   onAskSelected: () => void;
   /** A new side chat about the selected item, beside the one shown. */
   onNewSidechat: () => void;
@@ -66,7 +66,10 @@ export function GitHubInboxSidechatDock({
     {
       kind: "sidechat",
       Icon: ChatBubbleIcon,
-      label: `Ask about ${selection.kind === "issue" ? "issue" : "PR"} #${selection.number}`,
+      label:
+        "source" in selection
+          ? `Ask about PR ${selection.identity.itemId}`
+          : `Ask about ${selection.kind === "issue" ? "issue" : "PR"} #${selection.number}`,
     },
   ];
 
