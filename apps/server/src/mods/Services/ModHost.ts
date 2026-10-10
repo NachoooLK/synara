@@ -1,4 +1,17 @@
 import type {
+  ModsPullRequestListInput,
+  ModsPullRequestDetailInput,
+  ModsPullRequestDiffInput,
+  ModsPullRequestCommentInput,
+  ModsPullRequestActionInput,
+  ModsPullRequestSetPinnedInput,
+  ModsPullRequestListResult,
+  ModsPullRequestDetailResult,
+  PullRequestDiffResult,
+  ModPullRequestMutationResult,
+  ModsPullRequestSetPinnedResult,
+} from "@synara/contracts";
+import type {
   ModsDispatchUiInput,
   ModsDispatchUiResult,
   ModsExportInput,
@@ -26,6 +39,26 @@ import type { ModHostError } from "../Errors.ts";
 import type { ModAgentTool, ModPromptInput, ModPromptOutcome } from "../modManager.ts";
 
 export interface ModHostShape {
+  readonly pullRequests: {
+    readonly list: (
+      input: ModsPullRequestListInput,
+    ) => Effect.Effect<ModsPullRequestListResult, ModHostError>;
+    readonly detail: (
+      input: ModsPullRequestDetailInput,
+    ) => Effect.Effect<ModsPullRequestDetailResult, ModHostError>;
+    readonly diff: (
+      input: ModsPullRequestDiffInput,
+    ) => Effect.Effect<PullRequestDiffResult, ModHostError>;
+    readonly comment: (
+      input: ModsPullRequestCommentInput,
+    ) => Effect.Effect<ModPullRequestMutationResult, ModHostError>;
+    readonly action: (
+      input: ModsPullRequestActionInput,
+    ) => Effect.Effect<ModPullRequestMutationResult, ModHostError>;
+    readonly setPinned: (
+      input: ModsPullRequestSetPinnedInput,
+    ) => Effect.Effect<ModsPullRequestSetPinnedResult, ModHostError>;
+  };
   /** False on Stable, where mods are Beta-only and every method refuses. */
   readonly available: boolean;
   readonly list: () => Effect.Effect<ModsSnapshot, ModHostError>;

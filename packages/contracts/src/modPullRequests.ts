@@ -41,14 +41,10 @@ export const ModPullRequestUrl = Schema.String.check(
   }),
 );
 const nullable = <S extends Schema.Top>(schema: S) =>
-  Schema.optional(Schema.NullOr(schema)).pipe(Schema.withDecodingDefault(() => null));
-const falseDefault = Schema.optional(Schema.Boolean).pipe(Schema.withDecodingDefault(() => false));
-const actions = Schema.optional(Schema.Array(PullRequestAction)).pipe(
-  Schema.withDecodingDefault(() => []),
-);
-const methods = Schema.optional(Schema.Array(PullRequestMergeMethod)).pipe(
-  Schema.withDecodingDefault(() => []),
-);
+  Schema.NullOr(schema).pipe(Schema.withDecodingDefault(() => null));
+const falseDefault = Schema.Boolean.pipe(Schema.withDecodingDefault(() => false));
+const actions = Schema.Array(PullRequestAction).pipe(Schema.withDecodingDefault(() => []));
+const methods = Schema.Array(PullRequestMergeMethod).pipe(Schema.withDecodingDefault(() => []));
 
 export const ModPullRequestSourceRef = Schema.Struct({
   kind: Schema.Literal("mod"),
@@ -72,7 +68,7 @@ export type ModPullRequestCapabilities = typeof ModPullRequestCapabilities.Type;
 export const ModPullRequestSourceDefinition = Schema.Struct({
   id: ModPullRequestSourceId,
   title: TrimmedNonEmptyString.check(Schema.isMaxLength(1024)),
-  capabilities: Schema.optional(ModPullRequestCapabilities).pipe(
+  capabilities: ModPullRequestCapabilities.pipe(
     Schema.withDecodingDefault(() => ({
       diff: false,
       timeline: false,
@@ -133,7 +129,7 @@ export const ModPullRequestListEntry = Schema.Struct({
   viewerInvolvement: nullable(GitHubViewerInvolvement),
   labels: nullable(Schema.Array(PullRequestLabel)),
   assignees: nullable(Schema.Array(ModPullRequestActor)),
-  projectIds: Schema.optional(Schema.Array(ProjectId)).pipe(Schema.withDecodingDefault(() => [])),
+  projectIds: Schema.Array(ProjectId).pipe(Schema.withDecodingDefault(() => [])),
 });
 export type ModPullRequestListEntry = typeof ModPullRequestListEntry.Type;
 export const ModPullRequestDetail = Schema.Struct({
@@ -142,9 +138,7 @@ export const ModPullRequestDetail = Schema.Struct({
   changedFiles: nullable(NonNegativeInt),
   mergedAt: nullable(IsoDateTime),
   closedAt: nullable(IsoDateTime),
-  mergeability: Schema.optional(GitPullRequestMergeability).pipe(
-    Schema.withDecodingDefault(() => "unknown"),
-  ),
+  mergeability: GitPullRequestMergeability.pipe(Schema.withDecodingDefault(() => "unknown")),
   mergeStateStatus: nullable(Schema.String),
   reviewers: nullable(Schema.Array(ModPullRequestActor)),
   checks: nullable(Schema.Array(Check)),
@@ -174,7 +168,7 @@ export const ModsPullRequestListInput = Schema.Struct({
   state: Schema.Literals(["open", "closed"]),
   sort: Schema.Literals(["created", "updated"]),
   cursor: nullable(OpaqueId),
-  limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(500))).pipe(
+  limit: PositiveInt.check(Schema.isLessThanOrEqualTo(500)).pipe(
     Schema.withDecodingDefault(() => 100),
   ),
 });

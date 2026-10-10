@@ -1,3 +1,5 @@
+import { ModPullRequestPins } from "./modPullRequestPins";
+import { ModPullRequestSources } from "./modPullRequestSources";
 // FILE: modManager.ts
 // Purpose: Owns every mod: finds them, starts the enabled ones, reloads them when
 //          their files change, runs hook chains and answers their `$` calls.
@@ -317,6 +319,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | und
 }
 
 export class ModManager {
+  readonly pullRequests: ModPullRequestSources;
+  private readonly pullRequestPins: ModPullRequestPins;
   private readonly options: ModManagerOptions;
   private readonly records = new Map<string, ModRecord>();
   private readonly listeners = new Set<(event: ModsStreamEvent) => void>();
@@ -353,6 +357,21 @@ export class ModManager {
   constructor(options: ModManagerOptions) {
     this.options = options;
     this.workerUrl = options.workerUrl ?? null;
+    this.pullRequestPins = new ModPullRequestPins(
+      path.join(options.dataDir, "pull-request-pins.json"),
+    );
+    this.pullRequests = new ModPullRequestSources({
+      pins: this.pullRequestPins,
+      projects: options.backend.listProjects,
+      onChange: (modId, sourceId) => {
+        this.emit({ type: "pullRequestsInvalidated", modId, sourceId });
+        this.scheduleSnapshot();
+      },
+      log: (modId, message) => {
+        const record = this.records.get(modId);
+        if (record) this.appendLog(record, "error", message);
+      },
+    });
     this.signIns = new ModMcpSignIns({
       vault: options.secrets ?? makeMemoryModSecretVault(),
       port: options.signInPort,
@@ -377,10 +396,12 @@ export class ModManager {
     this.started = true;
     await fs.mkdir(this.options.modsDir, { recursive: true });
     await fs.mkdir(this.storeDir(), { recursive: true });
+    await this.pullRequestPins.load();
     const stored = await this.readRegistry();
     const folders = await listModFolders(this.options.modsDir);
     // Trust belongs to a mod that exists; a later folder with that name is new code.
     const present = new Set(folders.map((folder) => path.basename(folder)));
+    await this.pullRequestPins.retainMods(present);
     const kept = new Map([...stored].filter(([id]) => present.has(id)));
     if (kept.size !== stored.size) await this.writeRegistry(kept);
     this.trusted = kept;
@@ -422,6 +443,7 @@ export class ModManager {
       ),
     );
     await Promise.all([this.registryWrite, ...this.storeWrites.values()]);
+    await this.pullRequestPins.flush();
     this.listeners.clear();
   }
 
@@ -1114,6 +1136,7 @@ export class ModManager {
       this.linkWatchers.delete(id);
       // A folder that comes back under this name is new code; it starts off, signed out.
       await this.signIns.forget(id);
+      await this.pullRequestPins.removeMod(id);
       this.reloadGrants.delete(id);
       if (this.trusted.has(id)) {
         const next = new Map(this.trusted);
@@ -1181,6 +1204,7 @@ export class ModManager {
     record.commands.clear();
     record.views.clear();
     record.tools.clear();
+    this.pullRequests.withdrawMod(record.definition.id);
     record.unknownIcons.clear();
     await this.closeMcp(record);
     this.signIns.restarted(record.definition.id);
@@ -1305,6 +1329,7 @@ export class ModManager {
     record.commands.clear();
     record.views.clear();
     record.tools.clear();
+    this.pullRequests.withdrawMod(record.definition.id);
     await this.closeMcp(record);
     record.statusText = null;
     record.loadedAt = null;
@@ -1322,6 +1347,7 @@ export class ModManager {
     record.commands.clear();
     record.views.clear();
     record.tools.clear();
+    this.pullRequests.withdrawMod(record.definition.id);
     void this.closeMcp(record);
     record.statusText = null;
     this.appendLog(record, "error", reason);
@@ -1421,6 +1447,39 @@ export class ModManager {
     if (generation !== record.generation) throw new ModManagerError("The mod was stopped.");
     const modId = record.definition.id;
     switch (method) {
+      case "pullRequests.registerSource": {
+        this.pullRequests.register(modId, generation, args[0], async (event, input) => {
+          const host = record.host;
+          if (generation !== record.generation || !host?.isAlive || record.status !== "running")
+            throw new ModManagerError("The source's mod was stopped.");
+          const entries = this.hooksOf(record, event, input);
+          if (entries.length === 0)
+            throw new ModManagerError(`The mod has no matching ${event} hook for this source.`);
+          const step = async (index: number, value: unknown): Promise<unknown> => {
+            const entry = entries[index];
+            if (!entry) throw new ModManagerError(`No ${event} hook answered this request.`);
+            if (generation !== record.generation || record.host !== host)
+              throw new ModManagerError("The source's mod was stopped.");
+            const outcome = await host.invoke(entry.hookId, value, (nextInput) =>
+              step(index + 1, nextInput),
+            );
+            if (outcome.kind === "error")
+              throw Object.assign(new ModManagerError(outcome.error), { code: outcome.code });
+            return outcome.value;
+          };
+          return step(0, input);
+        });
+        return undefined;
+      }
+      case "pullRequests.unregisterSource":
+        this.pullRequests.unregister(modId, requireText(args[0], method, 64));
+        return undefined;
+      case "pullRequests.invalidate":
+        this.pullRequests.invalidate(
+          modId,
+          args[0] === undefined ? undefined : requireText(args[0], method, 64),
+        );
+        return undefined;
       case "log.info":
       case "log.warn":
       case "log.error": {
@@ -1936,6 +1995,7 @@ export class ModManager {
         description: tool.description,
       })),
       views: [...record.views.values()],
+      pullRequestSources: this.pullRequests.summaries(definition.id),
       mcpServers: Object.keys(definition.manifest?.mcpServers ?? {}),
       mcpSignIns: this.signIns.summary(definition.id, definition.manifest?.mcpServers),
       permissions: [...new Set(definition.manifest?.permissions ?? [])],

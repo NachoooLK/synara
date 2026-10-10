@@ -164,6 +164,38 @@ afterEach(() => {
 });
 
 describe("wsNativeApi", () => {
+  it("routes generic mod pull request methods without altering opaque IDs", async () => {
+    const { createWsNativeApi } = await import("./wsNativeApi");
+    const api = createWsNativeApi();
+    const identity = {
+      modId: "demo",
+      sourceId: "reviews",
+      repository: "Team/Repo",
+      itemId: "review/A-α",
+    };
+    await api.mods.pullRequests.list({
+      modId: "demo",
+      sourceId: "reviews",
+      state: "open",
+      sort: "updated",
+      cursor: "next/A",
+      limit: 100,
+    });
+    await api.mods.pullRequests.detail(identity);
+    await api.mods.pullRequests.diff(identity);
+    await api.mods.pullRequests.comment({ ...identity, body: "Hello" });
+    await api.mods.pullRequests.action({ ...identity, action: "merge", mergeMethod: "squash" });
+    await api.mods.pullRequests.setPinned({ ...identity, isPinned: true });
+    expect(requestMock.mock.calls.map((call) => call[0])).toEqual([
+      "mods.pullRequestsList",
+      "mods.pullRequestsDetail",
+      "mods.pullRequestsDiff",
+      "mods.pullRequestsComment",
+      "mods.pullRequestsAction",
+      "mods.pullRequestsSetPinned",
+    ]);
+    expect(requestMock.mock.calls[1]![1]).toEqual(identity);
+  });
   it("forwards exhausted shell failures and removes unsubscribed listeners", async () => {
     const { createWsNativeApi, onShellStreamFailure } = await import("./wsNativeApi");
     createWsNativeApi();

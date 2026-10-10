@@ -84,7 +84,13 @@ const unavailable = () =>
 const secretName = (modId: string) => `mod-mcp-sign-ins-${modId}`;
 
 const toModHostError = (cause: unknown) =>
-  new ModHostError({ message: cause instanceof Error ? cause.message : String(cause), cause });
+  new ModHostError({
+    message: cause instanceof Error ? cause.message : String(cause),
+    cause,
+    ...(cause instanceof Error && "code" in cause && typeof cause.code === "string"
+      ? { code: cause.code }
+      : {}),
+  });
 
 export const ModHostLive = Layer.effect(
   ModHost,
@@ -356,6 +362,14 @@ export const ModHostLive = Layer.effect(
     return {
       available,
       list: () => guarded(() => manager.snapshot()),
+      pullRequests: {
+        list: (input) => guarded(() => manager.pullRequests.list(input)),
+        detail: (input) => guarded(() => manager.pullRequests.detail(input)),
+        diff: (input) => guarded(() => manager.pullRequests.diff(input)),
+        comment: (input) => guarded(() => manager.pullRequests.comment(input)),
+        action: (input) => guarded(() => manager.pullRequests.action(input)),
+        setPinned: (input) => guarded(() => manager.pullRequests.setPinned(input)),
+      },
       setEnabled: (input) =>
         guarded(() =>
           manager.setEnabled(input.id, input.enabled, { reloadOnChange: input.reloadOnChange }),

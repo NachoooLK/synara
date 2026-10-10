@@ -1,3 +1,11 @@
+import {
+  ModsPullRequestListInput,
+  ModsPullRequestDetailInput,
+  ModsPullRequestDiffInput,
+  ModsPullRequestCommentInput,
+  ModsPullRequestActionInput,
+  ModsPullRequestSetPinnedInput,
+} from "./modPullRequests";
 import { Schema, Struct } from "effect";
 import {
   LoadProjectImportHistoryInput,
@@ -546,6 +554,13 @@ const WebSocketRequestBody = Schema.Union([
 
   // Mods (Beta-only; the server refuses these on Stable)
   tagRequestBody(MODS_WS_METHODS.list, Schema.Struct({})),
+  tagRequestBody(MODS_WS_METHODS.pullRequestsList, ModsPullRequestListInput),
+  tagRequestBody(MODS_WS_METHODS.pullRequestsDetail, ModsPullRequestDetailInput),
+  tagRequestBody(MODS_WS_METHODS.pullRequestsDiff, ModsPullRequestDiffInput),
+  tagRequestBody(MODS_WS_METHODS.pullRequestsComment, ModsPullRequestCommentInput),
+  tagRequestBody(MODS_WS_METHODS.pullRequestsAction, ModsPullRequestActionInput),
+  tagRequestBody(MODS_WS_METHODS.pullRequestsSetPinned, ModsPullRequestSetPinnedInput),
+
   tagRequestBody(MODS_WS_METHODS.setEnabled, ModsSetEnabledInput),
   tagRequestBody(MODS_WS_METHODS.reload, ModsReloadInput),
   tagRequestBody(MODS_WS_METHODS.readLogs, ModsReadLogsInput),

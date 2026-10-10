@@ -19,6 +19,7 @@ function mod(overrides: Partial<ModSummary> & Pick<ModSummary, "id">): ModSummar
     hooks: [],
     commands: [],
     views: [],
+    pullRequestSources: [],
     mcpServers: [],
     mcpSignIns: [],
     permissions: [],

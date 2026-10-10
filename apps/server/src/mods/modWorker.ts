@@ -506,7 +506,13 @@ async function invokeHandler(callId: number, handlerId: string, payload: unknown
     await currentCall.run(callId, () => handler(deepFreeze(payload)));
     outcome = { ok: true, value: undefined };
   } catch (error) {
-    outcome = { ok: false, error: describeForMod(error) };
+    outcome = {
+      ok: false,
+      error: describeForMod(error),
+      ...(error instanceof Error && "code" in error && typeof error.code === "string"
+        ? { code: error.code }
+        : {}),
+    };
   }
   post({ type: "invoke-result", callId, ...outcome });
 }
@@ -554,7 +560,13 @@ async function invoke(callId: number, hookId: number, input: unknown): Promise<v
         }
       : { ok: true, value: result };
   } catch (error) {
-    outcome = { ok: false, error: describeForMod(error) };
+    outcome = {
+      ok: false,
+      error: describeForMod(error),
+      ...(error instanceof Error && "code" in error && typeof error.code === "string"
+        ? { code: error.code }
+        : {}),
+    };
   }
   try {
     post({ type: "invoke-result", callId, ...outcome });

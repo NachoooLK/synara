@@ -981,6 +981,20 @@ export function createWsNativeApi(): NativeApi {
       onEvent: todoEventListeners.subscribe,
     },
     mods: {
+      pullRequests: {
+        list: (input) =>
+          transport.request(MODS_WS_METHODS.pullRequestsList, input, { timeoutMs: 65000 }),
+        detail: (input) =>
+          transport.request(MODS_WS_METHODS.pullRequestsDetail, input, { timeoutMs: 65000 }),
+        diff: (input) =>
+          transport.request(MODS_WS_METHODS.pullRequestsDiff, input, { timeoutMs: 65000 }),
+        comment: (input) =>
+          transport.request(MODS_WS_METHODS.pullRequestsComment, input, { timeoutMs: 65000 }),
+        action: (input) =>
+          transport.request(MODS_WS_METHODS.pullRequestsAction, input, { timeoutMs: 65000 }),
+        setPinned: (input) =>
+          transport.request(MODS_WS_METHODS.pullRequestsSetPinned, input, { timeoutMs: 65000 }),
+      },
       list: () => transport.request(MODS_WS_METHODS.list, {}),
       setEnabled: (input) => transport.request(MODS_WS_METHODS.setEnabled, input),
       reload: (input) => transport.request(MODS_WS_METHODS.reload, input),

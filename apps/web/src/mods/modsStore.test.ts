@@ -15,6 +15,7 @@ function mod(id: string, statusText: string | null = null): ModSummary {
     hooks: [],
     commands: [],
     views: [],
+    pullRequestSources: [],
     mcpServers: [],
     mcpSignIns: [],
     permissions: [],

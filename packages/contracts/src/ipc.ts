@@ -1,3 +1,15 @@
+import type {
+  ModsPullRequestListInput,
+  ModsPullRequestDetailInput,
+  ModsPullRequestDiffInput,
+  ModsPullRequestCommentInput,
+  ModsPullRequestActionInput,
+  ModsPullRequestSetPinnedInput,
+  ModsPullRequestListResult,
+  ModsPullRequestDetailResult,
+  ModPullRequestMutationResult,
+  ModsPullRequestSetPinnedResult,
+} from "./modPullRequests";
 import { Schema } from "effect";
 import type {
   LoadProjectImportHistoryInput,
@@ -1503,6 +1515,14 @@ export interface NativeApi {
   };
   // Mods are Beta-only; on Stable the server refuses every method with MODS_UNAVAILABLE.
   mods: {
+    pullRequests: {
+      list: (input: ModsPullRequestListInput) => Promise<ModsPullRequestListResult>;
+      detail: (input: ModsPullRequestDetailInput) => Promise<ModsPullRequestDetailResult>;
+      diff: (input: ModsPullRequestDiffInput) => Promise<PullRequestDiffResult>;
+      comment: (input: ModsPullRequestCommentInput) => Promise<ModPullRequestMutationResult>;
+      action: (input: ModsPullRequestActionInput) => Promise<ModPullRequestMutationResult>;
+      setPinned: (input: ModsPullRequestSetPinnedInput) => Promise<ModsPullRequestSetPinnedResult>;
+    };
     list: () => Promise<ModsSnapshot>;
     setEnabled: (input: ModsSetEnabledInput) => Promise<ModsSnapshot>;
     reload: (input: ModsReloadInput) => Promise<ModsSnapshot>;

@@ -47,7 +47,7 @@ export async function resolveModWorkerUrl(): Promise<URL> {
 
 export type ModHookOutcome =
   | { readonly kind: "result"; readonly value: unknown }
-  | { readonly kind: "error"; readonly error: string };
+  | { readonly kind: "error"; readonly error: string; readonly code?: string };
 
 export interface ModWorkerHostOptions {
   readonly data: ModWorkerData;
@@ -215,7 +215,11 @@ export class ModWorkerHost {
         invocation.resolve(
           message.ok
             ? { kind: "result", value: message.value }
-            : { kind: "error", error: message.error },
+            : {
+                kind: "error",
+                error: message.error,
+                ...(message.code ? { code: message.code } : {}),
+              },
         );
         return;
       }

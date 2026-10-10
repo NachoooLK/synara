@@ -1,3 +1,15 @@
+import {
+  ModsPullRequestListInput,
+  ModsPullRequestDetailInput,
+  ModsPullRequestDiffInput,
+  ModsPullRequestCommentInput,
+  ModsPullRequestActionInput,
+  ModsPullRequestSetPinnedInput,
+  ModsPullRequestListResult,
+  ModsPullRequestDetailResult,
+  ModPullRequestMutationResult,
+  ModsPullRequestSetPinnedResult,
+} from "./modPullRequests";
 import { Schema } from "effect";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
@@ -946,7 +958,45 @@ export const WsSubscribeModsEventsRpc = Rpc.make(MODS_WS_METHODS.subscribeEvents
   stream: true,
 });
 
+export const WsModsPullRequestsListRpc = Rpc.make(MODS_WS_METHODS.pullRequestsList, {
+  payload: ModsPullRequestListInput,
+  success: ModsPullRequestListResult,
+  error: WsRpcError,
+});
+export const WsModsPullRequestsDetailRpc = Rpc.make(MODS_WS_METHODS.pullRequestsDetail, {
+  payload: ModsPullRequestDetailInput,
+  success: ModsPullRequestDetailResult,
+  error: WsRpcError,
+});
+export const WsModsPullRequestsDiffRpc = Rpc.make(MODS_WS_METHODS.pullRequestsDiff, {
+  payload: ModsPullRequestDiffInput,
+  success: PullRequestDiffResult,
+  error: WsRpcError,
+});
+export const WsModsPullRequestsCommentRpc = Rpc.make(MODS_WS_METHODS.pullRequestsComment, {
+  payload: ModsPullRequestCommentInput,
+  success: ModPullRequestMutationResult,
+  error: WsRpcError,
+});
+export const WsModsPullRequestsActionRpc = Rpc.make(MODS_WS_METHODS.pullRequestsAction, {
+  payload: ModsPullRequestActionInput,
+  success: ModPullRequestMutationResult,
+  error: WsRpcError,
+});
+export const WsModsPullRequestsSetPinnedRpc = Rpc.make(MODS_WS_METHODS.pullRequestsSetPinned, {
+  payload: ModsPullRequestSetPinnedInput,
+  success: ModsPullRequestSetPinnedResult,
+  error: WsRpcError,
+});
+
 export const WsModsRpcGroup = RpcGroup.make(
+  WsModsPullRequestsListRpc,
+  WsModsPullRequestsDetailRpc,
+  WsModsPullRequestsDiffRpc,
+  WsModsPullRequestsCommentRpc,
+  WsModsPullRequestsActionRpc,
+  WsModsPullRequestsSetPinnedRpc,
+
   WsModsListRpc,
   WsModsSetEnabledRpc,
   WsModsReloadRpc,

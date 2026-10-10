@@ -1194,11 +1194,18 @@ const makeWsRpcHandlersLayer = () =>
         tasksEnabled ? effect : Effect.fail(tasksUnavailableError());
 
       // Mods are Beta-only; the ModHost refuses on Stable and the code tells clients why.
-      const toModsRpcError = (cause: { readonly message: string }) =>
+      const toModsRpcError = (cause: {
+        readonly message: string;
+        readonly code?: string | undefined;
+      }) =>
         new WsRpcError({
           message: cause.message,
           retryable: false,
-          ...(modHost.available ? {} : { code: MODS_UNAVAILABLE_ERROR_CODE }),
+          ...(modHost.available
+            ? cause.code
+              ? { code: cause.code }
+              : {}
+            : { code: MODS_UNAVAILABLE_ERROR_CODE }),
         });
 
       const toProjectProvisionRpcError = (cause: unknown) =>
@@ -3080,6 +3087,19 @@ const makeWsRpcHandlersLayer = () =>
             : Stream.fail(tasksUnavailableError()),
 
         [MODS_WS_METHODS.list]: () => modHost.list().pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.pullRequestsList]: (input) =>
+          modHost.pullRequests.list(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.pullRequestsDetail]: (input) =>
+          modHost.pullRequests.detail(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.pullRequestsDiff]: (input) =>
+          modHost.pullRequests.diff(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.pullRequestsComment]: (input) =>
+          modHost.pullRequests.comment(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.pullRequestsAction]: (input) =>
+          modHost.pullRequests.action(input).pipe(Effect.mapError(toModsRpcError)),
+        [MODS_WS_METHODS.pullRequestsSetPinned]: (input) =>
+          modHost.pullRequests.setPinned(input).pipe(Effect.mapError(toModsRpcError)),
+
         // Turning a mod on runs code with Synara's access, so only the owner's own
         // session may do it (or install one); a paired device may still turn one off.
         [MODS_WS_METHODS.setEnabled]: (input) =>

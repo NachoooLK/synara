@@ -5,6 +5,9 @@
 
 /** The `$` methods a worker may call, by dotted name. */
 export const MOD_API_METHODS = [
+  "pullRequests.registerSource",
+  "pullRequests.unregisterSource",
+  "pullRequests.invalidate",
   "log.info",
   "log.warn",
   "log.error",

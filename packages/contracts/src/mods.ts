@@ -1,3 +1,4 @@
+import { ModPullRequestSourceSummary } from "./modPullRequests";
 import { Schema } from "effect";
 
 import { IsoDateTime, ThreadId, TrimmedNonEmptyString } from "./baseSchemas";
@@ -11,6 +12,13 @@ import { IsoDateTime, ThreadId, TrimmedNonEmptyString } from "./baseSchemas";
 
 export const MODS_WS_METHODS = {
   list: "mods.list",
+  pullRequestsList: "mods.pullRequestsList",
+  pullRequestsDetail: "mods.pullRequestsDetail",
+  pullRequestsDiff: "mods.pullRequestsDiff",
+  pullRequestsComment: "mods.pullRequestsComment",
+  pullRequestsAction: "mods.pullRequestsAction",
+  pullRequestsSetPinned: "mods.pullRequestsSetPinned",
+
   setEnabled: "mods.setEnabled",
   reload: "mods.reload",
   readLogs: "mods.readLogs",
@@ -284,6 +292,9 @@ export const ModSummary = Schema.Struct({
   hooks: Schema.Array(Schema.String),
   commands: Schema.Array(ModCommand),
   views: Schema.Array(ModView),
+  pullRequestSources: Schema.Array(ModPullRequestSourceSummary).pipe(
+    Schema.withDecodingDefault(() => []),
+  ),
   /** The names of the MCP servers the manifest declares. */
   mcpServers: Schema.Array(Schema.String),
   /** The servers among them that ask the person to sign in, as far as Synara knows. */
@@ -329,6 +340,11 @@ export const ModLogEntry = Schema.Struct({
 export type ModLogEntry = typeof ModLogEntry.Type;
 
 export const ModsStreamEvent = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("pullRequestsInvalidated"),
+    modId: ModId,
+    sourceId: Schema.NullOr(ModId),
+  }),
   Schema.Struct({
     type: Schema.Literal("snapshot"),
     snapshot: ModsSnapshot,

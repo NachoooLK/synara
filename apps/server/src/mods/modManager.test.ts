@@ -155,6 +155,53 @@ describe("matchesModEvent", () => {
 });
 
 describe("ModManager", () => {
+  it("preserves sign-in error codes from source hooks", async () => {
+    await writeMod("sign-in", {
+      "hooks/register.ts": `export const register = (on) => {
+      on("mod.start", async ($) => $.pullRequests.registerSource({ id: "reviews", title: "Reviews" }));
+      on("pullRequests.detail", () => { throw Object.assign(new Error("Sign in needed"), { code: "mcp_sign_in_needed" }); });
+    };`,
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "sign-in");
+    await expect(
+      manager.pullRequests.detail({
+        modId: "sign-in",
+        sourceId: "reviews",
+        repository: "repo",
+        itemId: "1",
+      }),
+    ).rejects.toMatchObject({ code: "mcp_sign_in_needed" });
+  });
+  it("withdraws sources on stop and trust invalidation", async () => {
+    const folder = await writeMod("reviews", {
+      "hooks/register.ts": `
+      export const register = (on) => {
+        on("mod.start", async ($) => $.pullRequests.registerSource({ id: "team", title: "Team reviews" }));
+        on("pullRequests.list", { sourceId: "team" }, async () => ({ items: [{ repository: "Repo", itemId: "A/α", title: "Review", url: "https://reviews.example.test/A", state: "open" }] }));
+        on("pullRequests.detail", { sourceId: "team" }, async () => ({ repository: "Repo", itemId: "A/α", title: "Review", url: "https://reviews.example.test/A", state: "open" }));
+      };`,
+    });
+    const manager = makeManager();
+    await startEnabled(manager, "reviews");
+    const first = summaryOf(manager.snapshot(), "reviews");
+    expect(first.status).toBe("running");
+    expect(first.pullRequestSources).toHaveLength(1);
+    const input = { modId: "reviews", sourceId: "team", repository: "Repo", itemId: "A/α" };
+    expect((await manager.pullRequests.detail(input)).title).toBe("Review");
+    await manager.setEnabled("reviews", false);
+    expect(summaryOf(manager.snapshot(), "reviews").pullRequestSources).toEqual([]);
+    await expect(manager.pullRequests.detail(input)).rejects.toThrow(/unavailable/i);
+    await manager.setEnabled("reviews", true);
+    const revision = summaryOf(manager.snapshot(), "reviews").pullRequestSources[0]!.revision;
+    expect(revision).not.toBe(first.pullRequestSources[0]!.revision);
+    await writeFile(path.join(folder, "hooks", "extra.ts"), "export const edit = true;");
+    await manager.reload("reviews");
+    expect(summaryOf(manager.snapshot(), "reviews")).toMatchObject({
+      status: "changed",
+      pullRequestSources: [],
+    });
+  });
   it("lists a new mod as disabled until it is enabled, then runs it", async () => {
     await writeMod("hello", {
       "hooks/register.ts": `
