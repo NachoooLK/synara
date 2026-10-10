@@ -47,6 +47,21 @@ export class ModPullRequestSources {
   constructor(private readonly options: Options) {}
   register(modId: string, generation: number, value: unknown, invoke: Invoke): void {
     const definition = Schema.decodeUnknownSync(ModPullRequestSourceDefinition)(value);
+    const previous = this.sources.get(sourceKey(modId, definition.id));
+    if (
+      previous?.generation === generation &&
+      previous.summary.title === definition.title &&
+      JSON.stringify(previous.summary.capabilities) === JSON.stringify(definition.capabilities)
+    )
+      return;
+    this.replace(modId, generation, definition, invoke);
+  }
+  private replace(
+    modId: string,
+    generation: number,
+    definition: ModPullRequestSourceDefinition,
+    invoke: Invoke,
+  ): void {
     const source = Schema.decodeUnknownSync(ModPullRequestSourceRef)({
       kind: "mod",
       modId,
@@ -94,7 +109,7 @@ export class ModPullRequestSources {
   authenticationChanged(modId: string): void {
     for (const source of [...this.sources.values()]) {
       if (source.summary.source.modId !== modId) continue;
-      this.register(
+      this.replace(
         modId,
         source.generation,
         {
@@ -118,18 +133,21 @@ export class ModPullRequestSources {
       );
     return source;
   }
-  private current(source: Source): void {
+  private current(source: Source, remoteWriteMayHaveCompleted = false): void {
     const ref = source.summary.source;
     if (this.sources.get(sourceKey(ref.modId, ref.sourceId)) !== source)
       throw new Error(
-        "This source was withdrawn or changed while the request was running. A remote write may already have completed; do not retry automatically.",
+        "This source was withdrawn or changed while the request was running." +
+          (remoteWriteMayHaveCompleted
+            ? " A remote write may already have completed; do not retry automatically."
+            : ""),
       );
   }
   private async invoke(source: Source, event: string, input: unknown): Promise<unknown> {
     this.current(source);
     try {
       const result = await source.invoke(event, input);
-      this.current(source);
+      this.current(source, event === "pullRequests.comment" || event === "pullRequests.action");
       return result;
     } catch (error) {
       this.options.log(

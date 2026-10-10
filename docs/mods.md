@@ -127,6 +127,9 @@ needs neither an MCP service nor an account and registers no custom view.
 - Reads are on demand: list when Code review is open, detail when selected,
   diff when **Changes** opens. Explicit refresh and source invalidation refresh
   active queries; Synara does not add PR polling in the background.
+  Identical registrations within one running mod preserve pending reads.
+  Changes to source metadata replace the source; register in `mod.start` and
+  use `$.pullRequests.invalidate()` to refresh data.
 - Declare optional `diff`, `timeline`, `comment`, `actions` and `mergeMethods`
   only when supported. Synara reuses its native controls, and hides unavailable
   ones. Each item can further restrict merge methods. Writes require an

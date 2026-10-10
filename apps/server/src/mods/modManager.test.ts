@@ -155,6 +155,33 @@ describe("matchesModEvent", () => {
 });
 
 describe("ModManager", () => {
+  it("keeps native reads alive when the same source is registered again", async () => {
+    await writeMod("repeat-source", {
+      "hooks/register.ts": `export const register = on => {
+        const source = { id: "reviews", title: "Reviews" };
+        on("mod.start", async $ => $.pullRequests.registerSource(source));
+        on("pullRequests.list", { sourceId: "reviews" }, async $ => {
+          await $.pullRequests.registerSource(source);
+          return { items: [{ repository: "Team/Repo", itemId: "A", title: "Review", url: "https://reviews.example.test/A", state: "open" }] };
+        });
+      };`,
+    });
+    const manager = makeManager();
+    const before = await startEnabled(manager, "repeat-source");
+    const result = await manager.pullRequests.list({
+      modId: "repeat-source",
+      sourceId: "reviews",
+      state: "open",
+      sort: "updated",
+      cursor: null,
+      limit: 100,
+    });
+    expect(result.items).toMatchObject([{ repository: "Team/Repo", itemId: "A" }]);
+    expect(result.revision).toBe(before.pullRequestSources[0]!.revision);
+    expect(manager.readLogs("repeat-source").logs).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ level: "error" })]),
+    );
+  });
   it("preserves sign-in error codes from source hooks", async () => {
     await writeMod("sign-in", {
       "hooks/register.ts": `export const register = (on) => {

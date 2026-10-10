@@ -130,17 +130,17 @@ describe("ModPullRequestSources", () => {
       items: [{ ...item, projectIds: ["missing"] }],
     }));
     await expect(host.list(listInput())).rejects.toThrow(/project/i);
-    host.register("one", 1, { id: "reviews", title: "One" }, async () => ({
+    host.register("one", 2, { id: "reviews", title: "One" }, async () => ({
       ...item,
       itemId: "other",
     }));
     await expect(host.detail(input)).rejects.toThrow(/identity/i);
-    host.register("one", 1, { id: "reviews", title: "One" }, async () => ({
+    host.register("one", 3, { id: "reviews", title: "One" }, async () => ({
       items: [{ ...item, state: "closed" }],
     }));
     await expect(host.list(listInput())).rejects.toThrow(/state/i);
   });
-  it("discards a slow result after re-registration", async () => {
+  it.each(["reload", "metadata"])("discards a slow result after %s changes", async (change) => {
     const host = await setup();
     let release: () => void = () => {};
     host.register("one", 1, { id: "reviews", title: "Old" }, async () => {
@@ -153,10 +153,18 @@ describe("ModPullRequestSources", () => {
     const slow = host.detail(input);
     const rejection = expect(slow).rejects.toThrow(/withdrawn|changed/i);
     await new Promise((resolve) => setTimeout(resolve, 5));
-    host.register("one", 2, { id: "reviews", title: "New" }, async () => ({
-      ...item,
-      title: "New",
-    }));
+    host.register(
+      "one",
+      change === "reload" ? 2 : 1,
+      {
+        id: "reviews",
+        title: change === "metadata" ? "New" : "Old",
+      },
+      async () => ({
+        ...item,
+        title: "New",
+      }),
+    );
     release();
     await rejection;
     expect(host.summaries("one")[0]!.revision).not.toBe(oldRevision);
@@ -232,6 +240,38 @@ it("starts a fresh read generation after authentication changes", async () => {
   expect(calls).toBe(2);
   expect(host.summaries("one")[0]!.revision).not.toBe(revision);
 });
+it.each(["pullRequests.list", "pullRequests.comment"])(
+  "reserves the remote-write warning for a dispatched write (%s)",
+  async (event) => {
+    const host = await setup();
+    let release = () => {};
+    host.register(
+      "one",
+      1,
+      { id: "reviews", title: "Reviews", capabilities: { comment: true } },
+      async () => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return event === "pullRequests.list" ? { items: [] } : { ok: true };
+      },
+    );
+    const pending =
+      event === "pullRequests.list"
+        ? host.list(listInput())
+        : host.comment({ ...input, body: "Hello" });
+    const result = pending.catch((error: unknown) => error);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    host.withdrawMod("one");
+    release();
+    const error = await result;
+    expect(error).toBeInstanceOf(Error);
+    if (!(error instanceof Error)) throw error;
+    expect(error.message).toMatch(/withdrawn|changed/i);
+    if (event === "pullRequests.list") expect(error.message).not.toMatch(/remote write/i);
+    else expect(error.message).toMatch(/remote write.*do not retry automatically/i);
+  },
+);
 it.each(["cancel", "deadline"])("does not dispatch a queued write after %s", async (mode) => {
   const host = await setup();
   let release = () => {};

@@ -173,6 +173,10 @@ the owning mod. `types/synara.d.ts` defines the complete inputs and results:
   `$.pullRequests.invalidate(sourceId?)` refresh active queries; inactive
   views stay idle. `$.ui.invalidate` is for custom views, not native sources.
   `forceRefresh` lets detail adapters bypass their own cache when requested.
+  Repeating identical registration within one running mod is a no-op. Changes
+  to the title or capabilities replace the source and discard pending reads;
+  do not make those changes inside list, detail or diff hooks. Use `invalidate`
+  to refresh data instead of registering the source again.
 - **Lifecycle/errors:** disabling, unregistering, reloading or losing trust
   withdraws the source and its stale results. Throw source errors; other
   sources remain usable. Let `mcp_sign_in_needed` propagate: Code review
